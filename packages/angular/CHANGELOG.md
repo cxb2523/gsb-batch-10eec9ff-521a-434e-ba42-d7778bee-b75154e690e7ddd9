@@ -1,0 +1,47 @@
+# @kawarp/angular
+
+## 1.1.5
+
+### Patch Changes
+
+- Updated dependencies [84793de]
+  - @kawarp/core@1.4.0
+
+## 1.1.4
+
+### Patch Changes
+
+- Updated dependencies [326e81c]
+  - @kawarp/core@1.3.1
+
+## 1.1.3
+
+### Patch Changes
+
+- Updated dependencies [22a748e]
+  - @kawarp/core@1.3.0
+
+## 1.1.2
+
+### Patch Changes
+
+- Updated dependencies [5638962]
+  - @kawarp/core@1.2.2
+
+## 1.1.1
+
+### Patch Changes
+
+- Updated dependencies [561a1f6]
+  - @kawarp/core@1.2.1
+
+## 1.1.0
+
+### Minor Changes
+
+- 8a9a339: Relicense from AGPL-3.0 to MIT.
+
+### Patch Changes
+
+- Updated dependencies [8a9a339]
+  - @kawarp/core@1.2.0
