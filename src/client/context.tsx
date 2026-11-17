@@ -63,6 +63,7 @@ export interface EditorContextValue {
   getCanvasSize: () => Dimensions;
   undoResize: () => void;
   canUndoResize: boolean;
+  isRestoringResize: boolean;
   zoomToFit: () => void;
   zoomIn: () => void;
   zoomOut: () => void;

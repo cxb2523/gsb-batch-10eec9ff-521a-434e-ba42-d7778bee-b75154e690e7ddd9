@@ -91,7 +91,7 @@ function FieldNameInput({
 }
 
 export function RightSidebar() {
-  const { selectedObject, updateSelectedObject, changeLayer, deleteSelected, canvas, setBackground, canvasWidth, canvasHeight } =
+  const { selectedObject, updateSelectedObject, changeLayer, deleteSelected, canvas, setBackground, canvasWidth, canvasHeight, isRestoringResize } =
     useEditor();
 
   const isText = selectedObject instanceof fabric.Textbox || selectedObject instanceof fabric.IText;
@@ -135,8 +135,10 @@ export function RightSidebar() {
           <button
             class="p-1 rounded text-zinc-400 bg-transparent border-none cursor-pointer hover:text-zinc-800 hover:bg-zinc-100 transition-all"
             onClick={async () => {
-              if (!canvas || !selectedObject) return;
+              if (!canvas || !selectedObject || isRestoringResize) return;
               const clone = await selectedObject.clone();
+              // A resize restore may have started while the clone was built.
+              if (isRestoringResize) return;
               clone.set({ left: (selectedObject.left || 0) + 20, top: (selectedObject.top || 0) + 20 });
               canvas.add(clone);
               canvas.setActiveObject(clone);

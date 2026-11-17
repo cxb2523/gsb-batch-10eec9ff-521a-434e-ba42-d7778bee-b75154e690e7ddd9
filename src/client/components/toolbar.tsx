@@ -28,6 +28,7 @@ export function Toolbar() {
     setCanvasSize,
     undoResize,
     canUndoResize,
+    isRestoringResize,
     undo,
     redo,
     canUndo,
@@ -224,14 +225,17 @@ export function Toolbar() {
           )}
         </div>
 
-        {canUndoResize && (
+        {(canUndoResize || isRestoringResize) && (
           <button
-            class="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium text-zinc-500 bg-transparent border border-zinc-300 cursor-pointer hover:text-zinc-900 hover:border-zinc-500 transition-all"
+            class="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium text-zinc-500 bg-transparent border border-zinc-300 cursor-pointer hover:text-zinc-900 hover:border-zinc-500 transition-all disabled:opacity-50 disabled:cursor-wait"
             onClick={undoResize}
-            title="Restore the previous size and layout"
+            disabled={!canUndoResize}
+            title={isRestoringResize
+              ? "Restoring every page…"
+              : "Restore the previous size and layout"}
           >
             <RotateCcw size={11} />
-            Undo resize
+            {isRestoringResize ? "Restoring…" : "Undo resize"}
           </button>
         )}
       </div>
