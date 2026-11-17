@@ -248,16 +248,30 @@ export default defineEventHandler(async (event) => {
       const srtCandidate = filePath.slice(0, -4) + '.srt';
       // Symlink-safe: reject an .srt that resolves outside the course root.
       assertResolvedInside(courseDir, srtCandidate);
+      const { convertSrtFileToVtt, SRT_TOO_LARGE_CODE } = await import('../../utils/srtToVtt.js');
       try {
-        const { convertSrtFileToVtt } = await import('../../utils/srtToVtt.js');
         const vttBuffer = await convertSrtFileToVtt(srtCandidate, fs);
         setResponseHeader(event, 'Content-Type', 'text/vtt; charset=utf-8');
         setResponseHeader(event, 'Content-Length', vttBuffer.length);
+        // Subtitle-specific cache policy. The Nitro route rule for `/api/**`
+        // applies `no-store` in onRequest, before this handler runs, so the
+        // value set here is the one clients see. A re-edited .srt is picked up
+        // once the max-age window lapses.
         setResponseHeader(event, 'Cache-Control', 'private, max-age=600');
+        setResponseHeader(event, 'X-Content-Type-Options', 'nosniff');
         return vttBuffer;
       } catch (err) {
         if (err && err.code === 'ENOENT') {
           // No .srt sibling — fall through to the normal not-found handling below.
+        } else if (err && err.code === SRT_TOO_LARGE_CODE) {
+          // A present-but-oversized .srt is a client-actionable condition, not
+          // a server fault: report 413 explicitly instead of a generic 500.
+          console.warn(`SRT too large to convert: ${srtCandidate} (${err.size} bytes)`);
+          throw createError({
+            statusCode: 413,
+            statusMessage: 'Subtitle file too large to convert',
+            data: { code: SRT_TOO_LARGE_CODE, maxBytes: err.maxBytes, size: err.size }
+          });
         } else {
           console.error(`SRT to VTT conversion failed for ${srtCandidate}:`, err);
           throw createError({ statusCode: 500, statusMessage: 'Subtitle conversion failed' });

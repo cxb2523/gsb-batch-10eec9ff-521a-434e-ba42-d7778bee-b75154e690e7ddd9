@@ -287,6 +287,13 @@ BCP 47 language code and optionally set `SUBTITLE_LABEL` to the label you want
 shown in the player. The selector itself is language-agnostic and derives its
 buttons from the browser's `TextTrackList`.
 
+SRT sidecars are capped at 2 MiB of source text. A larger `.srt` is not read
+or converted; the `.vtt` URL answers with `413 Subtitle file too large to
+convert` (JSON body carries the `ESRTTOOLARGE` code and the file's size).
+Conversions are memoized per path and file version, so repeated requests for
+the same unchanged sidecar reuse one converted result, while an edited file
+is re-converted on its next request.
+
 ### File monitoring
 
 - Real-time monitoring of the content directory
