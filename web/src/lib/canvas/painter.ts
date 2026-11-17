@@ -46,7 +46,7 @@ export interface TextStyle {
 	minSize?: number;
 }
 
-const DEFAULT_FAMILY =
+export const DEFAULT_FAMILY =
 	'"Geist Mono Variable", ui-monospace, "SF Mono", Menlo, Consolas, monospace';
 
 export class Painter {

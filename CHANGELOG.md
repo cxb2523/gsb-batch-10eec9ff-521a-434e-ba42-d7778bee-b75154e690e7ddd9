@@ -11,6 +11,22 @@ early entries point at those instead.
 
 ---
 
+## 18 November 2026 — A label is picked up exactly where it is seen
+
+**The name and value under a part now take the press at their real position.**
+The picking box used a rough width per character, so once you zoomed or turned
+a part the area that answered the pointer could drift off the printed text — a
+press on the label selected nothing, or a press on empty space grabbed it. The
+box now measures the actual font at the size the label is drawn, capped by the
+same screen-pixel limit, and anchors from the same point the painting uses.
+
+**Labels that are not drawn are not picked either.** Zoom out past the point
+where the names stop rendering and no label answers underneath; drag a label
+aside and its picking box moves with it, leaving its old spot empty. Overlapping
+labels still hand the press to the one painted on top.
+
+---
+
 ## 13 November 2026 — A 16×2 LCD for the microcontroller to talk to
 
 **The I²C character display is in the palette,** under Semiconductors with the

@@ -10,7 +10,7 @@
  * two places.
  */
 
-import { rectExpand, type Painter, type Rect, type Vec2 } from '$lib/canvas';
+import { DEFAULT_FAMILY, rectExpand, type Painter, type Rect, type Vec2 } from '$lib/canvas';
 import { formatWithUnit } from '$lib/units';
 import { ledInk, ledRating } from './led';
 import {
@@ -434,6 +434,99 @@ export function editableValue(instance: Instance): { key: string; unit: string }
  */
 export const labelPixels = (scale: number) => Math.min(11 * scale, 15);
 
+/**
+ * The zoom below which part labels are not drawn at all.
+ *
+ * One constant for the painter and the picker: a label that is not on screen
+ * must not be under the pointer either.
+ */
+export const LABEL_VISIBLE_SCALE = 0.35;
+
+/**
+ * Smallest screen size a part label is rendered at, matching the `minSize`
+ * passed to `painter.text` when labels are drawn. Between the visibility
+ * threshold and this size the text would be mush, so it is skipped — and not
+ * picked.
+ */
+export const LABEL_MIN_PIXELS = 6;
+
+/**
+ * The size a part label actually renders at, or null when it is not drawn.
+ *
+ * This is the single answer both sides use: drawing skips on null, and picking
+ * returns nothing on null, so "seen" and "hit" can never disagree about
+ * whether a label exists.
+ */
+export function partLabelFont(scale: number): number | null {
+	if (scale <= LABEL_VISIBLE_SCALE) return null;
+	const size = labelPixels(scale);
+	return size >= LABEL_MIN_PIXELS ? size : null;
+}
+
+/** Measures a label's rendered advance width in screen pixels. */
+export type TextMeasurer = (text: string, size: number) => number;
+
+/**
+ * The per-character advance of the monospace face as a fraction of its point
+ * size, used when no canvas is available to ask — headless tests, mostly.
+ *
+ * Same ratio the old box estimate used, so fallback geometry matches the
+ * platform-independent behaviour the picker already had.
+ */
+export const FALLBACK_CHAR_ADVANCE = 0.6;
+
+const measureCache = new Map<string, number>();
+const MEASURE_CACHE_LIMIT = 1000;
+let measureContext: CanvasRenderingContext2D | null | undefined;
+let fontWired = false;
+
+/**
+ * Drop widths measured in the fallback monospace face once the real face
+ * arrives, or the cache could keep answering with pre-load metrics while the
+ * painter had already switched to the loaded font — the same seen/hit split
+ * this module exists to prevent.
+ */
+function wireFontInvalidation(): void {
+	if (fontWired) return;
+	fontWired = true;
+	if (typeof document !== 'undefined') {
+		const fonts = document.fonts;
+		if (fonts && fonts.ready) fonts.ready.then(() => measureCache.clear());
+	}
+}
+
+/**
+ * The width a string of `text` set at `size` pixels advances in the exact font
+ * the painter draws labels with.
+ *
+ * Picking has to measure the same glyphs painting rasterizes, including the
+ * width limit the font imposes above the cap, rather than a per-character guess
+ * that holds for one zoom and drifts at every other one. A throwaway 2-D
+ * context provides `measureText` offscreen; where that does not exist the
+ * monospace fallback is used.
+ */
+export const measureLabelText: TextMeasurer = (text, size) => {
+	const key = `${size}|${text}`;
+	const cached = measureCache.get(key);
+	if (cached !== undefined) return cached;
+
+	wireFontInvalidation();
+	let width: number;
+	if (measureContext === undefined) {
+		measureContext =
+			typeof document === 'undefined' ? null : document.createElement('canvas').getContext('2d');
+	}
+	if (measureContext) {
+		measureContext.font = `${size}px ${DEFAULT_FAMILY}`;
+		width = measureContext.measureText(text).width;
+	} else {
+		width = text.length * size * FALLBACK_CHAR_ADVANCE;
+	}
+	if (measureCache.size >= MEASURE_CACHE_LIMIT) measureCache.clear();
+	measureCache.set(key, width);
+	return width;
+};
+
 /** A designator or value as printed beside a part, anchored in world units. */
 export interface PartLabel {
 	slot: LabelSlot;
@@ -499,11 +592,25 @@ export function partLabels(instance: Instance): PartLabel[] {
 	return labels;
 }
 
-/** Where a label covers on screen, measured the way the monospace face sets it. */
-export function labelScreenBox(label: PartLabel, toScreen: (world: Vec2) => Vec2, scale: number): Rect {
+/**
+ * Where a label covers on screen, measured from the same font and anchors the
+ * painter draws it with.
+ *
+ * The anchor point is the world position `partLabels` hands both sides, so a
+ * rotated part and a dragged offset land here exactly where they land in the
+ * drawing. Width is the font's real advance width at the rendered (capped)
+ * size; the box then grows from the anchor the way `textAlign` and
+ * `textBaseline` place the glyphs.
+ */
+export function labelScreenBox(
+	label: PartLabel,
+	toScreen: (world: Vec2) => Vec2,
+	scale: number,
+	measure: TextMeasurer = measureLabelText
+): Rect {
 	const size = labelPixels(scale);
 	const at = toScreen(label.at);
-	const w = label.text.length * size * 0.6;
+	const w = measure(label.text, size);
 	return {
 		x: label.align === 'center' ? at.x - w / 2 : at.x,
 		y: label.baseline === 'bottom' ? at.y - size : at.y,
@@ -514,22 +621,33 @@ export function labelScreenBox(label: PartLabel, toScreen: (world: Vec2) => Vec2
 
 /**
  * The part label under a point on screen, if any. Only where labels are drawn
- * at all: below that zoom there is nothing to pick up.
+ * at all — below that zoom, or under the minimum rendered size, there is
+ * nothing to pick up.
+ *
+ * Positions come straight from `partLabels`: the same call that decides where
+ * a label is painted, including a part's rotation and any drag offset stored
+ * on the instance. A second placement calculation here would be a second
+ * answer for the same question, and the two would drift.
  */
 export function labelAt(
 	schematic: Schematic,
 	screen: Vec2,
 	toScreen: (world: Vec2) => Vec2,
-	scale: number
+	scale: number,
+	measure: TextMeasurer = measureLabelText
 ): { instance: Instance; label: PartLabel } | null {
-	if (scale <= 0.35) return null;
+	// Same gate the drawing side goes through, so an unrendered label can never
+	// be a hit.
+	if (partLabelFont(scale) === null) return null;
 	// A couple of pixels of slack: the text is small, and a press that lands
 	// between two letters of it is still a press on it.
 	const slack = 2;
+	// Back to front: when labels overlap, the one painted last is on top and is
+	// the one the press means.
 	for (let i = schematic.instances.length - 1; i >= 0; i--) {
 		const instance = schematic.instances[i];
 		for (const label of partLabels(instance)) {
-			const box = labelScreenBox(label, toScreen, scale);
+			const box = labelScreenBox(label, toScreen, scale, measure);
 			if (
 				screen.x >= box.x - slack &&
 				screen.x <= box.x + box.w + slack &&
@@ -642,7 +760,7 @@ export function drawSchematic(painter: Painter, view: SchematicView, visible: Re
 	}
 
 	const showPins = scale > 0.45;
-	const showLabels = scale > 0.35;
+	const showLabels = scale > LABEL_VISIBLE_SCALE;
 
 	for (const instance of view.schematic.instances) {
 		if (!instanceVisible(instance, region)) continue;
@@ -737,14 +855,19 @@ export function drawSchematic(painter: Painter, view: SchematicView, visible: Re
 		}
 
 		if (showLabels) {
-			for (const label of partLabels(instance)) {
-				painter.text(label.text, label.at, {
-					size: labelSize,
-					color: label.strong ? theme.labelStrong : theme.labelDim,
-					align: label.align,
-					baseline: label.baseline,
-					minSize: 6
-				});
+			// The same size gate the picker uses, so a label skipped here for being
+			// too small is not offered under the pointer either.
+			const partSize = partLabelFont(scale);
+			if (partSize !== null) {
+				for (const label of partLabels(instance)) {
+					painter.text(label.text, label.at, {
+						size: partSize,
+						color: label.strong ? theme.labelStrong : theme.labelDim,
+						align: label.align,
+						baseline: label.baseline,
+						minSize: LABEL_MIN_PIXELS
+					});
+				}
 			}
 		}
 	}

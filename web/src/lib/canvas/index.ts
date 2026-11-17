@@ -11,7 +11,7 @@
 export * from './geometry';
 export { Viewport, type ViewportState, type ViewportLimits } from './viewport';
 export { LayeredSurface, type SurfaceSize } from './surface';
-export { Painter, type StrokeStyle, type FillStyle, type TextStyle } from './painter';
+export { Painter, DEFAULT_FAMILY, type StrokeStyle, type FillStyle, type TextStyle } from './painter';
 export { Scene, type SceneItem } from './scene';
 export { SnapIndex, type SnapKind, type SnapPoint, type SnapSegment, type SnapTarget } from './snap';
 export { CanvasEditor, type EditorOptions, type RenderFn } from './editor';
