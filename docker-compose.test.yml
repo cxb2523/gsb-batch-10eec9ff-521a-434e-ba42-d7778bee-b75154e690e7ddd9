@@ -1,0 +1,64 @@
+# Each run uses fresh named volumes. Always finish with `down -v`.
+services:
+  fixtures:
+    image: node:24-alpine
+    entrypoint: /bin/sh
+    command: ["-ec", "cp -R /fixtures/content/. /content/; cp -R /fixtures/branding/. /branding/; chown -R 1000:1000 /content /branding"]
+    volumes:
+      - ./frontend/tests/fixtures:/fixtures:ro
+      - test_content:/content
+      - test_branding:/branding
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+      target: production
+    depends_on:
+      fixtures:
+        condition: service_completed_successfully
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      NODE_ENV: production
+      DATABASE_PATH: /app/data/database/database.sqlite
+      ADMIN_NAME: root
+      ADMIN_PASSWORD: TestAdminPass!
+      # The browser suite deliberately creates many users and sessions from
+      # one container address. Production defaults remain intentionally low.
+      AUTH_REQUEST_LIMIT: 10000
+      REGISTRATION_REQUEST_LIMIT: 10000
+      CREDENTIAL_BOOTSTRAP_REQUEST_LIMIT: 10000
+    volumes:
+      - test_database:/app/data/database
+      - test_content:/app/data/content
+      - test_branding:/app/data/branding
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/users >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+      target: test-runner
+    volumes:
+      # Mutation tests must edit the same isolated files served by web.
+      - test_content:/work/tests/fixtures/content
+      - test_branding:/work/tests/fixtures/branding
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      PW_BASE_URL: http://web:3000
+      PW_ADMIN_NAME: root
+      PW_ADMIN_PASSWORD: TestAdminPass!
+      CI: 1
+
+volumes:
+  test_database:
+  test_content:
+  test_branding:

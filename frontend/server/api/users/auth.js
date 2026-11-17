@@ -1,0 +1,227 @@
+import { defineEventHandler, readBody, createError, setCookie, deleteCookie } from 'h3';
+import { getDb } from '../../utils/db';
+import { verifyCredential, hashCredential } from '../../utils/credentials';
+import { createSession, createCredentialUpgrade, deleteSessionByToken } from '../../utils/sessions';
+import {
+  sessionCookieOpts,
+  upgradeCookieOpts,
+  SESSION_COOKIE,
+  UPGRADE_COOKIE
+} from '../../middleware/session';
+import {
+  AUTH_REQUEST_LIMIT,
+  AUTH_REQUEST_WINDOW_MS,
+  checkRateLimit,
+  configuredRequestLimit,
+  consumeRequestLimit,
+  recordFailure,
+  recordSuccess
+} from '../../utils/rate-limit';
+import { getClientIp } from '../../utils/requestIp';
+import { getBoolSetting } from '../../utils/systemSettings';
+
+// A hash to verify-against when the user/credential lookup misses, so the
+// response time of "no such user" / "no password set" matches the time of
+// "wrong password". Lazily initialized to keep module load synchronous.
+let dummyHashPromise = null;
+function getDummyHash() {
+  if (!dummyHashPromise) {
+    dummyHashPromise = hashCredential('timing-equalizer-' + Math.random().toString(36).slice(2));
+  }
+  return dummyHashPromise;
+}
+
+// POST /api/users/auth — verify a user's credentials and issue a session.
+// Body: { userId, password? | pin? }
+// Returns: { success: true,  user: { id, name, avatar, isAdmin, is_active } }
+//          { success: false, message }
+//
+// On success: sets the sg_session HttpOnly cookie. Subsequent requests carry
+// the cookie automatically and the session middleware (server/middleware/
+// session.js) populates event.context.user.
+export default defineEventHandler(async (event) => {
+  if (event.node.req.method !== 'POST') {
+    return createError({ statusCode: 405, statusMessage: 'Method Not Allowed' });
+  }
+
+  try {
+    const body = await readBody(event);
+    const { userId, password, pin } = body || {};
+
+    if (!userId) {
+      return createError({ statusCode: 400, statusMessage: 'User ID is required' });
+    }
+
+    // Two complementary IP-scoped limits:
+    //   - a fixed request budget bounds Argon2 work even when the caller rotates
+    //     random user IDs;
+    //   - per (userId, ip) failures add exponential backoff for credential
+    //     guessing without allowing other IPs to lock the victim account.
+    // The IP itself comes from getClientIp(), which does NOT trust
+    // client-supplied X-Forwarded-For unless the operator opts in via
+    // TRUST_PROXY_HOPS — closing the header-spoof bypass.
+    const ip = getClientIp(event);
+    const requestBudget = consumeRequestLimit(`auth-ip:${ip}`, {
+      limit: configuredRequestLimit('AUTH_REQUEST_LIMIT', AUTH_REQUEST_LIMIT),
+      windowMs: AUTH_REQUEST_WINDOW_MS
+    });
+    if (!requestBudget.allowed) {
+      return createError({
+        statusCode: 429,
+        statusMessage: `Too many authentication requests. Try again in ${requestBudget.retryAfterSeconds}s.`
+      });
+    }
+    const ipKey = `auth:${userId}:${ip}`;
+    const rlIp = checkRateLimit(ipKey);
+    if (!rlIp.allowed) {
+      return createError({
+        statusCode: 429,
+        statusMessage: `Too many failed attempts. Try again in ${rlIp.retryAfterSeconds}s.`
+      });
+    }
+    const recordAuthFailure = () => {
+      recordFailure(ipKey);
+    };
+    const recordAuthSuccess = () => {
+      recordSuccess(ipKey);
+    };
+
+    const db = getDb();
+    const user = db
+      .prepare('SELECT id, name, avatar, password, pin, isAdmin, is_active FROM users WHERE id = ?')
+      .get(userId);
+
+    // Read the current PIN policy once; used for the needsCredentialUpdate
+    // signal at the end of the handler.
+    const allowPin = getBoolSetting(db, 'allow_pin', true);
+
+    if (!user) {
+      // Mirror the response shape AND timing of the "wrong password" path so
+      // we don't leak user existence via response shape OR response time.
+      await verifyCredential(password || pin || 'x', await getDummyHash());
+      recordAuthFailure();
+      return { success: false, message: 'Invalid credentials' };
+    }
+
+    if (!user.is_active) {
+      // Intentional shape difference: pending users need to know they exist
+      // and are awaiting approval. This leaks existence by design (per the
+      // wishlist).
+      return {
+        success: false,
+        message: 'This account is awaiting administrator approval'
+      };
+    }
+
+    if (!password && !pin) {
+      recordAuthFailure();
+      return { success: false, message: 'Invalid credentials' };
+    }
+
+    // Try password first, then PIN. Either match wins, mirroring the
+    // pre-existing UX where users with both can use either. We always verify
+    // against either the real stored value OR a dummy hash so the response
+    // time doesn't reveal which credential the user actually has set.
+    let matched = null; // 'password' | 'pin' | null
+    let needsRehash = false;
+
+    if (password) {
+      const target = user.password || (await getDummyHash());
+      const r = await verifyCredential(password, target);
+      if (r.ok && user.password) {
+        matched = 'password';
+        needsRehash = r.needsRehash;
+      }
+    }
+
+    if (!matched && pin) {
+      // PIN authentication is disabled when allow_pin=false UNLESS the user
+      // has no password (the one-time bridge so they're not locked out
+      // before they can set one).
+      const pinAuthAllowed = allowPin || !user.password;
+      const target = user.pin || (await getDummyHash());
+      const r = await verifyCredential(pin, target);
+      if (r.ok && user.pin && pinAuthAllowed) {
+        matched = 'pin';
+        needsRehash = r.needsRehash;
+      }
+    }
+
+    if (!matched) {
+      recordAuthFailure();
+      return { success: false, message: 'Invalid credentials' };
+    }
+
+    // Best-effort inline migration: if the value matched but is still
+    // plaintext, rewrite it as an argon2 hash. Failure to *hash* must NOT
+    // block login — the next login will retry. But the write is a
+    // compare-and-swap against the exact legacy value we verified: if an
+    // admin reset the credential while we were hashing, the swap affects zero
+    // rows, meaning the credential we authenticated with is no longer current.
+    // In that case we refuse to issue a session rather than clobber the reset
+    // and hand out access after the admin's session revocation.
+    if (needsRehash) {
+      const column = matched === 'password' ? 'password' : 'pin';
+      const verifiedValue = matched === 'password' ? user.password : user.pin;
+      try {
+        const fresh = await hashCredential(matched === 'password' ? password : pin);
+        const res = db
+          .prepare(`UPDATE users SET ${column} = ? WHERE id = ? AND ${column} = ?`)
+          .run(fresh, userId, verifiedValue);
+        if (res.changes === 1) user[column] = fresh;
+        if (res.changes !== 1) {
+          console.warn(`[auth] credential changed mid-login for ${userId}; refusing session`);
+          recordAuthFailure();
+          return { success: false, message: 'Invalid credentials' };
+        }
+      } catch (err) {
+        // Hashing/storage itself failed — nothing was overwritten, so the
+        // reset race does not apply; let the login proceed and retry later.
+        console.warn(`[auth] inline rehash failed for ${userId}:`, err.message);
+      }
+    }
+
+    return db.transaction(() => {
+      const current = db.prepare('SELECT password, pin, is_active, isAdmin FROM users WHERE id = ?').get(userId);
+      if (!current || !current.is_active || current.password !== user.password ||
+          current.pin !== user.pin || current.isAdmin !== user.isAdmin ||
+          getBoolSetting(db, 'allow_pin', true) !== allowPin) {
+        recordAuthFailure();
+        return { success: false, message: 'Invalid credentials' };
+      }
+      const needsPinUpgrade = matched === 'pin' && !user.password && !allowPin;
+      const userAgent = event.node.req.headers['user-agent'] || null;
+
+      if (needsPinUpgrade) {
+        // A pre-existing normal cookie would defeat the upgrade boundary, so
+        // revoke it before issuing the path-scoped bridge credential.
+        if (event.context.sessionToken) {
+          deleteSessionByToken(db, event.context.sessionToken);
+        }
+        deleteCookie(event, SESSION_COOKIE, { path: '/' });
+        const { token, expiresAt } = createCredentialUpgrade(db, userId);
+        setCookie(event, UPGRADE_COOKIE, token, upgradeCookieOpts(event, expiresAt));
+      } else {
+        const { token, expiresAt } = createSession(db, userId, { userAgent });
+        setCookie(event, SESSION_COOKIE, token, sessionCookieOpts(event, expiresAt));
+        deleteCookie(event, UPGRADE_COOKIE, { path: '/api/users/complete-pin-upgrade' });
+      }
+      recordAuthSuccess();
+
+      return {
+        success: true,
+        needsCredentialUpdate: needsPinUpgrade ? 'pin_disabled' : null,
+        user: {
+          id: user.id,
+          name: user.name,
+          avatar: user.avatar,
+          isAdmin: user.isAdmin,
+          is_active: user.is_active
+        }
+      };
+    }).immediate();
+  } catch (error) {
+    console.error('Error authenticating user:', error);
+    return createError({ statusCode: 500, statusMessage: 'Authentication failed' });
+  }
+});

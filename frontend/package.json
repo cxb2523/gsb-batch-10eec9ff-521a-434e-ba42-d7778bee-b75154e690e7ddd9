@@ -1,0 +1,41 @@
+{
+  "name": "skillgoblin",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "nuxt dev",
+    "build": "nuxt build",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "vitest run",
+    "test:unit:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui"
+  },
+  "dependencies": {
+    "@tailwindcss/forms": "^0.5.7",
+    "@tailwindcss/vite": "^4.3.3",
+    "argon2": "^0.45.1",
+    "beanheads-vue": "1.2.1",
+    "better-sqlite3": "^13.0.3",
+    "busboy": "^1.6.0",
+    "chokidar": "^5.0.0",
+    "lru-cache": "^11.5.2",
+    "nuxt": "^4.5.2",
+    "sharp": "^0.35.4",
+    "tailwindcss": "^4.3.3",
+    "uuid": "^14.0.1"
+  },
+  "devDependencies": {
+    "@nuxt/devtools": "^3.4.2",
+    "@playwright/test": "1.62.1",
+    "jsdom": "^30.0.1",
+    "vitest": "^5.0.0"
+  },
+  "overrides": {
+    "glob": "^10.3.10",
+    "inflight": "npm:@isaacs/inflight@^1.0.4"
+  }
+}

@@ -1,0 +1,38 @@
+# Local prod-like harness for hand-testing against real content without
+# touching ./data (the production volume). Mirrors the production layout
+# (Dockerfile.prod, ADMIN_NAME / ADMIN_PASSWORD bootstrap) but mounts
+# ./manual-test/data so you can reset to "fresh install" without losing
+# any real progress.
+#
+# Run with:
+#   docker compose -f docker-compose.manual.yml up -d --build
+#   open http://localhost:3000
+#
+# Reset to "fresh install" state with:
+#   docker compose -f docker-compose.manual.yml down
+#   rm -rf manual-test/data/database/*
+#
+# Drop course folders into manual-test/data/content/ — the watcher picks
+# them up live (or rescan from the admin panel).
+---
+services:
+  skillgoblin-manual:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: skillgoblin-manual
+    volumes:
+      - ./manual-test/data/database:/app/data/database
+      - ./manual-test/data/content:/app/data/content
+      - ./manual-test/data/branding:/app/data/branding
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3000
+      - NODE_ENV=production
+      - DATABASE_PATH=/app/data/database/database.sqlite
+      - ADMIN_NAME=admin
+      - ADMIN_PASSWORD=skill-goblin-test
+      - CHOKIDAR_POLLING_INTERVAL=60000
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
