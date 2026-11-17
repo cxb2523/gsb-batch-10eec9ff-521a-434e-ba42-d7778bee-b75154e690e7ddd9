@@ -7,8 +7,13 @@ import type { ReviewVideoHostPort } from '../../../shared/ports/review-video-hos
 import type { PreferencesChangeHandler, ReviewPlayerPort } from '../player/player-review.port';
 import { PlayerLifecycle, createAbortError, waitForPlyrMetadata, waitForPlyrTargetData } from '../player/player-media.utils';
 import { PlyrInstanceController } from '../controllers/plyr-instance.controller';
-import { calculateEventTargetTime, calculatePlaybackRate } from '../player/player-commands.utils';
-import { normalizeReviewRange } from '../player/player-range.utils';
+import { calculatePlaybackRate, calculateEventTargetTime } from '../player/player-commands.utils';
+import {
+  calculateStepTargetTime,
+  normalizeReviewRange,
+  resolveReviewBounds,
+  resolveReviewStart,
+} from '../player/player-range.utils';
 const FRAME_RATE_FALLBACK = 60;
 const PLYR_VERSION = '3.8.5';
 const assertNever = (value: never): never => {
@@ -42,6 +47,7 @@ export class PlyrAdapter implements ReviewPlayerPort {
     this.clip = clip;
     this.requireVideo();
     this.range = normalizeReviewRange(clip.range);
+    this.resetStepState();
     this.applyPreferences(preferences);
   }
 
@@ -56,18 +62,22 @@ export class PlyrAdapter implements ReviewPlayerPort {
 
     switch (command.type) {
       case 'toggle-playback':
+        this.resetStepState();
         if (video.paused) void this.play(video);
         else video.pause();
         return;
       case 'restart':
+        this.resetStepState();
         void this.restartRange(video);
         return;
       case 'toggle-zoom':
         this.instance.element?.classList.toggle('vacnet-zoom-active');
         return;
       case 'jump-to-event':
-        if (this.clip?.eventTime === -1) return;
-        video.currentTime = calculateEventTargetTime(this.clip?.eventTime ?? this.range.start, this.range.start);
+        if (this.clip?.eventTime === -1 || this.clip?.eventTime === undefined) return;
+        // An explicit jump invalidates the accumulated stepping target.
+        this.resetStepState();
+        video.currentTime = calculateEventTargetTime(this.clip.eventTime, resolveReviewBounds(this.range, video.duration));
         return;
       case 'change-speed': {
         const rate = calculatePlaybackRate(video.playbackRate, command.direction);
@@ -89,13 +99,16 @@ export class PlyrAdapter implements ReviewPlayerPort {
 
   async load(source: string, clip: ClipData, signal: AbortSignal): Promise<void> {
     if (signal.aborted) throw createAbortError();
+    // Bumping the generation invalidates every in-flight wait of an older load.
     const generation = this.lifecycle.nextGeneration();
-    const operationSignal = AbortSignal.any([signal, this.lifecycle.signal]);
+    const operationSignal = AbortSignal.any([signal, this.lifecycle.signal, this.lifecycle.operationSignal]);
     this.clip = clip;
     const video = this.requireVideo();
     this.range = normalizeReviewRange(clip.range);
+    this.resetStepState();
     if (clip.reviewType === 'cheating') {
       // The site owns source selection, playback position and watched progress.
+      this.instance.element?.classList.remove('vacnet-video-loading');
       this.instance.updateMarker(clip, this.options.catalog()?.triggerMarkerLabel ?? '');
       return;
     }
@@ -104,19 +117,21 @@ export class PlyrAdapter implements ReviewPlayerPort {
     this.instance.element?.classList.add('vacnet-video-loading');
 
     try {
-       const catalog = this.options.catalog();
-       if (!catalog) throw new Error(getMessage('errVideoJsEarlyConfig'));
-       const metadata = waitForPlyrMetadata(video, operationSignal, catalog);
+      const catalog = this.options.catalog();
+      if (!catalog) throw new Error(getMessage('errVideoJsEarlyConfig'));
+      const metadata = waitForPlyrMetadata(video, operationSignal, catalog);
       video.src = source;
-       video.load();
-       await metadata;
-        if (!this.lifecycle.isCurrent(generation)) throw createAbortError();
-       video.currentTime = this.range.start;
-        this.instance.updateMarker(clip, catalog.triggerMarkerLabel);
-        await waitForPlyrTargetData(video, this.range.start, operationSignal, catalog);
-        if (!this.lifecycle.isCurrent(generation)) throw createAbortError();
-       await this.play(video);
+      video.load();
+      await metadata;
+      if (!this.lifecycle.isCurrent(generation)) throw createAbortError();
+      const startTime = resolveReviewStart(this.range);
+      video.currentTime = startTime;
+      this.instance.updateMarker(clip, catalog.triggerMarkerLabel);
+      await waitForPlyrTargetData(video, startTime, operationSignal, catalog);
+      if (!this.lifecycle.isCurrent(generation)) throw createAbortError();
+      await this.play(video);
     } finally {
+      // A superseded load must not clear the state owned by the newer load.
       if (this.lifecycle.isCurrent(generation)) this.instance.element?.classList.remove('vacnet-video-loading');
     }
   }
@@ -224,11 +239,16 @@ private readonly onEnded = (): void => {
   };
 
   private calculateStepTime(video: HTMLVideoElement, direction: number): number {
+    // Consecutive key presses accumulate onto the previous target; the element's
+    // currentTime may still lag behind because the browser applies seeks lazily.
     const baseTime = this.stepTargetTime !== null ? this.stepTargetTime : video.currentTime;
-    const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
-    const target = baseTime + direction * this.frameDuration(video);
-    const lower = this.range.end > this.range.start ? this.range.start : 0;
-    return Math.min(duration, Math.max(lower, target));
+    return calculateStepTargetTime(baseTime, direction, this.frameDuration(video), this.range, video.duration);
+  }
+
+  private resetStepState(): void {
+    this.stepTargetTime = null;
+    if (this.stepTimeoutId !== null) window.clearTimeout(this.stepTimeoutId);
+    this.stepTimeoutId = null;
   }
 
   private resetStepTimeout(): void {

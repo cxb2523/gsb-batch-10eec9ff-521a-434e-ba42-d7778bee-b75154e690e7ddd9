@@ -1,5 +1,6 @@
 import { getMessage } from '../../../shared/services/i18n.service';
 import type { ClipRange } from '../../../entities/clip.entity';
+import { calculateStepTargetTime } from '../player/player-range.utils';
 import type { Preferences } from '../../../entities/preferences.entity';
 import type { MessageCatalog } from '../../../shared/services/i18n.service';
 import type { VideoJsPlayer } from '../video-js.port';
@@ -67,14 +68,14 @@ export class VideoJsInstanceController {
   }
 
   clampStep(player: VideoJsPlayer, range: ClipRange, direction: -1 | 1): void {
-    const lower = range.start;
-    const duration = player.duration();
-    const fallbackUpper = player.currentTime() + this.frameDuration();
-    const upper = range.end > lower
-      ? range.end
-      : Number.isFinite(duration) && duration >= lower ? duration : fallbackUpper;
-    const target = player.currentTime() + direction * this.frameDuration();
-    player.currentTime(Math.min(upper, Math.max(lower, target)));
+    const target = calculateStepTargetTime(
+      player.currentTime(),
+      direction,
+      this.frameDuration(),
+      range,
+      player.duration(),
+    );
+    player.currentTime(target);
   }
 
   dispose(onVolumeChange: () => void, onTimeUpdate: () => void): void {

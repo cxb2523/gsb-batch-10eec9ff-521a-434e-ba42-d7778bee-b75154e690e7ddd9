@@ -6,8 +6,8 @@ import type { PlayerCommand } from '../../../shared/ports/protocol.port';
 import type { ReviewPlayerPort, PreferencesChangeHandler } from '../player/player-review.port';
 import { PlayerLifecycle, createAbortError, waitForVideoJsMetadata, waitForVideoJsTargetData } from '../player/player-media.utils';
 import { VideoJsInstanceController } from '../controllers/video-js-instance.controller';
-import { calculateEventTargetTime, calculatePlaybackRate } from '../player/player-commands.utils';
-import { normalizeReviewRange } from '../player/player-range.utils';
+import { calculatePlaybackRate, calculateEventTargetTime } from '../player/player-commands.utils';
+import { normalizeReviewRange, resolveReviewBounds, resolveReviewStart } from '../player/player-range.utils';
 
 const assertNever = (value: never): never => {
   throw new Error(getMessage("errUnhandledPlayerCommand", String(value)));
@@ -59,7 +59,7 @@ export class VideoJsAdapter implements ReviewPlayerPort {
         this.instance.videoElement()?.classList.toggle('vacnet-zoom-active');
         return;
       case 'jump-to-event':
-        player.currentTime(calculateEventTargetTime(this.eventTime, this.range.start));
+        player.currentTime(calculateEventTargetTime(this.eventTime, resolveReviewBounds(this.range, player.duration())));
         return;
       case 'change-speed': {
         const rate = calculatePlaybackRate(player.playbackRate(), command.direction);
@@ -96,7 +96,7 @@ export class VideoJsAdapter implements ReviewPlayerPort {
   async load(source: string, clip: ClipData, signal: AbortSignal): Promise<void> {
     if (signal.aborted) throw createAbortError();
     const generation = this.lifecycle.nextGeneration();
-    const operationSignal = AbortSignal.any([signal, this.lifecycle.signal]);
+    const operationSignal = AbortSignal.any([signal, this.lifecycle.signal, this.lifecycle.operationSignal]);
     const player = this.instance.getPlayer();
     if (!player) throw new Error(getMessage("errVideoJsUnavailable"));
     this.range = normalizeReviewRange(clip.range);
@@ -109,10 +109,11 @@ export class VideoJsAdapter implements ReviewPlayerPort {
     try {
       const catalog = this.catalog();
       if (!catalog) throw new Error(getMessage('errVideoJsEarlyConfig'));
-      await waitForVideoJsMetadata(player, clip.range.start, source, operationSignal, catalog);
+      const startTime = resolveReviewStart(this.range);
+      await waitForVideoJsMetadata(player, startTime, source, operationSignal, catalog);
       if (!this.lifecycle.isCurrent(generation)) throw createAbortError();
       const targetVideo = this.instance.videoElement();
-      if (targetVideo) await waitForVideoJsTargetData(targetVideo, clip.range.start, operationSignal, catalog);
+      if (targetVideo) await waitForVideoJsTargetData(targetVideo, startTime, operationSignal, catalog);
       if (!this.lifecycle.isCurrent(generation)) throw createAbortError();
       await Promise.resolve(player.play());
     } finally {

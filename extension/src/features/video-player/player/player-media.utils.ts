@@ -9,13 +9,27 @@ export const createAbortError = (): DOMException => new DOMException(ABORT_ERROR
 export class PlayerLifecycle {
   private generation = 0;
   private readonly disposeController = new AbortController();
+  private operationController = new AbortController();
 
   get signal(): AbortSignal { return this.disposeController.signal; }
-  nextGeneration(): number { return ++this.generation; }
+  /**
+   * Aborted as soon as a newer load starts. Waits issued by a superseded load
+   * reject promptly instead of lingering until a media event or the timeout,
+   * and can never resume to touch the newly loaded clip.
+   */
+  get operationSignal(): AbortSignal { return this.operationController.signal; }
+
+  nextGeneration(): number {
+    this.operationController.abort();
+    this.operationController = new AbortController();
+    return ++this.generation;
+  }
+
   isCurrent(generation: number): boolean { return generation === this.generation && !this.signal.aborted; }
 
   dispose(): void {
     this.generation += 1;
+    this.operationController.abort();
     this.disposeController.abort();
   }
 }
