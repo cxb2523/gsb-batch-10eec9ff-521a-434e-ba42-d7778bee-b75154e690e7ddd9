@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   createCeilingClipCurve,
+  LIMITER_CEILING_SMOOTHING_MS,
   LIMITER_CEILING_TOLERANCE,
   lookaheadMsToSamples,
   PeakLimiter
@@ -156,6 +157,81 @@ describe('PeakLimiter timing and settings', () => {
     const [raised] = process(short, undefined, limiter)
     // The first sample after raising must not jump straight back to unity ceiling.
     expect(raised[0]).toBeLessThan(1)
+  })
+
+  it('applies a lowered ceiling to samples already inside the lookahead delay line', () => {
+    const lookaheadMs = 2
+    const limiter = new PeakLimiter({ sampleRate: SAMPLE_RATE, ceilingDb: 0, lookaheadMs })
+    const latency = lookaheadMsToSamples(lookaheadMs, SAMPLE_RATE)
+
+    // A loud step enters the delay line but has not reached the output yet.
+    const first = new Float32Array(latency / 2)
+    first[0] = 8
+    process(first, undefined, limiter)
+
+    // Lowering the ceiling must bound the in-flight step as well, not just future input.
+    limiter.setCeilingDb(-24)
+    const rest = new Float32Array(4096)
+    const [left] = process(rest, undefined, limiter)
+
+    const newCeiling = decibelsToGain(-24)
+    expect(peakOf(left)).toBeLessThanOrEqual(newCeiling + LIMITER_CEILING_TOLERANCE)
+    // The step is actually emitted (near the new ceiling), not muted.
+    expect(peakOf(left)).toBeGreaterThan(newCeiling * 0.9)
+  })
+
+  it('ramps a raised ceiling over 20 ms and never exceeds the effective ceiling during the ramp', () => {
+    // Short release so the 20 ms ceiling ramp (not the gain release) is the binding constraint.
+    const limiter = new PeakLimiter({ sampleRate: SAMPLE_RATE, ceilingDb: -12, releaseMs: 10 })
+    const settle = new Float32Array(4800)
+    settle.fill(1)
+    process(settle, undefined, limiter)
+
+    limiter.setCeilingDb(0)
+    const frames = 4800 // 100 ms of full-scale step input
+    const step = new Float32Array(frames)
+    step.fill(1)
+    const out = new Float32Array(frames)
+    limiter.process(step, step, out, out, frames)
+
+    // Replay the 20 ms one-pole ramp the limiter applies to its effective ceiling.
+    const coefficient = 1 - Math.exp(-1 / ((LIMITER_CEILING_SMOOTHING_MS / 1000) * SAMPLE_RATE))
+    let effective = decibelsToGain(-12)
+    for (let frame = 0; frame < frames; frame += 1) {
+      effective += (1 - effective) * coefficient
+      expect(Math.abs(out[frame])).toBeLessThanOrEqual(effective + LIMITER_CEILING_TOLERANCE)
+    }
+
+    // The ramp is neither instant nor stalled: well under unity early, essentially settled late.
+    expect(peakOf(out.slice(0, SAMPLE_RATE / 100))).toBeLessThan(0.7) // first 10 ms
+    expect(out[frames - 1]).toBeGreaterThan(0.98)
+  })
+
+  it('keeps a synthetic sine bounded across lowering and raising the ceiling', () => {
+    const limiter = new PeakLimiter({ sampleRate: SAMPLE_RATE })
+    const sine = (frames: number, offset: number) => {
+      const signal = new Float32Array(frames)
+      for (let index = 0; index < frames; index += 1) {
+        signal[index] = 1.5 * Math.sin((2 * Math.PI * 440 * (offset + index)) / SAMPLE_RATE)
+      }
+      return signal
+    }
+
+    const blockFrames = 4800
+    const [first] = process(sine(blockFrames, 0), undefined, limiter)
+    expect(peakOf(first)).toBeLessThanOrEqual(CEILING + LIMITER_CEILING_TOLERANCE)
+
+    limiter.setCeilingDb(-12)
+    const loweredCeiling = decibelsToGain(-12)
+    const [second] = process(sine(blockFrames, blockFrames), undefined, limiter)
+    expect(peakOf(second)).toBeLessThanOrEqual(loweredCeiling + LIMITER_CEILING_TOLERANCE)
+
+    limiter.setCeilingDb(-1)
+    const [third] = process(sine(blockFrames, blockFrames * 2), undefined, limiter)
+    // During the 20 ms ramp the effective ceiling is below the target, so the target bound holds.
+    expect(peakOf(third)).toBeLessThanOrEqual(CEILING + LIMITER_CEILING_TOLERANCE)
+    // The release/smoothing keeps the first milliseconds well below the restored ceiling.
+    expect(peakOf(third.slice(0, 240))).toBeLessThan(CEILING * 0.9)
   })
 
   it('reports latency, output peak and maximum reduction', () => {

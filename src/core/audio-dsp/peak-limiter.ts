@@ -145,11 +145,28 @@ export class PeakLimiter {
     return gainToDecibels(this.targetCeilingLinear)
   }
 
-  /** Raising the ceiling ramps up over 20 ms; lowering it applies instantly to stay bounded. */
+  /**
+   * Raising the ceiling ramps up over 20 ms; lowering it applies instantly to stay bounded.
+   *
+   * Lowering also rescales the required-gain entries still held in the lookahead window: those
+   * were computed against the previous (higher) effective ceiling, so without rescaling a sample
+   * already sitting in the delay line could be emitted above the new ceiling for up to
+   * `latencySamples` frames. Every live entry was derived from a ceiling <= the previous
+   * smoothed value, hence scaling by `next / previous` keeps each of them conservative
+   * (`required <= next / peak`), and the very next output frame is bounded by the new ceiling.
+   */
   setCeilingDb(decibels: number): void {
-    this.targetCeilingLinear = decibelsToGain(clampLimiterCeilingDb(decibels))
-    if (this.targetCeilingLinear < this.smoothedCeilingLinear) {
-      this.smoothedCeilingLinear = this.targetCeilingLinear
+    const next = decibelsToGain(clampLimiterCeilingDb(decibels))
+    const previousEffective = this.smoothedCeilingLinear
+    this.targetCeilingLinear = next
+    if (next < this.smoothedCeilingLinear) {
+      this.smoothedCeilingLinear = next
+      if (previousEffective > 0) {
+        const scale = Math.min(1, next / previousEffective)
+        for (let index = 0; index < this.requiredGain.length; index += 1) {
+          this.requiredGain[index] = Math.min(1, this.requiredGain[index] * scale)
+        }
+      }
     }
   }
 

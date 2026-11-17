@@ -182,4 +182,133 @@ describe('MasterOutput protection runtime', () => {
 
     output.dispose()
   })
+
+  it('reports zeroed telemetry in the fallback snapshot instead of stale worklet readings', async () => {
+    const output = new MasterOutput()
+    const context = createContext({ failModule: true })
+
+    await output.initialize(context)
+
+    const snapshot = output.getSnapshot()
+    expect(snapshot.status).toBe('fallback')
+    expect(snapshot.error).toContain('worklet blocked')
+    expect(snapshot.latencySamples).toBe(0)
+    expect(snapshot.latencyMs).toBe(0)
+    expect(snapshot.gainReductionDb).toBe(0)
+    expect(snapshot.maxGainReductionDb).toBe(0)
+    expect(snapshot.sanitizedSamples).toBe(0)
+    expect(snapshot.postProtection).toBeNull()
+    expect(output.getGainReductionDb()).toBe(0)
+    expect(output.getLatencySeconds()).toBe(0)
+
+    output.dispose()
+  })
+
+  it('ignores late worklet telemetry that arrives after a downgrade', async () => {
+    const output = new MasterOutput()
+    await output.initialize(createContext({ failModule: true }))
+    expect(output.getStatus()).toBe('fallback')
+
+    const lateMessage: LimiterTelemetryMessage = {
+      type: 'telemetry',
+      gainReductionDb: 9.5,
+      maxGainReductionDb: 12,
+      sanitizedSamples: 7,
+      latencySamples: 96,
+      postProtection: {
+        leftPeakDb: -0.5,
+        rightPeakDb: -0.6,
+        leftRmsDb: -10,
+        rightRmsDb: -10.2,
+        overloadSamples: 0,
+        nonFiniteSamples: 0,
+        frames: 1920
+      }
+    }
+    const handler = (output as unknown as { handleMessage: (message: LimiterTelemetryMessage) => void }).handleMessage
+    handler.call(output, lateMessage)
+
+    const snapshot = output.getSnapshot()
+    expect(snapshot.gainReductionDb).toBe(0)
+    expect(snapshot.maxGainReductionDb).toBe(0)
+    expect(snapshot.sanitizedSamples).toBe(0)
+    expect(snapshot.latencySamples).toBe(0)
+    expect(snapshot.postProtection).toBeNull()
+
+    output.dispose()
+  })
+
+  it('pushes ceiling changes to the worklet while active', async () => {
+    const output = new MasterOutput()
+    await output.initialize(createContext())
+    const node = workletInstances[0]
+    node.port.postMessage.mockClear()
+
+    output.setCeilingDb(-6)
+
+    expect(output.getCeilingDb()).toBe(-6)
+    expect(output.getSnapshot().ceilingDb).toBe(-6)
+    expect(node.port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'config', ceilingDb: -6 }))
+
+    output.dispose()
+  })
+
+  it('clamps ceiling changes to the supported range', async () => {
+    const output = new MasterOutput()
+    await output.initialize(createContext())
+
+    output.setCeilingDb(5)
+    expect(output.getCeilingDb()).toBe(0)
+    output.setCeilingDb(-99)
+    expect(output.getCeilingDb()).toBe(-24)
+
+    output.dispose()
+  })
+
+  it('recomputes the fallback clip curve when the ceiling changes in fallback', async () => {
+    const output = new MasterOutput()
+    const context = createContext({ failModule: true })
+    await output.initialize(context)
+    expect(output.getStatus()).toBe('fallback')
+
+    const clip = (context.createWaveShaper as ReturnType<typeof vi.fn>).mock.results[0].value as {
+      curve: Float32Array | null
+    }
+    const originalCurve = clip.curve
+
+    output.setCeilingDb(-12)
+
+    expect(output.getSnapshot().ceilingDb).toBe(-12)
+    expect(clip.curve).not.toBe(originalCurve)
+    const newCeiling = decibelsToGain(-12)
+    for (const value of clip.curve!) {
+      expect(Math.abs(value)).toBeLessThanOrEqual(newCeiling + 1e-9)
+    }
+    expect(clip.curve![clip.curve!.length - 1]).toBeCloseTo(newCeiling, 6)
+
+    output.dispose()
+  })
+
+  it('keeps the failure visible when the ceiling changes on the failed path', async () => {
+    const output = new MasterOutput()
+    const context = createContext({ failModule: true, usableFallback: false })
+    await output.initialize(context)
+    expect(output.getStatus()).toBe('failed')
+
+    output.setCeilingDb(-6)
+
+    // The new value is stored for a future re-initialization, but the error stays visible and
+    // the failed snapshot never reports live telemetry.
+    expect(output.getCeilingDb()).toBe(-6)
+    expect(output.getStatus()).toBe('failed')
+    expect(output.getError()).toContain('Fallback protection unavailable')
+    const snapshot = output.getSnapshot()
+    expect(snapshot.status).toBe('failed')
+    expect(snapshot.error).toBeTruthy()
+    expect(snapshot.ceilingDb).toBe(-6)
+    expect(snapshot.gainReductionDb).toBe(0)
+    expect(snapshot.postProtection).toBeNull()
+
+    output.dispose()
+  })
 })

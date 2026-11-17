@@ -53,7 +53,7 @@ export class MasterOutput {
   readonly input: Tone.Gain
   readonly output: Tone.Gain
 
-  private readonly ceilingDb: number
+  private ceilingDb: number
   private readonly lookaheadMs: number
   private releaseMs: number
 
@@ -139,6 +139,28 @@ export class MasterOutput {
     return this.ceilingDb
   }
 
+  /**
+   * Adjusts the protection ceiling on whichever path is currently live, so the snapshot stays
+   * the single source of truth:
+   * - active: the new configuration is pushed to the limiter worklet.
+   * - fallback: the WaveShaper clip curve is recomputed for the new ceiling.
+   * - failed: the value is stored for a future re-initialization, but the error stays visible
+   *   and nothing is silently unblocked.
+   */
+  setCeilingDb(decibels: number): void {
+    this.ceilingDb = clampLimiterCeilingDb(decibels)
+    if (this.status === 'active' && this.limiterNode) {
+      const config: LimiterInboundMessage = {
+        type: 'config',
+        ceilingDb: this.ceilingDb,
+        releaseMs: this.releaseMs
+      }
+      this.limiterNode.port.postMessage(config)
+    } else if (this.status === 'fallback' && this.fallbackClip) {
+      this.fallbackClip.curve = createCeilingClipCurve(decibelsToGain(this.ceilingDb))
+    }
+  }
+
   setReleaseMs(milliseconds: number): void {
     this.releaseMs = clampLimiterReleaseMs(milliseconds)
     if (this.limiterNode) {
@@ -152,25 +174,33 @@ export class MasterOutput {
   }
 
   getLatencySeconds(): number {
+    if (this.status !== 'active') return 0
     if (!this.latencySamples || this.sampleRate <= 0) return 0
     return this.latencySamples / this.sampleRate
   }
 
   getGainReductionDb(): number {
-    return this.gainReductionDb
+    return this.status === 'active' ? this.gainReductionDb : 0
   }
 
+  /**
+   * The snapshot is the single source of truth for the UI. Telemetry fields (latency, gain
+   * reduction, sanitized count, post-protection levels) are only meaningful while the worklet
+   * path is active; in fallback or failed states they are reported as zeroed so a stale
+   * worklet reading can never leak into the degraded display.
+   */
   getSnapshot(): OutputProtectionSnapshot {
+    const telemetryLive = this.status === 'active'
     return {
       status: this.status,
       error: this.error,
       ceilingDb: this.ceilingDb,
-      latencySamples: this.latencySamples,
-      latencyMs: this.sampleRate > 0 ? (this.latencySamples / this.sampleRate) * 1000 : 0,
-      gainReductionDb: this.gainReductionDb,
-      maxGainReductionDb: this.maxGainReductionDb,
-      sanitizedSamples: this.sanitizedSamples,
-      postProtection: this.postProtection
+      latencySamples: telemetryLive ? this.latencySamples : 0,
+      latencyMs: telemetryLive && this.sampleRate > 0 ? (this.latencySamples / this.sampleRate) * 1000 : 0,
+      gainReductionDb: telemetryLive ? this.gainReductionDb : 0,
+      maxGainReductionDb: telemetryLive ? this.maxGainReductionDb : 0,
+      sanitizedSamples: telemetryLive ? this.sanitizedSamples : 0,
+      postProtection: telemetryLive ? this.postProtection : null
     }
   }
 
@@ -189,6 +219,11 @@ export class MasterOutput {
       // Already disconnected or empty.
     }
 
+    // The degraded paths have no delay line and no worklet telemetry: drop any values a
+    // previous (or in-flight) worklet session reported so they cannot be read as current.
+    this.latencySamples = 0
+    this.resetTelemetry()
+
     try {
       const gain = context.createGain()
       gain.gain.value = FALLBACK_PROTECTION_GAIN
@@ -202,7 +237,6 @@ export class MasterOutput {
 
       this.fallbackGain = gain
       this.fallbackClip = clip
-      this.latencySamples = 0
       this.status = 'fallback'
       this.error = reason
     } catch (fallbackCause) {
@@ -215,6 +249,9 @@ export class MasterOutput {
   }
 
   private handleMessage(message: LimiterTelemetryMessage): void {
+    // Late telemetry arriving after a downgrade to fallback/failed must be ignored: only the
+    // active worklet path is allowed to update these fields.
+    if (this.status !== 'active') return
     if (message?.type !== 'telemetry') return
     this.gainReductionDb = message.gainReductionDb
     this.maxGainReductionDb = Math.max(this.maxGainReductionDb, message.maxGainReductionDb)

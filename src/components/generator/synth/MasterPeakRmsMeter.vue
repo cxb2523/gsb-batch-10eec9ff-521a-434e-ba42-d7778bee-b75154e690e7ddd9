@@ -115,26 +115,28 @@
   })
 
   const protectionStatusText = computed(() => {
-    if (liveGainReductionDb.value > 0.05) {
+    if (currentStatus.value === 'fallback') return 'FALLBACK'
+    if (currentStatus.value === 'failed') return 'OFF'
+    if (currentStatus.value === 'active' && liveGainReductionDb.value > 0.05) {
       return `-${liveGainReductionDb.value.toFixed(1)} dB`
     }
     if (currentStatus.value === 'active') return 'ON'
-    if (currentStatus.value === 'fallback') return 'FALLBACK'
-    if (currentStatus.value === 'failed') return 'OFF'
-    return 'ON'
+    return '—'
   })
 
   const protectionStatusColor = computed(() => {
-    if (liveGainReductionDb.value > 0.05) return 'text-orange-400 font-semibold'
-    if (currentStatus.value === 'active') return 'text-daw-pulse'
     if (currentStatus.value === 'fallback') return 'text-orange-400'
+    if (currentStatus.value === 'failed') return 'text-red-400'
+    if (currentStatus.value === 'active' && liveGainReductionDb.value > 0.05) return 'text-orange-400 font-semibold'
+    if (currentStatus.value === 'active') return 'text-daw-pulse'
     return 'text-daw-text-muted'
   })
 
   const protectionIconClass = computed(() => {
-    if (liveGainReductionDb.value > 0.05) return 'text-orange-400'
-    if (currentStatus.value === 'active') return 'text-daw-pulse'
     if (currentStatus.value === 'fallback') return 'text-orange-400'
+    if (currentStatus.value === 'failed') return 'text-red-400'
+    if (currentStatus.value === 'active' && liveGainReductionDb.value > 0.05) return 'text-orange-400'
+    if (currentStatus.value === 'active') return 'text-daw-pulse'
     return 'text-daw-text-muted'
   })
 
