@@ -3,6 +3,7 @@ import {
   AnimationClip,
   Bone,
   BufferGeometry,
+  Float32BufferAttribute,
   MeshBasicMaterial,
   NumberKeyframeTrack,
   PerspectiveCamera,
@@ -15,11 +16,15 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { MMD, MMDAnimationManager } from '../src'
 
-const createMmd = (name: string) => {
+const createMmd = (name: string, options: { morph?: boolean } = {}) => {
   const bone = new Bone()
   bone.name = name
 
-  const mesh = new SkinnedMesh(new BufferGeometry(), new MeshBasicMaterial())
+  const geometry = new BufferGeometry()
+  if (options.morph)
+    geometry.morphAttributes.position = [new Float32BufferAttribute([0, 0, 0], 3)]
+
+  const mesh = new SkinnedMesh(geometry, new MeshBasicMaterial())
   mesh.add(bone)
   mesh.bind(new Skeleton([bone]))
 
@@ -76,6 +81,31 @@ const createCameraClip = () =>
     new VectorKeyframeTrack('target.position', [0, 1], [0, 0, -1, 1, 2, -3]),
     new NumberKeyframeTrack('.fov', [0, 1], [30, 60]),
   ])
+
+const createSkeletalClip = (name: string) =>
+  new AnimationClip(name, 1, [
+    new VectorKeyframeTrack('.bones[0].position', [0, 1], [0, 0, 0, 1, 0, 0]),
+  ])
+
+const createAudio = (options: { playing?: boolean } = {}) => {
+  let playing = options.playing ?? false
+  const play = vi.fn(() => {
+    playing = true
+  })
+  const stop = vi.fn(() => {
+    playing = false
+  })
+  const audio = {
+    get isPlaying() {
+      return playing
+    },
+    play,
+    stop,
+    type: 'Audio',
+  } as unknown as import('three').Audio
+
+  return { audio, play, stop }
+}
 
 describe('mMDAnimationManager', () => {
   it('advances every registered MMD through its mixer and MMD update', () => {
@@ -293,6 +323,113 @@ describe('mMDAnimationManager', () => {
 
     manager.update(6)
     expect(play).toHaveBeenCalledOnce()
+  })
+
+  it('replays audio after the delay when a skeletal animation loops', () => {
+    const mmd = createMmd('skeletal-loop')
+    const { audio, play, stop } = createAudio()
+    const manager = new MMDAnimationManager()
+
+    manager.add(mmd, { animation: createSkeletalClip('skeletal animation') })
+    manager.add(audio, { delayTime: 0.5 })
+
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledOnce()
+
+    // The skeletal clip (duration 1) loops; the audio stops and waits again.
+    manager.update(0.6)
+    expect(stop).toHaveBeenCalledOnce()
+    expect(play).toHaveBeenCalledOnce()
+
+    manager.update(0.4)
+    expect(play).toHaveBeenCalledOnce()
+
+    manager.update(0.1)
+    expect(play).toHaveBeenCalledTimes(2)
+    expect(stop).toHaveBeenCalledOnce()
+  })
+
+  it('replays audio only once when several models loop in the same frame', () => {
+    const first = createMmd('first')
+    const second = createMmd('second')
+    const { audio, play, stop } = createAudio()
+    const manager = new MMDAnimationManager()
+
+    manager.add(first, { animation: createSkeletalClip('first animation') })
+    manager.add(second, { animation: createSkeletalClip('second animation') })
+    manager.add(audio)
+
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledOnce()
+
+    manager.update(0.6)
+    expect(stop).toHaveBeenCalledOnce()
+    expect(play).toHaveBeenCalledTimes(2)
+  })
+
+  it('replays audio only once when the global duration and a skeletal loop coincide', () => {
+    const mmd = createMmd('coinciding-loop')
+    const { audio, play, stop } = createAudio()
+    const manager = new MMDAnimationManager({ duration: 1 })
+
+    manager.add(mmd, { animation: createSkeletalClip('skeletal animation') })
+    manager.add(audio)
+
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledOnce()
+
+    manager.update(0.6)
+    expect(stop).toHaveBeenCalledOnce()
+    expect(play).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not replay audio when only morph or camera animations loop', () => {
+    const mmd = createMmd('morph-loop', { morph: true })
+    const camera = new PerspectiveCamera()
+    const { audio, play, stop } = createAudio()
+    const manager = new MMDAnimationManager()
+
+    manager.add(mmd, {
+      animation: new AnimationClip('morph animation', 1, [
+        new NumberKeyframeTrack('.morphTargetInfluences[0]', [0, 1], [0, 1]),
+      ]),
+    })
+    manager.add(camera, { animation: createCameraClip() })
+    manager.add(audio)
+
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledOnce()
+
+    // Both the morph clip and the camera clip loop without any skeletal loop.
+    manager.update(0.6)
+    manager.update(2)
+    expect(stop).not.toHaveBeenCalled()
+    expect(play).toHaveBeenCalledOnce()
+  })
+
+  it('does not stop or replay externally played audio when a skeletal animation loops', () => {
+    const mmd = createMmd('external-audio')
+    const { audio, play, stop } = createAudio({ playing: true })
+    const manager = new MMDAnimationManager()
+
+    manager.add(mmd, { animation: createSkeletalClip('skeletal animation') })
+    manager.add(audio)
+
+    manager.update(1.1)
+    expect(stop).not.toHaveBeenCalled()
+    expect(play).not.toHaveBeenCalled()
+  })
+
+  it('does not stop externally played audio when removed', () => {
+    const { audio, play, stop } = createAudio({ playing: true })
+    const manager = new MMDAnimationManager()
+
+    manager.add(audio)
+    manager.update(0.5)
+    expect(play).not.toHaveBeenCalled()
+
+    manager.remove(audio)
+    expect(stop).not.toHaveBeenCalled()
   })
 
   it('removes one model without affecting other registered objects', () => {

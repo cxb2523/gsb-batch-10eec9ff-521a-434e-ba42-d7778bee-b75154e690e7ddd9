@@ -172,10 +172,9 @@ export class MMDAnimationManager {
   }
 
   public update(delta: number, options?: MMDUpdateOptions): this {
-    this.updateAudio(delta)
-
+    let skeletalAnimationLooped = false
     for (const [mmd, mixer] of this.models)
-      this.updateMMD(mmd, mixer, delta, options)
+      skeletalAnimationLooped = this.updateMMD(mmd, mixer, delta, options) || skeletalAnimationLooped
 
     if (this.camera != null && this.cameraMixer != null && this.cameraTarget != null) {
       this.cameraMixer.update(delta)
@@ -186,14 +185,18 @@ export class MMDAnimationManager {
       this.camera.lookAt(this.cameraTarget.position)
     }
 
+    this.updateAudio(delta, skeletalAnimationLooped)
+
     return this
   }
 
-  private updateAudio(delta: number) {
+  private updateAudio(delta: number, skeletalAnimationLooped: boolean) {
     if (this.audio == null)
       return
 
     this.audioElapsed += delta
+
+    let restarted = false
 
     if (this.duration != null) {
       while (this.audioElapsed >= this.duration) {
@@ -202,7 +205,25 @@ export class MMDAnimationManager {
           this.audio.stop()
         this.audioStarted = false
         this.audioStartedByManager = false
+        restarted = true
       }
+    }
+
+    // A skeletal animation loop drives the rhythm: stop the audio and send it
+    // back into its delay so it replays in step with the animation. Audio that
+    // is playing but was not started by this manager belongs to someone else,
+    // and a duration restart in the same frame already reset the wait, so both
+    // are left alone.
+    if (
+      skeletalAnimationLooped
+      && !restarted
+      && (this.audioStartedByManager || !this.audio.isPlaying)
+    ) {
+      if (this.audio.isPlaying)
+        this.audio.stop()
+      this.audioElapsed = 0
+      this.audioStarted = false
+      this.audioStartedByManager = false
     }
 
     const audioEnd = this.audioDuration == null
@@ -223,7 +244,7 @@ export class MMDAnimationManager {
     mixer: AnimationMixer,
     delta: number,
     options?: MMDUpdateOptions,
-  ) {
+  ): boolean {
     let skeletalAnimationLooped = false
     const onLoop = (event: { action: { getClip: () => AnimationClip } }) => {
       if (!event.action.getClip().tracks.some(track => track.name.startsWith('.bones'))) {
@@ -251,5 +272,7 @@ export class MMDAnimationManager {
     if (options?.physics !== false)
       mmd.physics?.update(delta)
     mmd.afterPhysics(options)
+
+    return skeletalAnimationLooped
   }
 }
