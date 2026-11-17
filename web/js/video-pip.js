@@ -96,8 +96,10 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
   let pipTr = null;
   let cueTrack = null;      // 经典 PiP 的合成字幕轨
   let cueList = [];         // 自己记着加过哪些 cue: mode=disabled 时 track.cues 是 null
-  let observer = null;
+  let observer = null;      // Document PiP 小窗开着时才用: 主题/语言/字号等皮肤属性
   let lastPaint = '';
+  let lastTrack = null;      // 上一次同步时的时间轴对象 (整条换曲识别)
+  let lastTimeline = '';     // 上一次同步时的内容指纹 (就地改写/译文到货识别)
   let skinCss = null;       //  小窗样式只在第一次打开时取一次
 
   const classicOn = () => video === document.pictureInPictureElement
@@ -123,6 +125,34 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
     return track.sentences[i] || null;
   };
 
+  /**
+   * 时间轴内容指纹: 只在媒体事件/刷新这些低频点计算, 不进每帧路径。
+   * 重新导入/改字幕是同一个 track 对象就地改写 —— 句数或原文/译文一变指纹就变;
+   * 译文异步到货同样落在译文片段里。配合对象身份判断, 整条换曲也能立刻识别。
+   */
+  const timelineKey = () => {
+    const track = engine && engine.track;
+    if (!track) return '';
+    const parts = [];
+    for (let i = 0; i < track.S; i++) {
+      const s = track.sentences[i];
+      parts.push(s && s.text, '~', s && s.translation, ';');
+    }
+    return track.S + '|' + parts.join('');
+  };
+
+  /**
+   * 时间轴是否已经换成另一份数据: 对象被整条替换, 或同一对象的句数/内容被改写。
+   * 两条小窗路径共用这一个判断, 所以 Document PiP 和经典 PiP 永远跟同一份时间轴。
+   */
+  const trackChanged = () => {
+    const track = engine && engine.track;
+    if (track === lastTrack && timelineKey() === lastTimeline) return false;
+    lastTrack = track;
+    lastTimeline = timelineKey();
+    return true;
+  };
+
   /** 主题、字体、字号都从播放页算好的值搬过来, 免得小窗另起一套观感. */
   const syncSkin = () => {
     if (!pipWin) return;
@@ -141,10 +171,12 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
 
   const paint = (force) => {
     if (!pipSubs) return;
+    // 时间轴被整条换掉或就地改写时, 文本签名可能恰好相同 —— 由 trackChanged 兜底强制重画。
+    if (trackChanged()) force = true;
     const cfg = trackCfg.video;
     const { text, translation } = pipLines(sentence(), trOn());
-    const signature = [text, translation, cfg.subtitles, cfg.position, cfg.width, cfg.transparency,
-      cfg.blur, cfg.fit, document.documentElement.dataset.theme].join('|');
+    const signature = [text, translation, trOn() ? 1 : 0, cfg.subtitles, cfg.position, cfg.width,
+      cfg.transparency, cfg.blur, cfg.fit, document.documentElement.dataset.theme].join('|');
     if (!force && signature === lastPaint) return;
     lastPaint = signature;
     pipSubs.hidden = !cfg.subtitles;
@@ -189,6 +221,9 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
       try { cueTrack.removeCue(cue); } catch { /* 已经不在轨上 */ }
     }
     cueList = [];
+    // 重填即认下当前时间轴: 后续媒体事件里的 trackChanged 只在又一次换数据时才成立。
+    lastTrack = engine && engine.track;
+    lastTimeline = timelineKey();
     if (!Cue) return;
     for (const cue of pipCues(engine && engine.track, trOn())) {
       const item = new Cue(cue.start, cue.end, cue.text);
@@ -206,6 +241,8 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
     pipWin = null;
     pipSubs = pipText = pipTr = pipStage = null;
     lastPaint = '';
+    lastTrack = null;
+    lastTimeline = '';
     observer?.disconnect();
     observer = null;
     if (video.parentNode !== stage) stage.insertBefore(video, stage.firstChild);
@@ -235,9 +272,11 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
     pipStage.insertBefore(video, pipStage.firstChild);
     doc.body.append(pipStage);
     win.addEventListener('pagehide', unmountDocument);
+    // 皮肤类属性只在小窗存在时有意义; 译文开关 data-tr 由模块级 settingObserver 负责,
+    // 那条通知与小窗开合无关, 经典 PiP / Activity PiP 也得收到。
     observer = new MutationObserver(() => { syncSkin(); paint(true); });
     observer.observe(document.documentElement, { attributes: true,
-      attributeFilter: ['data-theme', 'data-lang', 'data-space', 'data-tr'] });
+      attributeFilter: ['data-theme', 'data-lang', 'data-space'] });
     syncSkin();
     paint(true);
   }
@@ -326,21 +365,38 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
     onStateChange?.();
   }
 
-  /** 译文到货、设置变化、主题切换后重画小窗内容. */
-  function refresh() {
-    lastPaint = '';
-    if (pipWin) { syncSkin(); paint(true); }
+  /**
+   * 三种小窗共用同一份显示设置与时间轴: Document PiP 重画字幕层,
+   * 经典 / Android Activity PiP 整轨重填 cue。两种更新都不依赖 rAF,
+   * 所以译文开关变化、译文异步到货、换曲在页面后台时也能即时生效。
+   */
+  function syncPipContent() {
+    if (pipWin) { lastPaint = ''; syncSkin(); paint(true); }
     else if (classicOn() || activityActive) fillCues();
   }
 
+  /** 译文到货、设置变化、主题切换后重画小窗内容. */
+  function refresh() {
+    syncPipContent();
+  }
+
+  // 译文开关 (data-tr) 变化无论小窗是否已打开都要收到 —— 包括页面在后台时。
+  const settingObserver = new MutationObserver(syncPipContent);
+  settingObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-tr'] });
+
   // 小窗开着的时候页面多半在后台, rAF 会被节流; 媒体事件不受影响, 所以用它们驱动重画。
   for (const event of ['timeupdate', 'seeked', 'play', 'pause', 'loadedmetadata', 'ratechange']) {
-    video.addEventListener(event, () => paint(false));
+    video.addEventListener(event, () => {
+      // 换曲/重新导入后媒体重新加载会触发 loadedmetadata; 同文件改字幕则靠内容指纹。
+      // 经典/Activity 小窗在这里把整条字幕轨重填成新时间轴, 不残留上一版 cue。
+      if ((classicOn() || activityActive) && engine.track && trackChanged()) fillCues();
+      paint(false);
+    });
   }
   video.addEventListener('leavepictureinpicture', syncClassic);
   video.addEventListener('enterpictureinpicture', syncClassic);
   video.addEventListener('webkitpresentationmodechanged', syncClassic);
-  window.addEventListener('pagehide', () => { controls?.activate(false); if (pipWin) unmountDocument(); });
+  window.addEventListener('pagehide', () => { controls?.activate(false); settingObserver.disconnect(); if (pipWin) unmountDocument(); });
 
   return { toggle, close, refresh, paint: () => paint(true), isActive,
     supported: () => !!(activityPip || documentPip() || classicKind()) };

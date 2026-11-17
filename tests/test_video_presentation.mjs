@@ -13,13 +13,13 @@ const { outputFiles } = await build({ stdin: { contents: `
 const html = await readFile(new URL('../web/player.html', import.meta.url), 'utf8');
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
-function harness(t, { native = true, wakeRequest } = {}) {
+function harness(t, { native = true, wakeRequest, nativeExtras } = {}) {
   const dom = new JSDOM(html, { url: 'https://localhost/player.html', runScripts: 'outside-only', pretendToBeVisual: true });
   const w = dom.window, doc = w.document, calls = [];
   t.after(() => { w.dispatchEvent(new w.Event('pagehide')); w.close(); });
   const landscape = new w.EventTarget(); landscape.matches = false;
   w.matchMedia = () => landscape;
-  w.LinguaNative = native ? { platform: 'ios' } : undefined;
+  w.LinguaNative = native ? { platform: 'ios', ...nativeExtras } : undefined;
   doc.documentElement.requestFullscreen = async () => { calls.push('fullscreen'); };
   w.screen.orientation = { lock: async () => { calls.push('lock'); }, unlock() {} };
   if (wakeRequest) w.navigator.wakeLock = { request: wakeRequest };
@@ -32,7 +32,9 @@ function harness(t, { native = true, wakeRequest } = {}) {
     videoHeight: { configurable: true, value: 720 },
   });
   const track = { S: 1, sStart: [0], sEnd: [4], sentences: [{ text: 'Hello.', translation: '你好。' }] };
-  const cues = { mode: 'disabled', addCue() {}, removeCue() {} };
+  const cues = { mode: 'disabled', _items: [],
+    addCue(cue) { this._items.push(cue); },
+    removeCue(cue) { this._items = this._items.filter((item) => item !== cue); } };
   video.addTextTrack = () => cues;
   w.VTTCue = class { constructor(start, end, text) { Object.assign(this, { startTime: start, endTime: end, text }); } };
   video.webkitPresentationMode = 'inline';
@@ -49,7 +51,7 @@ function harness(t, { native = true, wakeRequest } = {}) {
   };
   const pointer = (target, type) => target.dispatchEvent(Object.assign(new w.Event(type, { bubbles: true, cancelable: true }),
     { pointerId: 1, button: 0, isPrimary: true, clientX: 160, clientY: 90 }));
-  return { w, doc, app, video, player, calls, cues, rotate, turn, pointer };
+  return { w, doc, app, video, player, calls, cues, track, rotate, turn, pointer };
 }
 
 test('PiP waits for a video frame before probing Safari support, then opens on the next tap', async (t) => {
@@ -249,4 +251,137 @@ test('returning from the background reacquires the immersive wake lock', async (
   Object.defineProperty(h.doc, 'hidden', { configurable: true, value: false });
   h.doc.dispatchEvent(new h.w.Event('visibilitychange')); await flush();
   assert.equal(requests, 2); assert.equal(released, 1);
+});
+
+test('classic PiP cue text follows the translation switch without a refresh call', async (t) => {
+  const h = harness(t);
+  h.doc.documentElement.dataset.tr = '1';
+  await h.player.pip.toggle();
+  assert.equal(h.player.pip.isActive(), true);
+  assert.equal(h.cues._items.length, 1);
+  assert.equal(h.cues._items[0].text, 'Hello.\n你好。');
+  // 开关走主页面的设置通道 (data-tr), 模拟页面已在后台: 不主动调 refresh, 只改属性。
+  h.doc.documentElement.dataset.tr = '0'; await flush();
+  assert.equal(h.cues._items.length, 1, 'switching translation must not stack cues');
+  assert.equal(h.cues._items[0].text, 'Hello.');
+  h.doc.documentElement.dataset.tr = '1'; await flush();
+  assert.equal(h.cues._items.length, 1);
+  assert.equal(h.cues._items[0].text, 'Hello.\n你好。');
+  await h.player.pip.toggle();
+  assert.equal(h.player.pip.isActive(), false);
+});
+
+test('classic PiP rebuilds the cue track from a replaced timeline without duplicate cues', async (t) => {
+  const h = harness(t);
+  h.doc.documentElement.dataset.tr = '1';
+  await h.player.pip.toggle();
+  assert.deepEqual(h.cues._items.map((cue) => cue.text), ['Hello.\n你好。']);
+  // 整条时间轴被换成另一份数据 (换曲/重新导入): 句数与内容都变了。
+  // 应用层不主动调 refresh, 小窗必须自己靠媒体事件愈合 (页面可能正在后台)。
+  const next = { S: 2, sStart: [0, 5], sEnd: [5, 9],
+    sentences: [{ text: 'New first.', translation: '新的第一句。' }, { text: 'New second.', translation: '' }] };
+  h.track.S = next.S;
+  h.track.sStart = next.sStart;
+  h.track.sEnd = next.sEnd;
+  h.track.sentences = next.sentences;
+  h.video.dispatchEvent(new h.w.Event('loadedmetadata')); await flush();
+  assert.deepEqual(h.cues._items.map((cue) => cue.text),
+    ['New first.\n新的第一句。', 'New second.'], 'old cues must be replaced by the new timeline');
+  // 再来一次媒体事件不能重复添加 cue。
+  h.video.dispatchEvent(new h.w.Event('timeupdate')); await flush();
+  assert.equal(h.cues._items.length, 2, 'a repeated media event must not re-add cues');
+  h.video.dispatchEvent(new h.w.Event('seeked')); await flush();
+  assert.equal(h.cues._items.length, 2);
+  await h.player.pip.toggle();
+});
+
+test('an in-place subtitle edit reaches classic PiP cues even when the media file is unchanged', async (t) => {
+  const h = harness(t);
+  h.doc.documentElement.dataset.tr = '1';
+  await h.player.pip.toggle();
+  assert.equal(h.cues._items[0].text, 'Hello.\n你好。');
+  // 字幕编辑保存是同一 track 对象就地改写, 媒体文件不变 (没有 loadedmetadata),
+  // 普通播放事件 (timeupdate) 也必须能通过内容指纹识别并整轨重填。
+  h.track.sentences[0].text = 'Hello there.';
+  h.track.sentences[0].translation = '你好呀。';
+  h.video.dispatchEvent(new h.w.Event('timeupdate')); await flush();
+  assert.equal(h.cues._items.length, 1);
+  assert.equal(h.cues._items[0].text, 'Hello there.\n你好呀。');
+  await h.player.pip.toggle();
+});
+
+test('Document PiP immediately shows and hides the translation on the switch and follows a new timeline', async (t) => {
+  const h = harness(t, { native: false });
+  h.doc.documentElement.dataset.tr = '1';
+  const pipDom = new JSDOM('<html><head></head><body></body></html>', { url: 'https://localhost/pip.html' });
+  t.after(() => pipDom.window.close());
+  const pipWin = pipDom.window;
+  let closed = false;
+  Object.assign(pipWin, { close: () => { closed = true; pipWin.dispatchEvent(new pipWin.Event('pagehide')); } });
+  h.w.fetch = async () => ({ ok: true, text: async () => '' });
+  h.w.documentPictureInPicture = { requestWindow: async () => pipWin };
+  h.video.requestPictureInPicture = undefined;
+  await h.player.pip.toggle();
+  assert.equal(h.player.pip.isActive(), true);
+  const pipDoc = pipWin.document;
+  const pipText = pipDoc.querySelector('.pip-text');
+  const pipTr = pipDoc.querySelector('.pip-tr');
+  assert.ok(pipText && pipTr);
+  assert.equal(pipText.textContent, 'Hello.');
+  assert.equal(pipTr.textContent, '你好。');
+  assert.equal(pipTr.hidden, false);
+  // 译文开关变化: 即使页面后台、没有任何媒体事件, MutationObserver 也立即生效。
+  h.doc.documentElement.dataset.tr = '0'; await flush();
+  assert.equal(pipTr.textContent, '');
+  assert.equal(pipTr.hidden, true);
+  h.doc.documentElement.dataset.tr = '1'; await flush();
+  assert.equal(pipTr.textContent, '你好。');
+  assert.equal(pipTr.hidden, false);
+  // 整条时间轴替换: 媒体事件驱动重画 (不依赖 rAF)。
+  h.track.S = 2;
+  h.track.sStart = [0, 5];
+  h.track.sEnd = [5, 9];
+  h.track.sentences = [{ text: 'Brand new.', translation: '全新的。' }, { text: 'Second.', translation: '' }];
+  h.video.dispatchEvent(new h.w.Event('timeupdate')); await flush();
+  assert.equal(pipText.textContent, 'Brand new.');
+  assert.equal(pipTr.textContent, '全新的。');
+  // 关闭小窗: 视频必须回到主页面舞台, 不丢失。
+  await h.player.pip.toggle();
+  assert.equal(closed, true);
+  assert.equal(h.player.pip.isActive(), false);
+  assert.equal(h.video.parentNode, h.doc.getElementById('videoStage'));
+});
+
+test('Android Activity PiP refills cues on the translation switch and a replaced timeline', async (t) => {
+  const h = harness(t, { nativeExtras: { platform: 'android', activityPip: {
+    enterPip: async () => ({ controls: false }), updatePip: async () => {},
+  } } });
+  h.doc.documentElement.dataset.tr = '1';
+  await h.player.pip.toggle();
+  // 原生容器在系统小窗真正起来后回送 native-pip 事件 (与 Android 插件实现一致)。
+  h.w.dispatchEvent(new h.w.CustomEvent('native-pip', { detail: { active: true } }));
+  assert.equal(h.player.pip.isActive(), true);
+  assert.equal(h.cues.mode, 'showing');
+  assert.deepEqual(h.cues._items.map((cue) => cue.text), ['Hello.\n你好。']);
+  // 译文开关: Activity PiP 与经典 PiP 共用同一条 cue 同步链路。
+  h.doc.documentElement.dataset.tr = '0'; await flush();
+  assert.equal(h.cues._items.length, 1, 'translation switch must not duplicate cues');
+  assert.equal(h.cues._items[0].text, 'Hello.');
+  h.doc.documentElement.dataset.tr = '1'; await flush();
+  assert.equal(h.cues._items[0].text, 'Hello.\n你好。');
+  // 时间轴替换: 模拟 Activity 还在前台而页面在后台, 只有媒体事件能驱动同步。
+  h.track.S = 2;
+  h.track.sStart = [0, 6];
+  h.track.sEnd = [6, 12];
+  h.track.sentences = [{ text: 'Activity one.', translation: '小窗第一句。' },
+    { text: 'Activity two.', translation: '小窗第二句。' }];
+  h.video.dispatchEvent(new h.w.Event('loadedmetadata')); await flush();
+  assert.deepEqual(h.cues._items.map((cue) => cue.text),
+    ['Activity one.\n小窗第一句。', 'Activity two.\n小窗第二句。']);
+  assert.equal(h.cues._items.length, 2, 'rebuild must not leave or duplicate cues');
+  // 原生容器发回关闭事件: cue 轨关闭, 主页面视频元素不受影响。
+  h.w.dispatchEvent(new h.w.CustomEvent('native-pip', { detail: { active: false } }));
+  assert.equal(h.player.pip.isActive(), false);
+  assert.equal(h.cues.mode, 'disabled');
+  assert.equal(h.video.parentNode, h.doc.getElementById('videoStage'));
 });

@@ -561,6 +561,10 @@ function apply(next) {
   vlist.reset(next.S);
   vlist.update(true);
   engine.attach(next);
+  // 上面的 videoPlayer?.apply() 发生在 attach 之前, 那时小窗拿到的还是旧时间轴;
+  // 引擎挂上整条新时间轴后再同步一次, 开着的小窗 (含后台状态) 立即切到新句子。
+  videoPlayer?.refreshPip?.();
+  audioPip?.refresh();
   paintRepeat();
   paintSpeed();
   paintShadow('off', -1, 0);
