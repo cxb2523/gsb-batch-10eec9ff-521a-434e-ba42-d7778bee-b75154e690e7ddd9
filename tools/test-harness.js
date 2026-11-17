@@ -126,6 +126,302 @@ window.H = {
           WEAPONS[i].vm.group.visible = true;
           updateAmmoUI(); },
   ads(on){ setADS(on); },
+
+  /* ---- breath-hold (sniper scope sway) machinery ------------------------
+     These are reusable primitives; H.breathTest() runs the full regression.
+     Keys go through the real window keyboard events, so the game's edge
+     latch (player.shiftEdge) is exercised exactly like a human hand. */
+  _key(code, down){
+    window.dispatchEvent(new KeyboardEvent(down ? 'keydown' : 'keyup',
+      {code, bubbles:true, cancelable:true}));
+  },
+  shiftDown(){ this._key('ShiftLeft', true); },
+  shiftUp(){ this._key('ShiftLeft', false); },
+
+  /* run n real frames of the game loop and settle */
+  async frames(n){ for (let i = 0; i < n; i++) await this.frame(); },
+
+  /* clean slate for a breath scenario: sniper, running, alive, scope up and
+     fully through its 0.2s ADS ease, no reload/bolt, no breath, Shift released */
+  async breathSetup(){
+    window.__god = true;
+    G.over = false; G.running = true; G.paused = false;
+    player.dead = false;
+    this.shiftUp();
+    this.wep(3);                                   /* SR-7 LONGBOW sniper */
+    const w = WEAPONS[3];
+    w.mag = w.magSize; w.res = w.reserve;
+    player.reloadT = 0; player.boltT = 0; player.pumpT = 0; player.switching = 0;
+    player.fireCooldown = 0;
+    clearBreath();
+    player.swayAmp = 1;
+    this.place(0, 0, 24, 0, 0);
+    this.ads(true);
+    await this.frames(24);                         /* let the 0.2s ADS lerp finish */
+    return this.breathState();
+  },
+
+  /* raw breath state machine + the numbers that drive the lens drift */
+  breathState(){
+    return {held: player.breathHeld, lock: player.breathLock,
+            edge: player.shiftEdge, breath: +player.breath.toFixed(4),
+            amp: +player.swayAmp.toFixed(4),
+            swayX: +player.swayX.toFixed(6), swayY: +player.swayY.toFixed(6),
+            scoped: !!WEAPONS[player.weapon].scope && player.adsEase > 0.55,
+            adsEase: +player.adsEase.toFixed(3),
+            reloadT: +player.reloadT.toFixed(3), boltT: +player.boltT.toFixed(3)};
+  },
+
+  /* Sample the real per-frame lens offset for win frames (after warm frames).
+     amp is the internal damped multiplier; peak/rms are what the camera
+     actually rotates by, measured across genuine frame advances. An optional
+     cond() cuts sampling early (e.g. only while a breath hold is alive) and
+     cut/n report that so callers can tell a full window from a truncated one. */
+  async swaySample(warm, win, cond){
+    warm = warm || 0; win = win || 30;
+    await this.frames(warm);
+    let peak = 0, sum2 = 0, sumAbs = 0, n = 0, minAmp = 2, maxAmp = 0, cut = false;
+    for (let i = 0; i < win; i++){
+      await this.frame();
+      if (cond && !cond()){ cut = true; break; }
+      const s = this.breathState();
+      const m = Math.hypot(s.swayX, s.swayY);
+      if (m > peak) peak = m;
+      sum2 += s.swayX*s.swayX + s.swayY*s.swayY;
+      sumAbs += m;
+      if (s.amp < minAmp) minAmp = s.amp;
+      if (s.amp > maxAmp) maxAmp = s.amp;
+      n++;
+    }
+    return {peak:n?+peak.toFixed(6):0, rms:n?+Math.sqrt(sum2/n).toFixed(6):0,
+            meanAbs:n?+(sumAbs/n).toFixed(6):0, minAmp:n?+minAmp.toFixed(3):0,
+            maxAmp:n?+maxAmp.toFixed(3):0, n, cut};
+  },
+
+  /* The game clock: G.elapsed accumulates the exact dt each update consumed,
+     so timing assertions stay correct whether the browser runs at 60fps or a
+     headless shell runs at 12fps with dt clamped to 0.05. */
+  gameTime(){ return G.elapsed; },
+
+  /* Advance real frames until secs of *game* time have passed. An optional
+     cond() is evaluated after every frame and cuts the wait early when it
+     returns false; the returned {cut,n,elapsed} says which happened. */
+  async waitGame(secs, cond){
+    const t0 = G.elapsed;
+    let n = 0;
+    while (G.elapsed - t0 < secs){
+      if (cond && !cond()) return {cut:true, n, elapsed:+(G.elapsed-t0).toFixed(3)};
+      await this.frame();
+      if (++n > 6000) throw new Error('waitGame frame runaway');
+    }
+    return {cut:false, n, elapsed:+(G.elapsed-t0).toFixed(3)};
+  },
+
+  /* Sway sampling measured in game time, not frame counts: warmSecs of settle,
+     then winSecs of lens-offset samples. cond() can truncate the window (e.g.
+     sample only while a breath is actually held); maxStep is the largest
+     frame-to-frame jump, which is the number a press-time snap would inflate. */
+  async swaySampleGame(warmSecs, winSecs, cond){
+    await this.waitGame(warmSecs || 0);
+    const t0 = G.elapsed;
+    let peak = 0, sum2 = 0, sumAbs = 0, n = 0, minAmp = 2, maxAmp = 0, cut = false;
+    let maxStep = 0, prev = null;
+    while (G.elapsed - t0 < winSecs){
+      await this.frame();
+      if (cond && !cond()){ cut = true; break; }
+      const s = this.breathState();
+      const m = Math.hypot(s.swayX, s.swayY);
+      if (prev !== null) maxStep = Math.max(maxStep, Math.abs(m - prev));
+      prev = m;
+      if (m > peak) peak = m;
+      sum2 += s.swayX*s.swayX + s.swayY*s.swayY;
+      sumAbs += m;
+      if (s.amp < minAmp) minAmp = s.amp;
+      if (s.amp > maxAmp) maxAmp = s.amp;
+      n++;
+    }
+    return {peak:n?+peak.toFixed(6):0, rms:n?+Math.sqrt(sum2/n).toFixed(6):0,
+            meanAbs:n?+(sumAbs/n).toFixed(6):0, minAmp:n?+minAmp.toFixed(3):0,
+            maxAmp:n?+maxAmp.toFixed(3):0, maxStep:n?+maxStep.toFixed(6):0, n, cut};
+  },
+
+  /* Full breath-hold regression, driven entirely through real frames and real
+     keyboard events. All timing is measured in game time (G.elapsed) so the
+     suite is immune to headless rAF throttling. Returns one report with a
+     check per requirement; every check carries the observed numbers so a
+     failure explains itself. */
+  async breathTest(){
+    const R = [];
+    const check = (name, pass, detail) => R.push({name, pass: !!pass, detail});
+    const assert = (c, msg) => { if (!c) throw new Error(msg); };
+    const isSniper = () => WEAPONS[player.weapon].id === 'sniper';
+
+    /* ---- 1. a legal hold cuts the lens drift, with no press-time jump ---- */
+    let s = await this.breathSetup();
+    assert(s.scoped, 'scope never came up: ' + JSON.stringify(s));
+    const base = await this.swaySampleGame(0.3, 0.7);
+    this.shiftDown();
+    await this.frame();                                     /* edge consumed here */
+    s = this.breathState();
+    check('hold: shift press enters breath', s.held && s.breath > 2.9 && !s.lock,
+          {breath:s.breath, held:s.held, lock:s.lock});
+    const entry = await this.swaySampleGame(0, 0.25);       /* entry ramp */
+    const held = await this.swaySampleGame(0.3, 1.0, () => this.breathState().held);
+    check('hold: drift clearly reduced while breathing',
+          held.rms < base.rms * 0.4 && held.maxAmp <= 0.10 && !held.cut,
+          {baseRms:base.rms, heldRms:held.rms, ratio:+(held.rms/base.rms).toFixed(3),
+           heldMaxAmp:held.maxAmp, cut:held.cut});
+    /* a snap at press time would show up as a per-frame jump far larger than
+       the smooth sine drift; damp() keeps every step inside the natural range */
+    check('hold: smooth entry, no press-time snap', entry.maxStep <= base.peak * 1.25,
+          {entryMaxStep:entry.maxStep, basePeak:base.peak});
+
+    /* ---- 2. three seconds of hold force exhaustion ------------------------ */
+    /* fresh hold so the stopwatch covers a full three seconds, not the tail
+       of the hold the sway sampling above was burning down */
+    this.shiftUp(); await this.waitGame(0.05);
+    this.shiftDown(); await this.frame();
+    assert(this.breathState().held, 'fresh hold did not engage for exhaustion test');
+    const tStart = this.gameTime();
+    const w = await this.waitGame(BREATH_TIME + 0.5, () => this.breathState().held);
+    const dur = +(this.gameTime() - tStart).toFixed(3);
+    s = this.breathState();
+    check('exhaust: hold lasts 3s then fails', w.cut && !s.held && s.lock && s.breath === 0
+          && dur >= 2.85 && dur <= 3.2,
+          {holdSecs:dur, cut:w.cut, state:s});
+
+    /* ---- 3. the same held key cannot restart the breath ------------------- */
+    await this.waitGame(0.5);
+    s = this.breathState();
+    check('exhaust: still locked while shift stays down', s.lock && !s.held, s);
+
+    /* ---- 4. release then re-press restores a legal hold ------------------- */
+    this.shiftUp();
+    await this.waitGame(0.05);
+    s = this.breathState();
+    check('release: breath and lock cleared on key up', !s.held && !s.lock && s.breath === 0, s);
+    this.shiftDown();
+    await this.frame();
+    s = this.breathState();
+    check('re-press: fresh shift press re-enters breath', s.held && s.breath > 2.9 && !s.lock, s);
+    this.shiftUp();
+    await this.waitGame(0.05);
+
+    /* ---- 5. drift returns to the unheld baseline after exhaustion --------- */
+    await this.breathSetup();
+    const base2 = await this.swaySampleGame(0.3, 0.7);
+    this.shiftDown();
+    await this.waitGame(BREATH_TIME + 0.3, () => this.breathState().held);
+    this.shiftUp();
+    const recovered = await this.swaySampleGame(1.2, 0.8); /* wait out the ease-up */
+    check('exhaust: drift recovers to baseline',
+          recovered.rms > base2.rms * 0.8 && recovered.minAmp > 0.85,
+          {baseRms:base2.rms, recoveredRms:recovered.rms,
+           ratio:+(recovered.rms/base2.rms).toFixed(3), minAmp:recovered.minAmp});
+
+    /* ---- 6. Shift during a reload never starts a breath ------------------- */
+    await this.breathSetup();
+    WEAPONS[3].mag = 1; updateAmmoUI();
+    this._key('KeyR', true);
+    await this.waitGame(0.1);
+    this._key('KeyR', false);
+    s = this.breathState();
+    assert(s.reloadT > 0, 'reload did not start');
+    this.shiftDown();
+    await this.waitGame(0.4);
+    s = this.breathState();
+    check('reload: shift during reload is ignored', s.reloadT > 0 && !s.held && !s.lock,
+          {reloadT:s.reloadT, held:s.held, lock:s.lock});
+    while (this.breathState().reloadT > 0){ await this.frame(); }
+    await this.waitGame(0.1);
+    s = this.breathState();
+    check('reload: no deferred breath while shift stays held', !s.held && !s.lock, s);
+    this.shiftUp(); await this.waitGame(0.05);
+    this.ads(true); await this.waitGame(0.3);               /* reloading dropped ADS */
+    this.shiftDown(); await this.frame();
+    s = this.breathState();
+    check('reload: later legal press still works', s.held && !s.lock, s);
+    this.shiftUp(); await this.waitGame(0.05);
+
+    /* ---- 7. Shift during the sniper bolt cycle never starts a breath ------ */
+    await this.breathSetup();
+    player.fireCooldown = 0;
+    assert(fireWeapon(), 'sniper shot failed');
+    await this.frame();
+    s = this.breathState();
+    assert(s.boltT > 0, 'bolt cycle did not start');
+    let heldDuringBolt = false;
+    this.shiftDown();
+    while (this.breathState().boltT > 0){
+      await this.frame();
+      if (this.breathState().held){ heldDuringBolt = true; break; }
+    }
+    s = this.breathState();
+    check('bolt: no breath while the bolt is worked',
+          !heldDuringBolt && !s.held && s.boltT >= 0,
+          {boltT:s.boltT, held:s.held});
+    while (this.breathState().boltT > 0) await this.frame();
+    await this.waitGame(0.1);
+    s = this.breathState();
+    check('bolt: no deferred breath after the cycle', !s.held, s);
+    this.shiftUp(); await this.waitGame(0.05);
+    this.shiftDown(); await this.frame();
+    s = this.breathState();
+    check('bolt: later legal press still works', s.held && !s.lock, s);
+    this.shiftUp(); await this.waitGame(0.05);
+
+    /* ---- 8. switching weapons clears the breath instantly ----------------- */
+    await this.breathSetup();
+    this.shiftDown(); await this.frame();
+    assert(this.breathState().held, 'hold did not engage before switch');
+    this.wep(0);                                           /* M4, no scope */
+    await this.waitGame(0.1);
+    s = this.breathState();
+    check('switch: hold and lock cleared on weapon swap',
+          !isSniper() && !s.held && !s.lock && s.breath === 0, s);
+    this.shiftUp(); await this.waitGame(0.05);
+    this.wep(3); this.ads(true); await this.waitGame(0.3);
+    this.shiftDown(); await this.frame();
+    check('switch: breath works again back on the sniper', this.breathState().held,
+          this.breathState());
+    this.shiftUp(); await this.waitGame(0.05);
+
+    /* ---- 9. leaving the scope clears the breath instantly ----------------- */
+    await this.breathSetup();
+    this.shiftDown(); await this.frame();
+    assert(this.breathState().held, 'hold did not engage before ADS exit');
+    this.ads(false);
+    await this.waitGame(0.1);
+    s = this.breathState();
+    check('exit ADS: hold and lock cleared', !s.held && !s.lock && s.breath === 0, s);
+    this.shiftUp(); await this.waitGame(0.05);
+    this.ads(true); await this.waitGame(0.3);
+    this.shiftDown(); await this.frame();
+    check('exit ADS: re-scope plus re-press holds again', this.breathState().held,
+          this.breathState());
+    this.shiftUp(); this.ads(false);
+
+    /* ---- 10. death clears the breath instantly ---------------------------- */
+    await this.breathSetup();
+    this.shiftDown(); await this.frame();
+    assert(this.breathState().held, 'hold did not engage before death');
+    window.__god = false;
+    damagePlayer(9999, player.pos.clone().add(new THREE.Vector3(1, 0, 0)));
+    /* endGame stops the clock, so advance plain frames rather than waitGame */
+    await this.frames(2);
+    s = this.breathState();
+    check('death: breath cleared when killed', player.dead && !s.held && !s.lock && s.breath === 0,
+          {dead:player.dead, state:s});
+    this.shiftUp();
+    window.__god = true;
+
+    const pass = R.every(r => r.pass);
+    return {pass, checks: R,
+            summary: R.filter(r => !r.pass).map(r => r.name),
+            samples: {baseRms: base.rms, heldRms: held.rms,
+                      recoveredRms: recovered.rms}};
+  },
+
   shoot(n){ for (let i = 0; i < (n || 1); i++){ player.fireCooldown = 0; fireWeapon(); } },
   resume(){ G.paused = false; G.running = true; UI.pause.classList.remove('on'); },
   state(){ return {hp:+player.hp.toFixed(0), ar:+player.armor.toFixed(0), k:G.kills, w:player.weapon,

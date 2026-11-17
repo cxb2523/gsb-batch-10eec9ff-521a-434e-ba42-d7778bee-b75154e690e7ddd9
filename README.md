@@ -98,9 +98,14 @@ spread, and costs 40% of your movement speed while held.
 The sniper is the one that changes the screen. Scoping swaps the crosshair for a full
 overlay and hides the weapon behind the glass, which the composite shader veils the way
 real optics do. The view drifts on a slow two-sine sway; holding `Shift` steadies it for
-three seconds, after which you have to release and take another breath. Mouse sensitivity
-scales with the zoom so your aim stays consistent on screen. The bolt takes 1.5s to work,
-which makes a miss genuinely expensive.
+three seconds, then the breath gives out and the drift eases back to normal — the same
+held key cannot restart it, so `Shift` must be released and pressed again. A hold only
+starts through the sniper scope and never while a reload or the 1.5s bolt cycle is in
+progress; a press consumed during one of those actions is not lost, and a later legal
+press still works. Letting `Shift` go, dropping out of the scope, swapping weapons or
+dying clears the hold (and any exhaustion) instantly, and the sway amplitude always
+eases rather than snaps. Mouse sensitivity scales with the zoom so your aim stays
+consistent on screen. The bolt takes 1.5s to work, which makes a miss genuinely expensive.
 
 ## Movement
 

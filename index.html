@@ -4413,7 +4413,7 @@ const player = {
   reloadT:0, pumpT:0, boltT:0, boltPhase:0, fireCooldown:0,
   triggerHeld:false, triggerReleased:true, clickBuf:0,
   ads:false, adsK:0, adsEase:0,
-  breath:0, breathHeld:false, breathLock:false, swayT:0,
+  breath:0, breathHeld:false, breathLock:false, shiftEdge:false, swayT:0,
   jumpsLeft:0, spaceEdge:false,
   mantleT:0, mantleDur:0, mantleFrom:new THREE.Vector3(), mantleTo:new THREE.Vector3(),
   dead:false
@@ -4653,7 +4653,8 @@ function updateCrosshair(dt){
     /* the gun would otherwise render straight through the lens */
     vmRoot.visible = scopeK < 0.92;
   }
-  const showBreath = scopeK>0.5 && !player.breathLock && player.breath<=0 && !player.breathHeld;
+  const showBreath = scopeK>0.5 && !player.breathLock && player.breath<=0
+                     && !player.breathHeld && player.reloadT<=0 && player.boltT<=0;
   if (showBreath !== UI._breathTip){
     UI._breathTip = showBreath;
     UI.breathTag.classList.toggle('on', showBreath);
@@ -4731,6 +4732,11 @@ let sensScale = 1;              // shrinks with ADS zoom so aim stays 1:1 on scr
 addEventListener('keydown', e=>{
   if (e.repeat) { if(['Space','KeyR','Digit1','Digit2','Digit3','Digit4','KeyV'].includes(e.code)) e.preventDefault(); return; }
   keys[e.code]=true;
+  /* breath hold is edge-triggered: the update loop consumes this latch once,
+     and a press that lands mid-reload/bolt simply fails the legality check
+     instead of starting a breath — a later, genuinely fresh press still works,
+     so no key press is ever swallowed */
+  if (e.code==='ShiftLeft' || e.code==='ShiftRight') player.shiftEdge = true;
   if (e.code==='Space') player.spaceEdge = true;      // consumed by the jump/mantle step
   if (['Space','KeyR','Digit1','Digit2','Digit3','Digit4','KeyV','Tab','ControlLeft'].includes(e.code)) e.preventDefault();
   if (!G.running) return;
@@ -4774,6 +4780,7 @@ document.addEventListener('pointerlockchange', ()=>{
   if (!locked && G.started && !G.over){
     G.paused = true; G.running=false;
     player.ads=false; player.adsK=0; player.adsEase=0;
+    clearBreath();
     UI._scopeK=-1; UI.scope.style.opacity=0; compMat.uniforms.scope.value=0;
     UI.cross.classList.remove('hidden'); vmRoot.visible=true;
     UI.pause.classList.add('on');
@@ -4822,11 +4829,21 @@ function currentSpreadMult(){
 }
 
 /* ---- aim down sights ---- */
+/* Every path that must drop the breath immediately (letting Shift go, leaving
+   the scope, swapping guns, death, pause) funnels through here so the state
+   machine can never get stuck half-holding. swayAmp is left alone: its damp()
+   eases the drift back to baseline smoothly instead of snapping. */
+function clearBreath(){
+  player.breath = 0;
+  player.breathHeld = false;
+  player.breathLock = false;
+  player.shiftEdge = false;
+}
 function setADS(on){
   if (on === player.ads) return;
   if (on && (player.dead || !G.running)) return;
   player.ads = on;
-  if (!on){ player.breathHeld = false; player.breathLock = false; }
+  if (!on) clearBreath();
 }
 function toggleADS(){ setADS(!player.ads); }
 
@@ -4835,6 +4852,7 @@ function switchWeapon(i){
   if (player.switching>0) return;
   if (player.reloadT>0){ player.reloadT=0; }
   setADS(false);
+  clearBreath();                                   /* swapping guns kills any hold */
   player.boltT = 0;
   player.switchTo = i;
   player.switching = WEAPONS[i].drawTime + 0.22;
@@ -4846,6 +4864,7 @@ function startReload(){
   if (player.reloadT>0 || player.switching>0 || player.pumpT>0 || player.boltT>0) return;
   if (w.mag>=w.magSize || w.res<=0) return;
   setADS(false);
+  clearBreath();                                   /* no breath during the reload */
   player.reloadT = w.reloadTime;
   player.reloadPhase = 0;
   SFX.magOut();
@@ -5088,6 +5107,7 @@ function damagePlayer(amount, fromPos){
   if (player.hp<=0){
     player.hp=0; player.dead=true;
     setADS(false);
+    clearBreath();
     updateVitalsUI();
     endGame(false);
   }
@@ -5796,19 +5816,46 @@ function updatePlayer(dt){
   const scoped = !!wpn.scope && player.adsEase > 0.55;
 
   /* scope sway: two slow sines at different rates so the drift never repeats
-     on an obvious beat. holding shift settles it for three seconds. */
+     on an obvious beat. Holding Shift while scoped settles it for three
+     seconds. The breath is a strict state machine:
+       - starts only on a fresh Shift press (edge), only through the sniper
+         scope, and never while a reload or bolt cycle is in progress
+       - runs for BREATH_TIME, then forces exhaustion (breathLock); the same
+         held key cannot restart it — Shift must come up and go down again
+       - releasing Shift, dropping out of the scope, switching guns or dying
+         clears both the hold and the exhaustion lock immediately */
   const shiftDown = !!(keys['ShiftLeft']||keys['ShiftRight']);
-  if (scoped && shiftDown && !player.breathLock && player.breath<=0){
-    player.breath = BREATH_TIME; player.breathHeld = true;
-  }
-  if (!shiftDown) player.breathLock = false;
-  if (player.breath>0){
+  const busy = player.reloadT>0 || player.boltT>0;
+  if (!shiftDown){
+    /* key up: fully reset so the next press is a legal fresh start */
+    clearBreath();
+  } else if (player.breathHeld){
     player.breath -= dt;
-    if (!shiftDown || !scoped){ player.breath = 0; player.breathHeld = false; }
-    else if (player.breath<=0){ player.breathHeld=false; player.breathLock=true; }  // out of air
-  } else player.breathHeld = false;
+    if (!scoped || busy || player.dead){
+      clearBreath();
+    } else if (player.breath<=0){
+      /* out of air: stay locked until the player physically lets Shift go */
+      player.breath = 0;
+      player.breathHeld = false;
+      player.breathLock = true;
+      player.shiftEdge = false;
+    }
+  } else if (player.shiftEdge){
+    player.shiftEdge = false;                   /* the press is consumed once */
+    /* a press while reloading/working the bolt is not a breath start, but the
+       edge was already cleared above — once the action ends, holding Shift
+       does nothing; a further real press starts normally. Nothing is eaten. */
+    if (scoped && !busy && !player.dead && !player.breathLock){
+      player.breath = BREATH_TIME;
+      player.breathHeld = true;
+    }
+  }
 
   player.swayT += dt;
+  /* damp() guarantees C1 continuity: entering and leaving the hold eases the
+     amplitude rather than jumping, so the lens never snaps on a key press.
+     Exhaustion leaves breathHeld false, which naturally retargets the full
+     baseline amplitude and drifts smoothly back up. */
   const swayAmp = damp(player.swayAmp===undefined?1:player.swayAmp,
                        player.breathHeld?0.04:1, player.breathHeld?9:3.4, dt);
   player.swayAmp = swayAmp;
@@ -5818,6 +5865,9 @@ function updatePlayer(dt){
     scopeSwayX = Math.sin(player.swayT*0.62)*a + Math.sin(player.swayT*1.13+1.7)*a*0.30;
     scopeSwayY = Math.sin(player.swayT*0.47+2.2)*a*0.72 + Math.sin(player.swayT*0.91)*a*0.22;
   }
+  /* readable by the dev harness so tests can measure the real lens drift */
+  player.swayX = scopeSwayX;
+  player.swayY = scopeSwayY;
 
   /* ---- stance ---- */
   const wantCrouch = !!(keys['ControlLeft']||keys['ControlRight']||keys['KeyC']);
@@ -6291,7 +6341,8 @@ function resetWorldState(){
   player.burstCount=0; player.burstIdle=0; player.fovKick=0;
   player.shake=0; player.landShake=0; player.crouch=false; player.height=STAND_H; player.eye=STAND_H;
   player.ads=false; player.adsK=0; player.adsEase=0; player.swayAmp=1;
-  player.breath=0; player.breathHeld=false; player.breathLock=false;
+  player.swayX=0; player.swayY=0;
+  player.breath=0; player.breathHeld=false; player.breathLock=false; player.shiftEdge=false;
   player.mantleT=0; player.mantleTilt=0; player.jumpsLeft=1; player.spaceEdge=false;
   sensScale=1; fovCur=BASE_FOV; vmRoot.visible=true;
   vmCamera.position.z=0; vmCamera.fov=VM_FOV; vmCamera.updateProjectionMatrix();
