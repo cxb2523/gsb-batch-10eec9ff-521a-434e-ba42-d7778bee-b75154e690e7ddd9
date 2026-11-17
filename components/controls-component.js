@@ -409,6 +409,7 @@ function removeKeyframe() {
     });
     cleanKeyframes(nodeNames);
     seekTime(time);
+    viewportsNeedRender();
     updateProperties();
     updateTimeline();
 }
@@ -566,6 +567,15 @@ function setKeyframeCamera() {
     var time = timeline.getCustomTime('playhead').getTime();
     var cameraName = $('#keyframe-camera').val();
     var cameraNode = findNodeByName(cameraName);
+    if (cameraNode == null || cameraNode.cameraId === undefined) {
+        // The chosen camera node no longer exists; use the default camera.
+        cameraNode = findCamera(pcx, 0);
+        cameraName = cameraNode != null ? cameraNode.name : '';
+    }
+    if (cameraNode == null) {
+        alert('No camera available to set on this keyframe');
+        return;
+    }
     var kf = getKeyframe(pcx, time);
     if (kf == null) {
         var newKF = {

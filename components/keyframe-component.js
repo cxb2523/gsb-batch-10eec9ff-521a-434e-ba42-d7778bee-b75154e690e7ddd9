@@ -8,12 +8,15 @@ layout.registerComponent( 'keyframeComponent', function(container, componentStat
 function updateKFInfo() {
     $('#keyframe-info').empty();
     var kf = getKeyframe(pcx, pcx.time);
-    if (kf == null || kf.nodes === undefined) {
+    if (kf == null || !kf.nodes) {
         return;
     }
     kf.nodes.forEach(function(nodeData) {
+        if (nodeData == null)
+            return;
         var node = findNode(pcx, nodeData.id);
-        $('#keyframe-info').append('<pre>' + node.name + '</pre>');
+        var nodeName = node != null ? node.name : 'node ' + nodeData.id;
+        $('#keyframe-info').append('<pre>' + nodeName + '</pre>');
         $('#keyframe-info').append('<div class="node-info" id="node-info-' + nodeData.id + '"></div>');
         $('#node-info-' + nodeData.id).empty();
         if (nodeData.pos)
@@ -28,7 +31,7 @@ function updateKFInfo() {
             $('#node-info-' + nodeData.id).append('<span class="node-info-enabled">SCALE</span>');
         else
             $('#node-info-' + nodeData.id).append('<span class="node-info-disabled">SCALE</span>');
-        if (node.model) {
+        if (node != null && node.model) {
             if (nodeData.vis)
                 $('#node-info-' + nodeData.id).append('<span class="node-info-enabled">VIS</span>');
             else

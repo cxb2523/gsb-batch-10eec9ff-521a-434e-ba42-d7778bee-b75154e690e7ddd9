@@ -122,7 +122,7 @@ function seekTime(time, noLog) {
     timeline.setCustomTime(new Date(time), 'playhead');
     $('#current-time').text(time);
     var cameraNode = seekTimePlayer(pcx, time);
-    $('#key-camera').text(cameraNode.name);
+    $('#key-camera').text(cameraNode != null ? cameraNode.name : 'no camera');
     previousTime = time;
     pcx.time = time;
     updateProperties();

@@ -281,27 +281,24 @@ function deleteNode() {
         alert('Select a node to delete');
         return;
     }
-    if (selectNode.id == 0) {
+    var node = findNode(pcx, treeNode.id);
+    if (node == null)
+        return;
+    if (node.id == 0) {
         alert('Cannot delete the root node');
         return;
     }
-    var node = findNode(pcx, treeNode.id);
     if (node.cameraId == 0) {
         alert('Cannot delete the default camera');
         return;
     }
     var childNames = '';
     var containsDefaultCamera = false;
-    var cameras = [];
-    var deletedNodes = [];
     traverseTree(pcx, function(child) {
         if (child.cameraId == 0)
             containsDefaultCamera = true;
         if (child.name != node.name)
             childNames += '"' + child.name + '", ';
-        if (child.cameraId !== undefined)
-            cameras.push(child.cameraId);
-        deletedNodes.push(child.id);
     }, node);
     if (containsDefaultCamera) {
         alert('Cannot delete a node that has the default camera as a child');
@@ -310,29 +307,13 @@ function deleteNode() {
     if (childNames) {
         childNames = childNames.slice(0, childNames.length - 2);
     }
-    pcx.keyframes.forEach(function(kf) {
-        if (cameras.includes(kf.cameraId))
-            kf.cameraId = 0;
-        for (var i = 0; i < kf.nodes.length; i++) {
-            if (deletedNodes.includes(kf.nodes[i].id)) {
-                kf.nodes.splice(i, 1);
-                i--;
-            }
-        }
-    });
-    var parent = getParentNode(pcx, node);
-    for (var i = 0; i < parent.children.length; i++) {
-        if (parent.children[i].id == node.id) {
-            parent.children.splice(i, 1);
-            parent.threeObject.remove(node.threeObject);
-            break;
-        }
-    }
+    var parent = removeNode(pcx, node);
     updateTree();
     updateCameraLists();
     selectNode(parent.id);
     var time = timeline.getCustomTime('playhead').getTime();
     seekTime(time);
+    viewportsNeedRender();
     log('Deleted node "' + node.name + '" with children ' + childNames);
 }
 
@@ -347,15 +328,37 @@ function updateCameraLists() {
         opts += '<option value="' + cameras[i].name + '">' + cameras[i].name + '</option>';
     }
     $('#keyframe-camera').html(opts);
-    opts = '<option value="free camera">free camera</option><option value="key camera">key camera</option>' + opts;
-    for (var i = 0; i < viewports.length; i++) {
-        var current = $('#view-camera-select-' + i).val();
-        if (current == null) {
+    var cameraOpts = '<option value="free camera">free camera</option><option value="key camera">key camera</option>' + opts;
+    viewports.forEach(function(viewport) {
+        var select = $('#view-camera-select-' + viewport.viewportId);
+        // Derive the selection from the viewport's cameraId rather than the
+        // current DOM value, which may be stale after options are replaced.
+        var current = null;
+        if (viewport.cameraId == CAMERA.free)
             current = 'free camera';
+        else if (viewport.cameraId == CAMERA.key)
+            current = 'key camera';
+        else {
+            var cameraNode = findCamera(pcx, viewport.cameraId);
+            if (cameraNode != null)
+                current = cameraNode.name;
         }
-        $('#view-camera-select-' + i).html(opts);
-        $('#view-camera-select-' + i).val(current);
-    }
+        if (current == null) {
+            // The selected camera node was deleted. Show the camera the
+            // viewport actually falls back to so the UI matches the render.
+            var fallback = findCameraOrDefault(pcx, viewport.cameraId);
+            if (fallback != null) {
+                current = fallback.name;
+                viewport.cameraId = fallback.cameraId;
+            }
+            else {
+                current = 'free camera';
+                viewport.cameraId = CAMERA.free;
+            }
+        }
+        select.html(cameraOpts);
+        select.val(current);
+    });
 }
 
 function createModelEditor(modelName, nodeName, parent, id) {
@@ -482,32 +485,8 @@ function update() {
                         child.visible = false;
                 });
             });
-            var camera;
-            if (viewport.cameraId != CAMERA.key) {
-                camera = findCamera(pcx, viewport.cameraId);
-            }
-            else {
-                var time = timeline.getCustomTime('playhead').getTime();
-                var exact = getKeyframe(pcx, time);
-                if (exact && exact.cameraId !== undefined) {
-                    camera = findCamera(pcx, exact.cameraId);
-                }
-                else {
-                    var before = getKeyframeBefore(pcx, time, null, '', true);
-                    if (before.kf != null)
-                        camera = findCamera(pcx, before.kf.cameraId);
-                    else
-                        camera = findCamera(pcx, 0);
-                }
-            }
-            var ar  = getAspectRatio(pcx.settings.aspectRatio);
-            if (camera.cameraObject.fov != camera.cameraFov || 
-                camera.cameraObject.aspect != ar) {
-                camera.cameraObject.fov = camera.cameraFov;
-                camera.cameraObject.aspect = ar;
-                camera.cameraObject.updateProjectionMatrix();
-            }
-            viewport.renderer.render(pcx.scene, camera.cameraObject);
+            var time = timeline.getCustomTime('playhead').getTime();
+            renderCameraViewport(pcx, viewport, viewport.cameraId == CAMERA.key, time);
         }
         else if (viewport.camera != null) {
             // Meta camera

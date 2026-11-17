@@ -203,7 +203,18 @@ function changeCamera(viewportId) {
     }
     else {
         var cameraNode = findNodeByName(selectedCamera);
-        viewport.cameraId = cameraNode.cameraId;
+        if (cameraNode == null || cameraNode.cameraId === undefined) {
+            // Camera node is gone; fall back to the default camera.
+            var fallback = findCamera(pcx, 0);
+            viewport.cameraId = fallback != null ? fallback.cameraId : CAMERA.free;
+            if (fallback != null)
+                $('#view-camera-select-' + viewportId).val(fallback.name);
+            else
+                $('#view-camera-select-' + viewportId).val('free camera');
+        }
+        else {
+            viewport.cameraId = cameraNode.cameraId;
+        }
         $('#viewport' + viewportId + ' > .view-controls').hide();
     }
     updateViewport(viewportId);

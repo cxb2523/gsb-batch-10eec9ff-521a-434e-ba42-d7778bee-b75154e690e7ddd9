@@ -106,7 +106,7 @@ function changeProperties() {
             }
         }
     });
-    if (node.cameraId !== undefined) {
+    if (node.cameraId !== undefined && node.cameraObject != null) {
         node.cameraFov = parseFloat($('#fov').val());
         node.cameraObject.fov = node.cameraFov;
         node.cameraObject.updateProjectionMatrix();

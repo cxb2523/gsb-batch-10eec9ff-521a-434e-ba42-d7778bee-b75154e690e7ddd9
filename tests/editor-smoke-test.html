@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Editor smoke test - delete camera node</title>
+    <link rel="stylesheet" type="text/css" media="screen" href="../css/goldenlayout-base.css" />
+    <link rel="stylesheet" type="text/css" media="screen" href="../css/goldenlayout-dark-theme.css" />
+    <link rel="stylesheet" type="text/css" media="screen" href="../css/jqtree.css" />
+    <link rel="stylesheet" type="text/css" media="screen" href="../css/vis-timeline-graph2d.css" />
+    <link rel="stylesheet" type="text/css" media="screen" href="../css/bootstrap.min.css" />
+    <link rel="stylesheet" type="text/css" media="screen" href="../css/main.css" />
+    <script type="text/javascript" src="https://code.jquery.com/jquery-1.11.1.min.js"></script>
+    <script src="../js/vis-timeline-graph2d.min.js"></script>
+    <script src="../js/goldenlayout.min.js"></script>
+    <script src="../js/tree.jquery.js"></script>
+    <script src="../js/three.js"></script>
+    <script src="../js/BufferGeometryUtils.js"></script>
+    <script src="../layout.js"></script>
+    <script src="../components/tree-component.js"></script>
+    <script src="../components/tree-controls-component.js"></script>
+    <script src="../components/model-component.js"></script>
+    <script src="../components/shape-component.js"></script>
+    <script src="../components/viewport-component.js"></script>
+    <script src="../components/settings-component.js"></script>
+    <script src="../components/controls-component.js"></script>
+    <script src="../components/properties-component.js"></script>
+    <script src="../components/file-component.js"></script>
+    <script src="../components/log-component.js"></script>
+    <script src="../components/timeline-component.js"></script>
+    <script src="../components/welcome-component.js"></script>
+    <script src="../components/keyframe-component.js"></script>
+    <script src="../built-in-models.js"></script>
+    <script src="../player.js"></script>
+    <script src="../main.js"></script>
+    <style>
+        #smoke-results {
+            position: fixed;
+            right: 0;
+            top: 0;
+            width: 420px;
+            max-height: 100%;
+            overflow: auto;
+            background: #111;
+            color: #ddd;
+            font: 12px Consolas, monospace;
+            padding: 8px;
+            z-index: 99999;
+        }
+        .pass { color: #6c6; }
+        .fail { color: #f66; }
+    </style>
+</head>
+<body>
+<script>
+    // Editor smoke test: exercises deleteNode()/seekTime()/updateKFInfo() through
+    // the real editor code paths once the layout is up.
+    window.addEventListener('load', function () {
+        var results = document.createElement('div');
+        results.id = 'smoke-results';
+        document.body.appendChild(results);
+        var failures = 0;
+
+        function report(ok, message) {
+            if (!ok)
+                failures++;
+            var line = document.createElement('div');
+            line.className = ok ? 'pass' : 'fail';
+            line.textContent = (ok ? 'PASS  ' : 'FAIL  ') + message;
+            results.appendChild(line);
+        }
+
+        function assert(cond, message) {
+            report(!!cond, message);
+        }
+
+        setTimeout(function () {
+            try {
+                // --- Scene setup -------------------------------------------------
+                var cameraB = createCameraEditor('camera B', pcx.sceneTree, 5, 1, 45);
+                assert(cameraB != null, 'created camera B');
+
+                // A keyframe that uses camera B and contains data for camera B
+                // and for the default cube.
+                var kf = { time: 100, nodes: [{ id: 5, pos: { x: 1, y: 1, z: 1 } }], cameraId: 1 };
+                pcx.keyframes.push(kf);
+
+                // Seek so the viewport follows the key camera.
+                var viewport = viewports[0];
+                viewport.cameraId = CAMERA.key;
+                seekTime(100);
+                assert($('#key-camera').text() === 'camera B', 'key camera reads "camera B"');
+
+                // A viewport render through the key-camera path must not throw.
+                var rendered = false;
+                try {
+                    viewport.needsRender = true;
+                    update();
+                    rendered = true;
+                } catch (e) {
+                    report(false, 'viewport render threw: ' + e.message);
+                }
+                assert(rendered, 'viewport renders with key camera');
+
+                // --- Delete the camera node -------------------------------------
+                $('#scene-tree').tree('selectNode', $('#scene-tree').tree('getNodeById', 5));
+                deleteNode();
+
+                assert(findNode(pcx, 5) == null, 'camera B node removed from scene tree');
+                assert(findCamera(pcx, 1) == null, 'camera B no longer findable');
+                assert(kf.cameraId === 0, 'keyframe camera repointed to the default camera');
+                assert(kf.nodes.length === 0, 'keyframe data for the deleted node removed');
+                assert($('#key-camera').text() === 'default camera',
+                    'key camera label falls back to "default camera"');
+
+                // A viewport pinned directly to the deleted camera must show a
+                // valid selection instead of a dangling camera name.
+                var pinned = viewports[0];
+                pinned.cameraId = 1;
+                $('#view-camera-select-0').val('camera B');
+                updateCameraLists();
+                assert($('#view-camera-select-0').val() === 'default camera',
+                    'viewport camera dropdown falls back after deletion');
+                assert(pinned.cameraId === 0, 'pinned viewport camera repointed to default');
+
+                // Viewport must survive the deleted camera.
+                var survived = false;
+                try {
+                    viewport.needsRender = true;
+                    update();
+                    survived = true;
+                } catch (e) {
+                    report(false, 'viewport threw after delete: ' + e.message);
+                }
+                assert(survived, 'viewport renders after camera node deletion');
+
+                // --- Keyframe info with a missing node ---------------------------
+                pcx.keyframes.push({ time: 200, nodes: [{ id: 4242, pos: { x: 0, y: 0, z: 0 } }] });
+                pcx.time = 200;
+                var infoOk = false;
+                try {
+                    updateKFInfo();
+                    infoOk = true;
+                } catch (e) {
+                    report(false, 'updateKFInfo threw: ' + e.message);
+                }
+                assert(infoOk, 'keyframe info panel tolerates a missing node');
+
+                // --- Player side agrees with the editor --------------------------
+                var playerCamera = seekTimePlayer(pcx, 100);
+                assert(playerCamera != null && playerCamera.name === 'default camera',
+                    'player falls back to the default camera after deletion');
+
+                // --- No keyframe camera at all -----------------------------------
+                var nonePcx = createContext('smoke-none');
+                loadSettingsPlayer(nonePcx, defaultSettings);
+                var cam = createEmptyNodePlayer('default camera', nonePcx.sceneTree, 1);
+                createCameraPlayer(nonePcx, cam, 0, 45);
+                var cubeNode = createEmptyNodePlayer('cube', nonePcx.sceneTree, 2);
+                nonePcx.keyframes = [
+                    { time: 0, nodes: [{ id: 2, pos: { x: 0, y: 0, z: 0 } }] },
+                    { time: 200, nodes: [{ id: 2, pos: { x: 100, y: 0, z: 0 } }] }
+                ];
+                assert(seekTimePlayer(nonePcx, 50).name === 'default camera',
+                    'no camera keyframes: player uses the default camera');
+                var r = { cameraId: CAMERA.key, renderer: nonePcx.renderer };
+                assert(renderCameraViewport(nonePcx, r, true, 50) === true,
+                    'no camera keyframes: editor viewport renders');
+
+                document.title = failures === 0 ? 'SMOKE OK' : 'SMOKE FAIL';
+                results.insertAdjacentHTML('afterbegin',
+                    '<div><b>' + (failures === 0 ? 'ALL PASS' : failures + ' FAILURES') + '</b></div>');
+            } catch (e) {
+                document.title = 'SMOKE ERROR';
+                results.insertAdjacentHTML('afterbegin',
+                    '<div class="fail"><b>ERROR: ' + e.message + '</b></div>');
+            }
+        }, 1200);
+    });
+</script>
+</body>
+</html>

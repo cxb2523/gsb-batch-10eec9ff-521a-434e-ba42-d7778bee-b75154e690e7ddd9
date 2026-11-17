@@ -83,12 +83,12 @@ function loadProjectPlayer(url, pcx, doneLoading) {
             aspectHeight = Math.floor(aspectHeight);
             pcx.renderer.setSize(aspectWidth, aspectHeight);
             var camera = seekTimePlayer(pcx, pcx.time);
-            pcx.renderer.render(pcx.scene, camera.cameraObject);
+            renderWithCamera(pcx.renderer, pcx.scene, camera);
         }
         updateSize(null, div);
         div.onfullscreenchange = updateSize;
         var camera = seekTimePlayer(pcx, 0);
-        pcx.renderer.render(pcx.scene, camera.cameraObject);
+        renderWithCamera(pcx.renderer, pcx.scene, camera);
         if (doneLoading)
             doneLoading(pcx);
         if (pcx.settings.autoplay)
@@ -163,6 +163,42 @@ function getParentNode(pcx, find, tree) {
                 parent = node;
         })
     }, tree);
+    return parent;
+}
+
+// Remove a node and its subtree. Keyframes that referenced a removed camera
+// are repointed at the default camera (cameraId 0) and keyframe data for
+// removed nodes is dropped. Returns the removed node's parent.
+function removeNode(pcx, node) {
+    var cameras = [];
+    var deletedNodes = [];
+    traverseTree(pcx, function(child) {
+        if (child.cameraId !== undefined)
+            cameras.push(child.cameraId);
+        deletedNodes.push(child.id);
+    }, node);
+    (pcx.keyframes || []).forEach(function(kf) {
+        if (kf.cameraId !== undefined && cameras.indexOf(kf.cameraId) != -1)
+            kf.cameraId = 0;
+        if (!kf.nodes)
+            return;
+        for (var i = 0; i < kf.nodes.length; i++) {
+            if (kf.nodes[i] != null && deletedNodes.indexOf(kf.nodes[i].id) != -1) {
+                kf.nodes.splice(i, 1);
+                i--;
+            }
+        }
+    });
+    var parent = getParentNode(pcx, node);
+    if (parent != null) {
+        for (var i = 0; i < parent.children.length; i++) {
+            if (parent.children[i].id == node.id) {
+                parent.children.splice(i, 1);
+                parent.threeObject.remove(node.threeObject);
+                break;
+            }
+        }
+    }
     return parent;
 }
 
@@ -303,8 +339,10 @@ function createShapeGeometry(pcx, data, shapeName) {
 function findCamera(pcx, cameraId, startNode) {
     if (!startNode)
         startNode = pcx.sceneTree;
+    if (!startNode)
+        return null;
     var found = null;
-    if (startNode.cameraId == cameraId)
+    if (cameraId !== undefined && startNode.cameraId !== undefined && startNode.cameraId == cameraId)
         return startNode;
     startNode.children.forEach(function(node) {
         var foundSub = findCamera(pcx, cameraId, node);
@@ -316,6 +354,8 @@ function findCamera(pcx, cameraId, startNode) {
 
 function getKeyframe(pcx, time) {
     var found = null;
+    if (!pcx.keyframes)
+        return null;
     pcx.keyframes.forEach(function(keyframe) {
         if (keyframe.time == time)
             found = keyframe
@@ -326,7 +366,7 @@ function getKeyframe(pcx, time) {
 function getKeyframeBefore(pcx, time, nodeId, dataType, hasCamera) {
     var found = null;
     var foundData = null;
-    pcx.keyframes.forEach(function(keyframe) {
+    (pcx.keyframes || []).forEach(function(keyframe) {
         var data = getKeyframeData(keyframe, nodeId);
         if ((data != null && data[dataType] !== undefined) || hasCamera) {
             if (!hasCamera || keyframe.cameraId !== undefined) {
@@ -349,7 +389,7 @@ function getKeyframeBefore(pcx, time, nodeId, dataType, hasCamera) {
 function getKeyframeAfter(pcx, time, nodeId, dataType) {
     var found = null;
     var foundData = null;
-    pcx.keyframes.forEach(function(keyframe) {
+    (pcx.keyframes || []).forEach(function(keyframe) {
         var data = getKeyframeData(keyframe, nodeId);
         if (data != null && data[dataType] !== undefined) {
             if (keyframe.time > time) {
@@ -369,13 +409,87 @@ function getKeyframeAfter(pcx, time, nodeId, dataType) {
 
 function getKeyframeData(kf, nodeId) {
     var found = null;
-    if (kf == null)
+    if (kf == null || !kf.nodes)
         return null;
     kf.nodes.forEach(function(nodeData) {
         if (nodeData.id == nodeId)
             found = nodeData;
     });
     return found;
+}
+
+// A camera node is only usable for rendering if it actually has a three.js
+// camera object attached.
+function isUsableCamera(camera) {
+    return camera != null && camera.cameraObject != null;
+}
+
+// Camera selection used by both the player and the editor viewport.
+// Order: exact keyframe camera, nearest earlier keyframe with a camera,
+// then the default camera (cameraId 0).
+function getKeyframeCamera(pcx, time) {
+    var kf = getKeyframe(pcx, time);
+    if (kf != null && kf.cameraId !== undefined) {
+        var exact = findCamera(pcx, kf.cameraId);
+        if (isUsableCamera(exact))
+            return exact;
+    }
+    var candidates = [];
+    (pcx.keyframes || []).forEach(function(keyframe) {
+        if (keyframe.cameraId !== undefined && keyframe.time < time)
+            candidates.push(keyframe);
+    });
+    candidates.sort(function(a, b) {
+        return b.time - a.time;
+    });
+    for (var i = 0; i < candidates.length; i++) {
+        var camera = findCamera(pcx, candidates[i].cameraId);
+        if (isUsableCamera(camera))
+            return camera;
+    }
+    return findCamera(pcx, 0);
+}
+
+function findCameraOrDefault(pcx, cameraId) {
+    var camera = findCamera(pcx, cameraId);
+    if (!isUsableCamera(camera))
+        camera = findCamera(pcx, 0);
+    return camera;
+}
+
+// Camera used by an editor viewport. followsKeyframes means the viewport
+// follows the keyframe camera and therefore uses the same fallback rule as
+// the player.
+function getViewportCamera(pcx, cameraId, followsKeyframes, time) {
+    var camera = followsKeyframes ? getKeyframeCamera(pcx, time) : findCameraOrDefault(pcx, cameraId);
+    if (!isUsableCamera(camera))
+        camera = findCamera(pcx, 0);
+    return camera;
+}
+
+// Render only when a usable camera (with a cameraObject) was resolved.
+function renderWithCamera(renderer, scene, camera) {
+    if (renderer == null || camera == null || camera.cameraObject == null)
+        return false;
+    renderer.render(scene, camera.cameraObject);
+    return true;
+}
+
+// Render an editor viewport that looks through a scene camera. Keeps the
+// existing FOV/aspect-ratio update behavior, and skips rendering instead of
+// dereferencing a missing camera.
+function renderCameraViewport(pcx, viewport, followsKeyframes, time) {
+    var camera = getViewportCamera(pcx, viewport.cameraId, followsKeyframes, time);
+    if (!isUsableCamera(camera))
+        return false;
+    var ar = getAspectRatio(pcx.settings.aspectRatio);
+    if (camera.cameraObject.fov != camera.cameraFov ||
+        camera.cameraObject.aspect != ar) {
+        camera.cameraObject.fov = camera.cameraFov;
+        camera.cameraObject.aspect = ar;
+        camera.cameraObject.updateProjectionMatrix();
+    }
+    return renderWithCamera(viewport.renderer, pcx.scene, camera);
 }
 
 function seekTimePlayer(pcx, time) {
@@ -481,16 +595,10 @@ function seekTimePlayer(pcx, time) {
         }
         node.threeObject.quaternion.normalize();
     });
-    var cameraNode = null;
-    if (kf != null && kf.cameraId !== undefined)
-        cameraNode = findCamera(pcx, kf.cameraId);
-    else {
-        var before = getKeyframeBefore(pcx, time, null, '', true);
-        if (before.kf != null)
-            cameraNode = findCamera(pcx, before.kf.cameraId);
-        else
-            cameraNode = findCamera(pcx, 0);
-    }
+    var cameraNode = getKeyframeCamera(pcx, time);
+    // Never leave the caller without a usable camera for rendering.
+    if (!isUsableCamera(cameraNode))
+        cameraNode = findCamera(pcx, 0);
     return cameraNode;
 }
 
@@ -518,7 +626,7 @@ function playPlayer(player) {
             }
         }
         
-        pcx.renderer.render(pcx.scene, camera.cameraObject);
+        renderWithCamera(pcx.renderer, pcx.scene, camera);
     }, 1000 / pcx.settings.framerate);
 }
 
