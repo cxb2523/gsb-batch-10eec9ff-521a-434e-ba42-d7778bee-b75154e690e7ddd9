@@ -1,6 +1,7 @@
 import { settings } from "./state.js";
 import { loadFile, loadImage } from "./image.js";
 import { loadBanner } from "./canvas.js";
+import { downloadBadge } from "./export.js";
 
 export const updateRange = (name, value, dp) => {
   const eleName = `.form input#image-${name}`;
@@ -71,20 +72,11 @@ export const resetButtonListener = () => {
 export const downloadButtonListener = () => {
   const ele = document.querySelector(`button#download`);
   if (!ele) return;
+  // Each click snapshots the current settings synchronously and queues one
+  // export. Exports render on detached canvases and run in order, so rapid
+  // clicks cannot interleave with each other or corrupt the preview.
   ele.addEventListener("click", () => {
-    settings.isExport = true;
-    setTimeout(() => {
-      const a = document.createElement("a");
-      const canvas = document.querySelector("canvas");
-      const url = canvas.toDataURL("image/png;base64");
-      const fileName = settings.image.fileName
-        ? settings.image.fileName.replace(/\.[^/.]+$/, "")
-        : "";
-      a.download = `${fileName || Date.now()}-gde-badge.png`;
-      a.href = url;
-      a.click();
-      settings.isExport = false;
-    }, 100);
+    downloadBadge();
   });
 };
 

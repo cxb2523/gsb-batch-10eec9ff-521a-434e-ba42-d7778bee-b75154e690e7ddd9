@@ -1,8 +1,8 @@
 import { settings } from "./state.js";
 import { updateRange } from "./listeners.js";
 
-export const drawGrid = (canvas, ctx) => {
-  if (settings.isExport) return;
+export const drawGrid = (canvas, ctx, isExport = false) => {
+  if (isExport) return;
 
   ctx.save();
   ctx.globalAlpha = 0.7;
@@ -29,8 +29,8 @@ export const drawGrid = (canvas, ctx) => {
   ctx.restore();
 };
 
-export const drawCheckPattern = (canvas, ctx) => {
-  if (settings.isExport) return;
+export const drawCheckPattern = (canvas, ctx, isExport = false) => {
+  if (isExport) return;
 
   const size = canvas.width / 40;
   ctx.fillStyle = "#bdbdbd";
@@ -104,105 +104,166 @@ export const updateSliderStates = () => {
   }
 };
 
-export const draw = () => {
-  const canvas = document.querySelector("canvas");
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
+export const isDrawable = (image) =>
+  Boolean(
+    image &&
+      typeof image === "object" &&
+      image.complete &&
+      image.naturalWidth > 0 &&
+      image.naturalHeight > 0,
+  );
 
-  const { image: imageObj, x, y, z, shape, grid, banner } = settings;
-  const image = imageObj.img;
+const getCanvasSize = (image, shape) => {
+  if (!image) return { width: 1920, height: 1920 };
+
+  const imageWidth = image.naturalWidth || image.width;
+  const imageHeight = image.naturalHeight || image.height;
+
+  if (shape === "original") {
+    return { width: imageWidth, height: imageHeight };
+  }
+
+  const size = Math.min(imageWidth, imageHeight);
+  return { width: size, height: size };
+};
+
+const syncShapeAttribute = (shape) => {
+  const container = document.querySelector(".canvas");
+  if (!container) return;
+  if (shape === "circle" || shape === "material") {
+    container.dataset.shape = shape;
+  } else {
+    delete container.dataset.shape;
+  }
+};
+
+/**
+ * Draws the badge into any canvas.
+ *
+ * This is a pure render: it never reads or writes preview-only state. The
+ * caller decides whether guides (grid, transparency checkerboard) belong in
+ * the output. Preview draws pass `isExport: false`; downloaded files pass
+ * `isExport: true`, which renders to a throwaway canvas so the preview canvas
+ * and the user's settings are never mutated by an export.
+ */
+export const renderBadge = (
+  canvas,
+  {
+    image = null,
+    banner = null,
+    material = null,
+    x = 0,
+    y = 0,
+    z = 1,
+    shape = "original",
+    grid = "none",
+  } = {},
+  { isExport = false } = {},
+) => {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return canvas;
+
+  const { width, height } = getCanvasSize(image, shape);
+  // Assigning width/height also resets the context, clearing previous pixels.
+  canvas.width = width;
+  canvas.height = height;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const offsetX = Number(x) || 0;
+  const offsetY = Number(y) || 0;
+  const zoom = Number(z) || 1;
 
   if (image) {
+    const imageWidth = image.naturalWidth || image.width;
+    const imageHeight = image.naturalHeight || image.height;
+
     switch (shape) {
       case "original": {
-        canvas.width = image.width;
-        canvas.height = image.height;
         ctx.save();
         ctx.translate(
-          (((canvas.width - image.width * z) / 2) * x) / 100,
-          (((canvas.height - image.height * z) / 2) * y) / 100,
+          (((canvas.width - imageWidth * zoom) / 2) * offsetX) / 100,
+          (((canvas.height - imageHeight * zoom) / 2) * offsetY) / 100,
         );
         ctx.transform(
-          z,
+          zoom,
           0,
           0,
-          z,
-          (-(z - 1) * canvas.width) / 2,
-          (-(z - 1) * canvas.height) / 2,
+          zoom,
+          (-(zoom - 1) * canvas.width) / 2,
+          (-(zoom - 1) * canvas.height) / 2,
         );
-        drawCheckPattern(canvas, ctx);
+        drawCheckPattern(canvas, ctx, isExport);
         ctx.drawImage(image, 0, 0);
         ctx.restore();
         break;
       }
       default: {
-        const size = Math.min(image.width, image.height);
-        canvas.width = size;
-        canvas.height = size;
-        const hRatio = canvas.width / image.width;
-        const vRatio = canvas.height / image.height;
+        const hRatio = canvas.width / imageWidth;
+        const vRatio = canvas.height / imageHeight;
         const ratio = Math.max(hRatio, vRatio);
-        const canvasX = (canvas.width - image.width * ratio) / 2;
-        const canvasY = (canvas.height - image.height * ratio) / 2;
+        const canvasX = (canvas.width - imageWidth * ratio) / 2;
+        const canvasY = (canvas.height - imageHeight * ratio) / 2;
         ctx.save();
         ctx.translate(
-          (((canvas.width - image.width * z) / 2) * x) / 100,
-          (((canvas.height - image.height * z) / 2) * y) / 100,
+          (((canvas.width - imageWidth * zoom) / 2) * offsetX) / 100,
+          (((canvas.height - imageHeight * zoom) / 2) * offsetY) / 100,
         );
         ctx.transform(
-          z,
+          zoom,
           0,
           0,
-          z,
-          (-(z - 1) * canvas.width) / 2,
-          (-(z - 1) * canvas.height) / 2,
+          zoom,
+          (-(zoom - 1) * canvas.width) / 2,
+          (-(zoom - 1) * canvas.height) / 2,
         );
-        drawCheckPattern(canvas, ctx);
+        drawCheckPattern(canvas, ctx, isExport);
         ctx.drawImage(
           image,
           0,
           0,
-          image.width,
-          image.height,
+          imageWidth,
+          imageHeight,
           canvasX,
           canvasY,
-          image.width * ratio,
-          image.height * ratio,
+          imageWidth * ratio,
+          imageHeight * ratio,
         );
         ctx.restore();
         break;
       }
     }
   } else {
-    // Set transparent canvas
-    ctx.canvas.width = 1920;
-    ctx.canvas.height = 1920;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    drawCheckPattern(canvas, ctx);
+    // No image yet: keep the transparent 1920x1920 preview stage. In export
+    // mode the checkerboard is omitted, yielding a valid transparent badge.
+    drawCheckPattern(canvas, ctx, isExport);
   }
 
-  // Draw "Banner"
-  if (banner) {
-    const height = (banner.height / banner.width) * canvas.width;
-    const bannerY = canvas.height - height;
+  // Draw "Banner". This is part of the finished badge, so it is drawn in both
+  // preview and export mode, but only when the asset is actually decodable.
+  if (isDrawable(banner)) {
+    const bannerHeight =
+      ((banner.naturalHeight || banner.height) /
+        (banner.naturalWidth || banner.width)) *
+      canvas.width;
+    const bannerY = canvas.height - bannerHeight;
     ctx.drawImage(
       banner,
       0,
       0,
-      banner.width,
-      banner.height,
+      banner.naturalWidth || banner.width,
+      banner.naturalHeight || banner.height,
       0,
       bannerY,
       canvas.width,
-      height,
+      bannerHeight,
     );
   }
 
-  // Draw grid
-  if (grid === "grid") drawGrid(canvas, ctx);
+  // Draw grid (guides only, never part of an exported badge)
+  if (grid === "grid") drawGrid(canvas, ctx, isExport);
 
+  // Apply the user-selected shape mask. Masking is part of the finished badge.
   switch (shape) {
-    // Mask image into circle
     case "circle": {
       ctx.globalCompositeOperation = "destination-in";
       ctx.beginPath();
@@ -215,22 +276,40 @@ export const draw = () => {
       );
       ctx.closePath();
       ctx.fill();
-      document.querySelector(".canvas").dataset.shape = "circle";
       break;
     }
     case "material": {
-      ctx.globalCompositeOperation = "destination-in";
-      if (settings.material) {
-        ctx.drawImage(settings.material, 0, 0, canvas.width, canvas.height);
+      if (isDrawable(material)) {
+        ctx.globalCompositeOperation = "destination-in";
+        ctx.drawImage(material, 0, 0, canvas.width, canvas.height);
       }
-      document.querySelector(".canvas").dataset.shape = "material";
       break;
     }
-    default: {
-      delete document.querySelector(".canvas").dataset.shape;
+    default:
       break;
-    }
   }
+
+  return canvas;
+};
+
+export const draw = () => {
+  const canvas = document.querySelector("canvas");
+  if (!canvas) return;
+
+  const { image: imageObj, banner, material, x, y, z, shape, grid } = settings;
+
+  renderBadge(canvas, {
+    image: imageObj && isDrawable(imageObj.img) ? imageObj.img : null,
+    banner,
+    material,
+    x,
+    y,
+    z,
+    shape,
+    grid,
+  });
+
+  syncShapeAttribute(shape);
   updateSliderStates();
 };
 
