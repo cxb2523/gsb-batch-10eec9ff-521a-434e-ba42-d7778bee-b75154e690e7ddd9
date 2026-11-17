@@ -1,0 +1,95 @@
+@import 'tailwindcss';
+
+@import '@vidstack/react/player/styles/base.css' layer(utilities);
+@import '@vidstack/react/player/styles/default/theme.css' layer(utilities);
+@import '@vidstack/react/player/styles/default/layouts/audio.css'
+  layer(utilities);
+@import '@vidstack/react/player/styles/default/layouts/video.css'
+  layer(utilities);
+
+/*
+  Subatic palette. The site is a screening room: the chrome stays dark and
+  quiet so the videos are the brightest things on the page. The logo red is
+  reserved for actions, focus and progress.
+*/
+@theme {
+  --font-sans: var(--font-archivo), ui-sans-serif, system-ui, sans-serif;
+
+  --color-auditorium: #131217; /* page background */
+  --color-stage: #1c1a21; /* inputs, panels */
+  --color-stage-raised: #25232b; /* hover, secondary buttons */
+  --color-rail: #2e2b35; /* hairlines and borders */
+  --color-usher: #a19dab; /* secondary text */
+  --color-screen: #f3f1f6; /* primary text */
+  --color-signal: #f4434a; /* logo red: focus, progress, highlights */
+  --color-signal-strong: #d6303a; /* red behind white text (AA contrast) */
+  --color-signal-deep: #b9242d;
+
+  /* Aliases used by the shadcn-style primitives in components/ui */
+  --color-background: var(--color-auditorium);
+  --color-foreground: var(--color-screen);
+  --color-muted-foreground: var(--color-usher);
+  --color-border: var(--color-rail);
+  --color-input: var(--color-rail);
+  --color-ring: var(--color-signal);
+  --color-primary: var(--color-signal-strong);
+  --color-primary-foreground: #ffffff;
+}
+
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-rail);
+  }
+
+  html {
+    color-scheme: dark;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-auditorium);
+    color: var(--color-screen);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-signal);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: color-mix(in srgb, var(--color-signal) 40%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Video player (vidstack) */
+.player {
+  --video-brand: var(--color-signal);
+  --video-focus-ring-color: var(--color-signal);
+  --video-border-radius: 0;
+  --video-border: none;
+  --audio-brand: var(--color-signal);
+  --audio-focus-ring-color: var(--color-signal);
+  --audio-border-radius: 0;
+}
+
+.player[data-view-type='audio'] .vds-poster {
+  display: none;
+}
