@@ -2,14 +2,11 @@
 // Loads onnxruntime-web models and runs inference off the main thread.
 
 import { getDecoder } from "./decoders";
+import { mergeModelResults } from "./merge";
 import { computeLetterbox, rgbaToNchw } from "./preprocess";
 
 import type { InferenceSession } from "onnxruntime-web";
-import type {
-  ObjectDetection,
-  ONNXModelConfig,
-  SegmentationMask,
-} from "../types";
+import type { ONNXModelConfig } from "../types";
 import type { DecodeContext, DecodeResult, TensorLike } from "./decoders";
 import type {
   ONNXProcessOptions,
@@ -139,20 +136,26 @@ const handleMessage = async (event: MessageEvent): Promise<void> => {
         const ort = await loadOrt();
         const started = performance.now();
 
-        const detections: ObjectDetection[] = [];
-        const masks: SegmentationMask[] = [];
+        // Run every loaded model, then merge their outputs into one clean set:
+        // cross-model duplicates are suppressed per label and each surviving
+        // detection keeps only its own mask.
+        const perModel: DecodeResult[] = [];
         for (const loaded of models.values()) {
-          const result = await runModel(
-            ort,
-            loaded,
-            imageBitmap,
-            sourceWidth,
-            sourceHeight,
-            options,
+          perModel.push(
+            await runModel(
+              ort,
+              loaded,
+              imageBitmap,
+              sourceWidth,
+              sourceHeight,
+              options,
+            ),
           );
-          if (result.objects) detections.push(...result.objects);
-          if (result.masks) masks.push(...result.masks);
         }
+
+        const { detections, masks } = mergeModelResults(perModel, {
+          maxResults: options.maxResults,
+        });
 
         // Transfer mask buffers (zero-copy) instead of structured-cloning them
         const transfer = masks.map((m) => m.mask.buffer);
