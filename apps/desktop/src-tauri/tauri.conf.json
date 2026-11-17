@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Agent Office",
+  "version": "0.4.2",
+  "identifier": "dev.bimaadam.agentoffice",
+  "build": {
+    "frontendDist": "../loading",
+    "beforeDevCommand": "bun scripts/build-collector.ts",
+    "beforeBuildCommand": "bun run prepare-app"
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://github.com/ignitrondev/agent-office/releases/latest/download/latest.json"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFCNkY2MDI4RkYyQjA4NjcKUldSbkNDdi9LR0J2cXphaVJFcERqQlBRaGpsWDF5dUJkS2lURjdxR3BzWHc1YU9jRnBYMUxjZ0oK"
+    }
+  },
+  "app": {
+    "windows": [],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": ["deb", "rpm", "appimage", "nsis", "msi"],
+    "category": "DeveloperTool",
+    "linux": { "appimage": { "bundleMediaFramework": true } },
+    "windows": { "nsis": { "installerHooks": "./installer-hooks.nsh" } },
+    "shortDescription": "3D live view of your coding agents",
+    "externalBin": ["binaries/agent-office-collector"],
+    "resources": { "../../web/dist/": "web/" },
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+  }
+}
