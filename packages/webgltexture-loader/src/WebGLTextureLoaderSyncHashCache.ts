@@ -14,21 +14,28 @@ export default class WebGLTextureLoaderSyncHashCache<T> extends WebGLTextureLoad
 
   _disposed = false;
 
+  /**
+   * Terminal: once disposed, the loader can never load again. `load()` rejects,
+   * `get()` returns undefined and no `getNoCache()` call is made. Calling
+   * `dispose()` again is a no-op (textures are deleted exactly once).
+   */
   override dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
     const { results, promises } = this;
     results.forEach((r) => {
       this.disposeTexture(r.texture);
     });
     results.clear();
     promises.clear();
-    this._disposed = true;
   }
 
   disposeTexture(texture: WebGLTexture): void {
     this.gl.deleteTexture(texture);
   }
 
-  override get(input: T): TextureAndSize {
+  override get(input: T): TextureAndSize | undefined {
+    if (this._disposed) return undefined;
     const hash = this.inputHash(input);
     const result = this.results.get(hash);
     if (result) return result;
@@ -38,10 +45,13 @@ export default class WebGLTextureLoaderSyncHashCache<T> extends WebGLTextureLoad
   }
 
   override load(input: T): Promise<TextureAndSize> {
+    if (this._disposed) {
+      return Promise.reject(new Error("WebGLTextureLoaderSyncHashCache: loader has been disposed"));
+    }
     const hash = this.inputHash(input);
     const existing = this.promises.get(hash);
     if (existing) return existing;
-    const promise = Promise.resolve(this.get(input));
+    const promise = Promise.resolve(this.get(input)!);
     this.promises.set(hash, promise);
     return promise;
   }

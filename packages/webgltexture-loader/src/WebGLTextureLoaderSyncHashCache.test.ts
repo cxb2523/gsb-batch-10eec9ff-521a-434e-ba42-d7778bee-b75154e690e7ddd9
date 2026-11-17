@@ -50,3 +50,33 @@ test("dispose deletes every cached texture", () => {
   loader.dispose();
   expect(deleted).toEqual([a.texture, b.texture]);
 });
+
+test("repeated dispose deletes every cached texture only once", () => {
+  const deleted: WebGLTexture[] = [];
+  const loader = new CountingLoader(mockGL(deleted));
+  const a = loader.get(1);
+  const b = loader.get(2);
+  loader.dispose();
+  loader.dispose();
+  loader.dispose();
+  expect(deleted).toEqual([a.texture, b.texture]);
+});
+
+test("after dispose, load rejects and get returns empty without touching the cache", async () => {
+  const deleted: WebGLTexture[] = [];
+  const loader = new CountingLoader(mockGL(deleted));
+  const a = loader.get(42);
+  loader.dispose();
+  expect(deleted).toEqual([a.texture]);
+
+  expect(loader.get(42)).toBeUndefined();
+  expect(loader.get(43)).toBeUndefined();
+  expect(loader.getNoCacheCalls).toBe(1);
+
+  await expect(loader.load(42)).rejects.toThrow(/disposed/);
+  await expect(loader.load(43)).rejects.toThrow(/disposed/);
+  expect(loader.getNoCacheCalls).toBe(1);
+  expect(loader.results.size).toBe(0);
+  expect(loader.promises.size).toBe(0);
+  expect(deleted).toEqual([a.texture]);
+});

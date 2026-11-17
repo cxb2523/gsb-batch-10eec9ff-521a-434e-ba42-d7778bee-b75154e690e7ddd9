@@ -24,7 +24,14 @@ export default class WebGLTextureLoaderAsyncHashCache<T> extends WebGLTextureLoa
 
   _disposed = false;
 
+  /**
+   * Terminal: once disposed, the loader can never load again. `load()` rejects,
+   * `get()` returns undefined and no `loadNoCache()` call is made. Calling
+   * `dispose()` again is a no-op (textures are deleted exactly once).
+   */
   override dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
     const { promises, results, inputs, disposes } = this;
     for (const d of disposes.values()) d();
     for (const result of results.values()) this.disposeTexture(result.texture);
@@ -32,7 +39,6 @@ export default class WebGLTextureLoaderAsyncHashCache<T> extends WebGLTextureLoa
     results.clear();
     inputs.clear();
     disposes.clear();
-    this._disposed = true;
   }
 
   disposeTexture(texture: WebGLTexture): void {
@@ -40,13 +46,27 @@ export default class WebGLTextureLoaderAsyncHashCache<T> extends WebGLTextureLoa
   }
 
   override load(input: T): Promise<TextureAndSize> {
+    if (this._disposed) {
+      return Promise.reject(
+        new Error("WebGLTextureLoaderAsyncHashCache: loader has been disposed"),
+      );
+    }
     const hash = this.inputHash(input);
     const maybePromise = this.promises.get(hash);
     if (maybePromise) return maybePromise;
     const d = this.loadNoCache(input);
-    this.disposes.set(hash, d.dispose);
-    const promise = d.promise.then((result) => {
-      if (!this.promises.has(hash)) {
+    const dispose = d.dispose;
+    this.disposes.set(hash, dispose);
+    const promise: Promise<TextureAndSize> = d.promise.then((result) => {
+      // The request is stale if the loader was disposed, if it was cancelled,
+      // or if a newer request for the same input replaced it. In that case the
+      // result must be dropped and the newer request's dispose callback must
+      // not be touched.
+      if (
+        this._disposed ||
+        this.promises.get(hash) !== promise ||
+        this.disposes.get(hash) !== dispose
+      ) {
         return neverEnding;
       }
       this.disposes.delete(hash);
@@ -58,10 +78,12 @@ export default class WebGLTextureLoaderAsyncHashCache<T> extends WebGLTextureLoa
   }
 
   override get(input: T): TextureAndSize | undefined {
+    if (this._disposed) return undefined;
     return this.results.get(this.inputHash(input));
   }
 
   cancelLoad(input: T): void {
+    if (this._disposed) return;
     const hash = this.inputHash(input);
     this.promises.delete(hash);
     const dispose = this.disposes.get(hash);
