@@ -795,6 +795,9 @@ export class Context {
       this._bitmap.height,
     );
     dst_bounds = dst_bounds.intersect(bitmap_bounds);
+    if (dst_bounds.x2 <= dst_bounds.x1 || dst_bounds.y2 <= dst_bounds.y1) return;
+    // a degenerate destination rectangle cannot be mapped back into the source
+    if (dw === 0 || dh === 0) return;
 
     let inv = this._transform.cloneTransform();
     inv.invert();
@@ -805,25 +808,74 @@ export class Context {
       return t * (b2 - b1) + b1;
     }
 
+    const smooth = this.imageSmoothingEnabled;
+    // plain bilinear by default; higher quality adds box supersamples when
+    // minifying so that shrinking does not alias
+    const maxGrid =
+      this.imageSmoothingQuality === "high"
+        ? 4
+        : this.imageSmoothingQuality === "medium"
+          ? 2
+          : 1;
+
     for (let i = dst_bounds.x1; i < dst_bounds.x2; i++) {
       for (let j = dst_bounds.y1; j < dst_bounds.y2; j++) {
         let dst_pt = new Point(i, j);
-        let src_pt = inv.transformPoint(dst_pt).round();
-        src_pt = new Point(
-          remap(src_pt.x, dx, dx + dw, sx, sx + sw),
-          remap(src_pt.y, dy, dy + dh, sy, sy + sh),
-        );
-        if (src_bounds.contains(src_pt)) {
-          if (
-            this.pixelInsideClip(dst_pt.x, dst_pt.y) &&
-            this._bitmap._isValidCoords(dst_pt.x, dst_pt.y)
-          ) {
-            const new_pixel = bitmap.getPixelRGBA(src_pt.x, src_pt.y);
-            const old_pixel = this._bitmap.getPixelRGBA(dst_pt.x, dst_pt.y);
-            const final_pixel = this.composite(old_pixel, new_pixel);
-            this._bitmap.setPixelRGBA(dst_pt.x, dst_pt.y, final_pixel);
-          }
+        if (
+          !this._bitmap._isValidCoords(i, j) ||
+          !this.pixelInsideClip(i, j)
+        ) {
+          continue;
         }
+
+        let new_pixel: number;
+        if (smooth) {
+          // keep the source coordinate continuous so that every destination
+          // pixel can land on a distinct source position even when shrinking
+          const src_raw = inv.transformPoint(dst_pt);
+          const src_x = remap(src_raw.x, dx, dx + dw, sx, sx + sw);
+          const src_y = remap(src_raw.y, dy, dy + dh, sy, sy + sh);
+          if (!Number.isFinite(src_x) || !Number.isFinite(src_y)) continue;
+
+          // size of one destination pixel in source-pixel units (includes the
+          // current transform); used to supersample when minifying
+          const src_raw_x = inv.transformPoint(new Point(i + 1, j));
+          const src_raw_y = inv.transformPoint(new Point(i, j + 1));
+          const step_x = remap(src_raw_x.x, dx, dx + dw, sx, sx + sw) - src_x;
+          const step_y = remap(src_raw_y.y, dy, dy + dh, sy, sy + sh) - src_y;
+          const footprint_x = Math.abs(step_x);
+          const footprint_y = Math.abs(step_y);
+          const grid =
+            (footprint_x > 1 || footprint_y > 1) ? maxGrid : 1;
+          new_pixel = bitmap._sampleSmoothRGBA(
+            src_x,
+            src_y,
+            footprint_x,
+            footprint_y,
+            grid,
+            sx,
+            sy,
+            sw,
+            sh,
+          );
+        } else {
+          // nearest neighbour: preserve the historical mapping exactly
+          let src_pt = inv.transformPoint(dst_pt).round();
+          src_pt = new Point(
+            remap(src_pt.x, dx, dx + dw, sx, sx + sw),
+            remap(src_pt.y, dy, dy + dh, sy, sy + sh),
+          );
+          if (!src_bounds.contains(src_pt)) continue;
+          if (!bitmap._isValidCoords(src_pt.x, src_pt.y)) continue;
+          new_pixel = bitmap.getPixelRGBA(src_pt.x, src_pt.y);
+        }
+
+        // a fully transparent smooth sample leaves the destination unchanged,
+        // which also keeps out-of-rectangle regions at the background colour
+        if (smooth && (new_pixel & 0xff) === 0) continue;
+        const old_pixel = this._bitmap.getPixelRGBA(i, j);
+        const final_pixel = this.composite(old_pixel, new_pixel);
+        this._bitmap.setPixelRGBA(i, j, final_pixel);
       }
     }
   }

@@ -1,6 +1,16 @@
-import { NAMED_COLORS, OPAQUE_BLACK } from "./named_colors.js";
+import {
+  NAMED_COLORS,
+  OPAQUE_BLACK,
+  TRANSPARENT_BLACK,
+} from "./named_colors.js";
 import { Context } from "./context.js";
 import { fromBytesBigEndian, getBytesBigEndian } from "./uint32.js";
+
+function clampByte(value: number): number {
+  if (!(value > 0)) return 0;
+  if (value >= 255) return 255;
+  return Math.round(value);
+}
 
 /**
  * The Bitmap class is used for direct pixel manipulation(for example setting a pixel colour,
@@ -173,10 +183,15 @@ export class Bitmap {
    * {@link Context} factory. Creates a new {@link Context} instance object for the current bitmap object
    */
   getContext(type: string) {
+    // like a canvas, calling with no argument at all is a TypeError, while an
+    // unsupported type name simply yields null
+    if (arguments.length === 0) {
+      throw new TypeError("getContext requires a context type");
+    }
     if (type === "2d") {
       return this._context;
     }
-    throw new TypeError("unsupported context type");
+    return null;
   }
 
   _copySubBitmap(x: number, y: number, w: number, h: number) {
@@ -203,6 +218,130 @@ export class Bitmap {
         }
       }
     }
+  }
+
+  /**
+   * Sample a source pixel with bilinear interpolation, optionally supersampling
+   * a box-shaped footprint.
+   *
+   * `x`/`y` are continuous coordinates in source pixel space. `footprintW`/
+   * `footprintH` is the size of one destination pixel measured in source
+   * pixels (1x1 means point sampling). `grid` is the number of samples per axis
+   * inside that footprint (1 = plain bilinear, 2/4 = supersampled box filter,
+   * used for minification at higher `imageSmoothingQuality`).
+   *
+   * Coordinates outside the source sub-rectangle or outside the bitmap produce
+   * a transparent result, so the destination pixel is left untouched. Inside
+   * the rectangle interpolation only reads pixels that are contained by both
+   * the rectangle and the bitmap; every out-of-range neighbour is treated as
+   * transparent black (it adds neither colour nor alpha), so nothing outside
+   * the sub-rectangle or the bitmap can ever be sampled.
+   *
+   * When `x`/`y` land exactly on a pixel, the interpolation weight collapses
+   * onto that single pixel, so the result is exactly the value the
+   * nearest-neighbour path reads. This keeps unscaled draws pixel-exact.
+   */
+  _sampleSmoothRGBA(
+    x: number,
+    y: number,
+    footprintW: number,
+    footprintH: number,
+    grid: number,
+    rectX: number,
+    rectY: number,
+    rectW: number,
+    rectH: number,
+  ): number {
+    if (
+      !Number.isFinite(x) ||
+      !Number.isFinite(y) ||
+      !Number.isFinite(rectX) ||
+      !Number.isFinite(rectY) ||
+      !Number.isFinite(rectW) ||
+      !Number.isFinite(rectH) ||
+      rectW <= 0 ||
+      rectH <= 0
+    ) {
+      return TRANSPARENT_BLACK;
+    }
+
+    const rectX2 = rectX + rectW;
+    const rectY2 = rectY + rectH;
+    const width = this._width;
+    const height = this._height;
+
+    // the sample point itself must be inside the source rectangle and bitmap;
+    // otherwise the destination pixel stays transparent (background remains)
+    if (x < rectX || x >= rectX2 || y < rectY || y >= rectY2) {
+      return TRANSPARENT_BLACK;
+    }
+    if (x < 0 || y < 0 || x >= width || y >= height) {
+      return TRANSPARENT_BLACK;
+    }
+
+    // premultiplied accumulation: rgb * (a/255) * weight, plus alpha * weight
+    let sumAlpha = 0;
+    let sumRed = 0;
+    let sumGreen = 0;
+    let sumBlue = 0;
+
+    const accumulatePixel = (px: number, py: number, weight: number) => {
+      if (weight <= 0) return;
+      // pixel centers must be inside both the source rectangle and the bitmap;
+      // everything else contributes as transparent black
+      const cx = px + 0.5;
+      const cy = py + 0.5;
+      if (cx < rectX || cx >= rectX2 || cy < rectY || cy >= rectY2) return;
+      if (px < 0 || py < 0 || px >= width || py >= height) return;
+      const index = (width * py + px) * 4;
+      const alpha = this.data[index + 3];
+      if (alpha === 0) return;
+      const alphaWeight = (alpha / 255) * weight;
+      sumRed += this.data[index] * alphaWeight;
+      sumGreen += this.data[index + 1] * alphaWeight;
+      sumBlue += this.data[index + 2] * alphaWeight;
+      sumAlpha += alphaWeight;
+    };
+
+    const sampleBilinear = (px: number, py: number, weight: number) => {
+      if (!Number.isFinite(px) || !Number.isFinite(py)) return;
+      const x0 = Math.floor(px);
+      const y0 = Math.floor(py);
+      const fx = px - x0;
+      const fy = py - y0;
+      accumulatePixel(x0, y0, (1 - fx) * (1 - fy) * weight);
+      accumulatePixel(x0 + 1, y0, fx * (1 - fy) * weight);
+      accumulatePixel(x0, y0 + 1, (1 - fx) * fy * weight);
+      accumulatePixel(x0 + 1, y0 + 1, fx * fy * weight);
+    };
+
+    const n = grid >= 1 ? Math.floor(grid) : 1;
+    if (n === 1) {
+      sampleBilinear(x, y, 1);
+    } else {
+      const stepX = footprintW / n;
+      const stepY = footprintH / n;
+      const startX = x - footprintW / 2 + stepX / 2;
+      const startY = y - footprintH / 2 + stepY / 2;
+      for (let sy = 0; sy < n; sy++) {
+        for (let sx = 0; sx < n; sx++) {
+          sampleBilinear(
+            startX + sx * stepX,
+            startY + sy * stepY,
+            1 / (n * n),
+          );
+        }
+      }
+    }
+
+    if (sumAlpha <= 0) return TRANSPARENT_BLACK;
+    const inv = 1 / sumAlpha;
+    return fromBytesBigEndian(
+      clampByte(sumRed * inv),
+      clampByte(sumGreen * inv),
+      clampByte(sumBlue * inv),
+      clampByte(sumAlpha * 255),
+    );
   }
 
   _isValidCoords(x, y) {
