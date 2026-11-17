@@ -1,0 +1,16 @@
+{
+  "languageCode": "en",
+  "transcript": [
+    {
+      "transcript": "Bravo source begins playing now.",
+      "confidence": 0.97,
+      "words": [
+        { "word": "Bravo", "start": 0.0, "end": 0.5 },
+        { "word": "source", "start": 0.5, "end": 1.0 },
+        { "word": "begins", "start": 1.0, "end": 1.5 },
+        { "word": "playing", "start": 1.5, "end": 2.0 },
+        { "word": "now.", "start": 2.0, "end": 2.5 }
+      ]
+    }
+  ]
+}

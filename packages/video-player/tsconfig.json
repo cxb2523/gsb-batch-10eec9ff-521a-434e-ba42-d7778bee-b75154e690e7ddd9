@@ -30,6 +30,7 @@
   "exclude": [
     "dist/**/*", // Exclude the dist folder to prevent circular dependencies
     "react-wrapper/**/*",
-    "vue/**/*"
+    "vue/**/*",
+    "**/__tests__/**/*" // Node-based tests have their own tsconfig under __tests__
   ]
 }

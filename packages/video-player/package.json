@@ -35,6 +35,7 @@
   ],
   "scripts": {
     "build": "yarn run build:tsup && yarn run build:css && yarn run build:assets",
+    "test:subtitles": "node javascript/modules/subtitles/__tests__/run-tests.mjs",
     "build:tsup": "tsup --tsconfig tsconfig.tsup.json",
     "build:css": "sass --load-path=./node_modules javascript/styles/index.scss dist/styles.css",
     "build:assets": "cp -r javascript/assets dist/ && mkdir -p dist/astro && cp astro/IKVideoPlayer.astro dist/astro/IKVideoPlayer.astro",

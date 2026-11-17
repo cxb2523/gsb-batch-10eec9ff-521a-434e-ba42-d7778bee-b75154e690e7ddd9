@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "node",
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"],
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "baseUrl": ".."
+  },
+  "include": [
+    "mock-player.ts",
+    "subtitles.test.ts",
+    "../subtitles.ts"
+  ]
+}
