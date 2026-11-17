@@ -305,7 +305,7 @@ export class CDGScrollPresetInstruction extends CDGInstruction {
     }
 
     let vScroll = 0;
-    switch (this.hCmd) {
+    switch (this.vCmd) {
       case CDG_SCROLL_DOWN:
         vScroll = TILE_HEIGHT;
         break;
@@ -346,7 +346,7 @@ export class CDGScrollPresetInstruction extends CDGInstruction {
     offx: number;
     offy: number;
   }): number {
-    if (offx > 0 && offx < WIDTH && offy > 0 && offy < HEIGHT) {
+    if (offx >= 0 && offx < WIDTH && offy >= 0 && offy < HEIGHT) {
       return context.pixels[offx + offy * WIDTH] ?? this.color;
     }
     return this.color;

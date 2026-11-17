@@ -22,11 +22,14 @@ import {
   CDG_SCROLL_LEFT,
   CDG_SCROLL_RIGHT,
   CDG_SCROLL_PRESET,
+  CDG_SCROLL_UP,
   CDG_SET_KEY_COLOR,
   CDG_TILE_BLOCK,
   CDG_TILE_BLOCK_XOR,
   HEIGHT,
   PACKET_SIZE,
+  TILE_HEIGHT,
+  TILE_WIDTH,
   WIDTH,
 } from './constants.js';
 import type { CdgRenderContext } from './types.js';
@@ -232,6 +235,137 @@ describe('CDG instructions', () => {
 
     expect(context.pixels[0]).toBe(13);
     expect(context.backgroundColor).toBe(6);
+  });
+
+  it('scroll preset applies vertical scroll from the vertical command nibble', () => {
+    const downContext = createRenderContext();
+    downContext.pixels[5 + 30 * WIDTH] = 9;
+
+    const scrollDown = new CDGScrollPresetInstruction({
+      bytes: createPacket({
+        opcode: CDG_SCROLL_PRESET,
+        data: [0x02, 0x00, CDG_SCROLL_DOWN << 4],
+      }),
+    });
+    scrollDown.execute(downContext);
+
+    // vScroll = +TILE_HEIGHT: new(x, y) reads old(x, y + TILE_HEIGHT).
+    expect(downContext.pixels[5 + (30 - TILE_HEIGHT) * WIDTH]).toBe(9);
+    // Rows revealed at the bottom are filled with the preset color.
+    expect(downContext.pixels[5 + (HEIGHT - 1) * WIDTH]).toBe(2);
+    expect(downContext.backgroundColor).toBe(2);
+
+    const upContext = createRenderContext();
+    upContext.pixels[7 + 4 * WIDTH] = 10;
+
+    const scrollUp = new CDGScrollPresetInstruction({
+      bytes: createPacket({
+        opcode: CDG_SCROLL_PRESET,
+        data: [0x03, 0x00, CDG_SCROLL_UP << 4],
+      }),
+    });
+    scrollUp.execute(upContext);
+
+    // vScroll = -TILE_HEIGHT: new(x, y) reads old(x, y - TILE_HEIGHT).
+    expect(upContext.pixels[7 + (4 + TILE_HEIGHT) * WIDTH]).toBe(10);
+    // Rows revealed at the top are filled with the preset color.
+    expect(upContext.pixels[7]).toBe(3);
+  });
+
+  it('scroll preset combines horizontal and vertical tile steps', () => {
+    const context = createRenderContext();
+    context.pixels[10 + 15 * WIDTH] = 12;
+
+    const diagonal = new CDGScrollPresetInstruction({
+      bytes: createPacket({
+        opcode: CDG_SCROLL_PRESET,
+        data: [0x01, CDG_SCROLL_LEFT << 4, CDG_SCROLL_UP << 4],
+      }),
+    });
+    diagonal.execute(context);
+
+    // hScroll = -TILE_WIDTH and vScroll = -TILE_HEIGHT shift the source window.
+    expect(
+      context.pixels[10 + TILE_WIDTH + (15 + TILE_HEIGHT) * WIDTH],
+    ).toBe(12);
+    // Corner revealed by the combined shift uses the preset color.
+    expect(context.pixels[0]).toBe(1);
+    expect(context.backgroundColor).toBe(1);
+  });
+
+  it('scroll preset treats coordinate zero and edge pixels as valid sources', () => {
+    const context = createRenderContext();
+    context.pixels[0 + 5 * WIDTH] = 8;
+    context.pixels[4 + 0 * WIDTH] = 6;
+
+    const instruction = new CDGScrollPresetInstruction({
+      bytes: createPacket({
+        opcode: CDG_SCROLL_PRESET,
+        data: [0x07, CDG_SCROLL_LEFT << 4, 0x00],
+      }),
+    });
+
+    expect(instruction.getPixel({ context, offx: 0, offy: 5 })).toBe(8);
+    expect(instruction.getPixel({ context, offx: 4, offy: 0 })).toBe(6);
+    expect(
+      instruction.getPixel({ context, offx: WIDTH - 1, offy: HEIGHT - 1 }),
+    ).toBe(0);
+    expect(instruction.getPixel({ context, offx: -1, offy: 5 })).toBe(7);
+    expect(instruction.getPixel({ context, offx: 4, offy: HEIGHT })).toBe(7);
+
+    instruction.execute(context);
+
+    // hScroll = -TILE_WIDTH: new(6, 5) reads old(0, 5) instead of the fill color.
+    expect(context.pixels[TILE_WIDTH + 5 * WIDTH]).toBe(8);
+  });
+
+  it('scroll copy wraps source pixels from the opposite side', () => {
+    const leftContext = createRenderContext();
+    leftContext.pixels[WIDTH - TILE_WIDTH + 3 * WIDTH] = 14;
+
+    const copyLeft = new CDGScrollCopyInstruction({
+      bytes: createPacket({
+        opcode: CDG_SCROLL_COPY,
+        data: [0x04, CDG_SCROLL_LEFT << 4, 0x00],
+      }),
+    });
+    copyLeft.execute(leftContext);
+
+    // new(0, 3) wraps to old(WIDTH - TILE_WIDTH, 3).
+    expect(leftContext.pixels[0 + 3 * WIDTH]).toBe(14);
+
+    const upContext = createRenderContext();
+    upContext.pixels[2 + (HEIGHT - TILE_HEIGHT) * WIDTH] = 13;
+
+    const copyUp = new CDGScrollCopyInstruction({
+      bytes: createPacket({
+        opcode: CDG_SCROLL_COPY,
+        data: [0x04, 0x00, CDG_SCROLL_UP << 4],
+      }),
+    });
+    copyUp.execute(upContext);
+
+    // new(2, 0) wraps to old(2, HEIGHT - TILE_HEIGHT).
+    expect(upContext.pixels[2 + 0 * WIDTH]).toBe(13);
+  });
+
+  it('scroll swaps pixel buffers so the next scroll reads the new frame', () => {
+    const context = createRenderContext();
+    context.pixels[2 * TILE_WIDTH] = 5;
+
+    const scrollLeft = new CDGScrollPresetInstruction({
+      bytes: createPacket({
+        opcode: CDG_SCROLL_PRESET,
+        data: [0x00, CDG_SCROLL_LEFT << 4, 0x00],
+      }),
+    });
+
+    scrollLeft.execute(context);
+    expect(context.pixels[3 * TILE_WIDTH]).toBe(5);
+
+    scrollLeft.execute(context);
+    expect(context.pixels[4 * TILE_WIDTH]).toBe(5);
+    expect(context.pixels[3 * TILE_WIDTH]).toBe(0);
   });
 
   it('set key color writes transparency key index', () => {
