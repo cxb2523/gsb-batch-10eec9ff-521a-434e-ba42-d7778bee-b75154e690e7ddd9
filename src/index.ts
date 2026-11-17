@@ -1,0 +1,282 @@
+import { Point, InitPoint, PreRoundedPoint, RoundedPoint } from "./types"
+import { getLength, getAngles, PI, min, max, cos, sin } from "./utils"
+import { getSegments } from "./segments"
+
+
+
+const roundPolygon = (
+  points: InitPoint[],
+  radius: number = 0,
+): RoundedPoint[] => {
+
+  const
+    len = points.length,
+    preRoundedPoints: PreRoundedPoint[] = [],
+    limPoints: PreRoundedPoint[] = [],
+    noLimPoints: PreRoundedPoint[] = [],
+    zeroLimPoints: PreRoundedPoint[] = []
+
+  // prepare points, calc angles
+  points.forEach((curr, id) => {
+
+    const
+      prev = points[(id - 1 + len) % len],
+      next = points[(id + 1) % len],
+      prevlen = getLength(prev, curr),
+      nextlen = getLength(curr, next),
+      angle = getAngles(prev, curr, next, prevlen, nextlen)
+
+    if (angle.main === 0) {
+      angle.main = Number.EPSILON
+      angle.vel = Number.MAX_SAFE_INTEGER
+    }
+    else if (angle.main === PI) angle.vel = 0
+
+    const preRoundedPoint = {
+      x: curr.x,
+      y: curr.y,
+      angle,
+      offset: 0,
+      arc: {
+        radius,
+        hit: radius,
+        // limit lim to prevent offset to become bigger than prev/next length
+        lim: min(nextlen / angle.vel, prevlen / angle.vel, curr.r || 0),
+      },
+      in: { length: prevlen, rest: prevlen },
+      out: { length: nextlen, rest: nextlen },
+      locked: false,
+      id,
+      get prev() { return preRoundedPoints[(id - 1 + len) % len] },
+      get next() { return preRoundedPoints[(id + 1) % len] },
+    }
+
+    // if point overlaps another point
+    if (isNaN(angle.main)) {
+      angle.main = 0
+      angle.bis = angle.prev || angle.next // :)
+      zeroLimPoints.push(preRoundedPoint)
+    }
+    // spread points into either limited, zero-limited or none-limited lists
+    // ( is limited if point has own radius to round )
+    else if (typeof curr.r === "number") {
+      if (curr.r === 0) zeroLimPoints.push(preRoundedPoint)
+      else limPoints.push(preRoundedPoint)
+    }
+    else noLimPoints.push(preRoundedPoint)
+
+    preRoundedPoints.push(preRoundedPoint)
+  })
+
+
+  // lock (overlapped | zero radius) points
+  zeroLimPoints.forEach((p) => {
+    p.angle.vel = 0
+    p.arc.radius = 0
+    lockPoint(p)
+  })
+
+
+  // calc collision radius for each point
+  preRoundedPoints.forEach((p) => {
+    p.arc.hit = min(
+      p.out.rest / (p.angle.vel + p.next.angle.vel),
+      p.in.rest  / (p.angle.vel + p.prev.angle.vel),
+    )
+  })
+
+
+  // calc limit radius and its offsets
+  let minHitPoint = getMinHit(limPoints)
+  while (minHitPoint) {
+    calcLimitRadius(minHitPoint)
+    minHitPoint = getMinHit(limPoints)
+  }
+
+
+  // calc common radius and its offsets
+  minHitPoint = getMinHit(preRoundedPoints)
+  while (minHitPoint) {
+    calcCommonRadius(minHitPoint, radius)
+    minHitPoint = getMinHit(preRoundedPoints)
+  }
+
+
+  // final calc coordinates
+  const roundedPoints = preRoundedPoints.map((p) => {
+
+    const bislen = p.arc.radius / sin(p.angle.main / 2)
+
+    return {
+      id: p.id,
+      x: p.x,
+      y: p.y,
+      angle: {
+        main: p.angle.main,
+        prev: p.angle.prev,
+        next: p.angle.next,
+        bis: p.angle.bis,
+        dir: p.angle.dir,
+      },
+      offset: p.offset,
+      arc: {
+        radius: p.arc.radius,
+        x: p.x + (cos(p.angle.bis) * bislen || 0),
+        y: p.y + (sin(p.angle.bis) * bislen || 0),
+      },
+      in: {
+        length: p.in.length,
+        x: p.x + cos(p.angle.prev) * p.offset,
+        y: p.y + sin(p.angle.prev) * p.offset,
+      },
+      out: {
+        length: p.out.length,
+        x: p.x + cos(p.angle.next) * p.offset,
+        y: p.y + sin(p.angle.next) * p.offset,
+      },
+      get prev() { return roundedPoints[(p.id - 1 + len) % len] },
+      get next() { return roundedPoints[(p.id + 1) % len] },
+    }
+  })
+
+  return roundedPoints
+}
+
+
+
+const calcLimitRadius = (
+  curr: PreRoundedPoint,
+) => {
+
+  const { prev, next } = curr
+
+  // straight angle has zero offset, so any radius fits ( avoids rest / 0 = NaN )
+  if (curr.angle.vel === 0) curr.arc.radius = curr.arc.lim
+
+  // if prev locked
+  else if (prev.locked && !next.locked) curr.arc.radius = min(
+    max(
+      (curr.out.length - (next.arc.lim * next.angle.vel)) / curr.angle.vel,
+      curr.out.length / (curr.angle.vel + next.angle.vel),
+    ),
+    curr.in.rest / curr.angle.vel,
+    curr.arc.lim,
+  )
+
+  // if next locked
+  else if (next.locked && !prev.locked) curr.arc.radius = min(
+    max(
+      (curr.in.length - (prev.arc.lim * prev.angle.vel)) / curr.angle.vel,
+      curr.in.length / (curr.angle.vel + prev.angle.vel),
+    ),
+    curr.out.rest / curr.angle.vel,
+    curr.arc.lim,
+  )
+
+  // if BOTH locked
+  else if (next.locked && prev.locked) curr.arc.radius = min(
+    curr.in.rest / curr.angle.vel,
+    curr.out.rest / curr.angle.vel,
+    curr.arc.lim,
+  )
+
+  // if NONE locked
+  else curr.arc.radius = min(
+    max(
+      (curr.in.length - (prev.arc.lim * prev.angle.vel)) / curr.angle.vel,
+      curr.in.length / (curr.angle.vel + prev.angle.vel),
+    ),
+    max(
+      (curr.out.length - (next.arc.lim * next.angle.vel)) / curr.angle.vel,
+      curr.out.length / (curr.angle.vel + next.angle.vel),
+    ),
+    curr.arc.lim,
+  )
+
+  // rest may already be exhausted ( <= 0 ) by a locked neighbor
+  curr.arc.radius = max(curr.arc.radius, 0)
+
+  lockPoint(curr)
+}
+
+
+
+const calcCommonRadius = (
+  curr:   PreRoundedPoint,
+  radius: number,
+) => {
+
+  if (radius > curr.arc.hit) {
+    const { prev, next } = curr
+
+    // max(..., 0) cased by somehow getting rest = -2.71e-15 from calcLimit
+    if (prev.locked && !next.locked) curr.arc.radius = max(min(
+      curr.in.rest / curr.angle.vel,
+      curr.out.length / (curr.angle.vel + next.angle.vel),
+      curr.arc.radius,
+    ), 0)
+
+    else if (next.locked && !prev.locked) curr.arc.radius = max(min(
+      curr.out.rest / curr.angle.vel,
+      curr.in.length / (curr.angle.vel + prev.angle.vel),
+      curr.arc.radius,
+    ), 0)
+
+    else if (next.locked && prev.locked) curr.arc.radius = max(min(
+      curr.in.rest / curr.angle.vel,
+      curr.out.rest / curr.angle.vel,
+      curr.arc.radius,
+    ), 0)
+
+    else curr.arc.radius = curr.arc.hit
+  }
+
+  lockPoint(curr)
+}
+
+
+
+const lockPoint = (curr: PreRoundedPoint) => {
+  const { prev, next } = curr
+
+  curr.offset = curr.arc.radius * curr.angle.vel
+
+  prev.out.rest -= curr.offset
+  curr.in.rest  -= curr.offset
+  curr.out.rest -= curr.offset
+  next.in.rest  -= curr.offset
+
+  curr.locked = true
+
+  // to get right getMinHit then
+  prev.arc.hit = min(
+    prev.in.length / (prev.angle.vel + prev.prev.angle.vel),
+    prev.in.rest / prev.angle.vel,
+    prev.out.rest / prev.angle.vel,
+  )
+  next.arc.hit = min(
+    next.out.length / (next.angle.vel + next.next.angle.vel),
+    next.out.rest / next.angle.vel,
+    next.in.rest / next.angle.vel,
+  )
+}
+
+
+
+const getMinHit = (
+  arr: PreRoundedPoint[],
+) => (
+  arr.reduce((min: PreRoundedPoint | null, p) =>
+    p.locked ? min : !min ? p : p.arc.hit < min.arc.hit ? p : min,
+  null))
+
+
+
+export {
+  roundPolygon as default,
+  getSegments,
+
+  type Point,
+  type InitPoint,
+  type RoundedPoint,
+}
