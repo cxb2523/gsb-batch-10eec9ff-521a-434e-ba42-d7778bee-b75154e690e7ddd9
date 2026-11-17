@@ -860,8 +860,10 @@
     let config = {};
 
     function init(){
-        fetch('config.json').then(res => res.json()).then(data => { 
-            update(data);   
+        //optional ?config= override (used by tests); defaults to config.json
+        let configUrl = new URLSearchParams(location.search).get('config') || 'config.json';
+        fetch(configUrl).then(res => res.json()).then(data => {
+            update(data);
         }).catch(console.error);
     }
     init();
@@ -1145,7 +1147,14 @@
                 entry.loaderEl = loaderEl;
             }
         });
-        loadEntry(media[mod(featureIndex, media.length)]);
+        //select the first playable entry, starting from the feature index
+        let startIndex = mod(featureIndex, media.length);
+        for(let i = 0; i < media.length && !canPlay(media[startIndex]); i++){
+            startIndex = mod(startIndex + 1, media.length);
+        }
+        if(canPlay(media[startIndex])){
+            loadEntry(media[startIndex]);
+        }
     }
 
     function updateDuration(entry, duration){
@@ -1425,14 +1434,15 @@
     });
 
     function updateTrackPreview(){
-        if(currentEntry.needsDuration){
-            return;
-        }
         //reset to prevent compounding width calculation issues
+        //(also clears any progress display left over from a previous track)
         scrubberTrackPreviewEl.style.removeProperty('margin-left');
         scrubberTrackPreviewEl.style.removeProperty('width');
         scrubberEl.style.removeProperty('left');
         scrubberFillEl.style.removeProperty('width');
+        if(currentEntry.needsDuration){
+            return;
+        }
         if(currentEntry.preview){
             let fullWidth = scrubberEl.parentElement.parentElement.clientWidth;
             scrubberTrackPreviewEl.style.marginLeft = ((currentEntry.previewStart) / currentEntry.originalDuration) * 100 + '%';
@@ -1459,6 +1469,11 @@
     //t: 0-1 value in relation to the actual audio start/end
     function updateScrubPosition(t){
         if(currentEntry.needsDuration){
+            //duration unknown: clear any stale progress display
+            scrubPosition = 0;
+            scrubberEl.style.left = '0%';
+            scrubberFillEl.style.width = '0%';
+            controlsEl.querySelector('.time').innerHTML = currentEntry.preview ? '(preview)<br/>' : '';
             return;
         }
         //rebase t to full (assumed) duration
@@ -1486,6 +1501,16 @@
         controlsEl.querySelector('.time').innerHTML = timeText;
     }
 
+    //clears leftover drag state and progress display, then redraws the
+    //scrubber at the current track's (preview) start
+    function resetScrubState(){
+        scrubberDragged = false;
+        scrubPosition = 0;
+        updateTrackPreview();
+        updateScrubPosition(0);
+        updatePreviewVolume(0);
+    }
+
     function scrub(x){
         if(scrubberDragged){
             let trackX = scrubberTrackEl.getBoundingClientRect().x;
@@ -1503,6 +1528,9 @@
 
     function endScrub(){
         if(currentEntry.loading){
+            return;
+        }
+        if(!isFinite(playerEl.duration)){
             return;
         }
         playerEl.currentTime = scrubPosition * playerEl.duration;
@@ -1538,11 +1566,20 @@
                 }
                 entry = media[mod(idx, media.length)];
             }
+            if(!canPlay(entry)){
+                //no playable entry found (all locked or failed to load)
+                return;
+            }
             loadEntry(entry);
         }
     }
     function prevTrack(){
-        if(playerEl.currentTime > (currentEntry.previewStart - currentEntry.audioStart) + 5){
+        let currentTime = playerEl.currentTime;
+        if(currentEntry.duration && !currentEntry.needsDuration){
+            //ignore transient seek positions left over from a track switch
+            currentTime = Math.min(currentTime, currentEntry.duration);
+        }
+        if(currentTime > (currentEntry.previewStart - currentEntry.audioStart) + 5){
             playerEl.currentTime = (currentEntry.previewStart - currentEntry.audioStart);
         } else {
             let idx = media.indexOf(currentEntry)-1;
@@ -1552,6 +1589,10 @@
                 i++;
                 idx--;
                 entry = media[mod(idx, media.length)];
+            }
+            if(!canPlay(entry)){
+                //no playable entry found (all locked or failed to load)
+                return;
             }
             loadEntry(entry);
         }
@@ -1638,15 +1679,23 @@
             return;
         }
         if(entry === currentEntry){
-            if(entry.type === 'video'){
-                mediaVideoEl.currentTime = 0;
-            } else {
+            //replaying the same entry (e.g. loopCount repeat): restart from
+            //the preview start and reset the scrubber display
+            resetScrubState();
+            let startTime = 0;
+            if(entry.preview && !entry.needsDuration){
+                startTime = Math.max(0, entry.previewStart - (entry.audioStart || 0));
             }
-            playerEl.currentTime = 0;
+            if(entry.type === 'video'){
+                mediaVideoEl.currentTime = startTime;
+            }
+            playerEl.currentTime = startTime;
             playerEl.play();
             return;
         }
         currentEntry = entry;
+        scrubberDragged = false;
+        scrubPosition = 0;
         media.forEach(thisEntry => {
             thisEntry.trackEl.classList.remove('active');
             thisEntry.trackEl.querySelector('button').classList.remove('pause');
@@ -1659,10 +1708,9 @@
             currentEntry.duration = 999;
             currentEntry.needsDuration = true;
         }
-        updateTrackPreview();
+        resetScrubState();
         if(entry.preview){
             scrubberTrackContainerEl.classList.add('preview');
-            updatePreviewVolume(0);
         } else {
             scrubberTrackContainerEl.classList.remove('preview');
         }

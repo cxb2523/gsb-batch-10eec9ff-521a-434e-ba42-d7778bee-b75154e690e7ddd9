@@ -1,0 +1,27 @@
+{
+    "title": "drag test",
+    "media": [
+        {
+            "file": "../test/media/drag1.wav",
+            "title": "DragA",
+            "feature": true,
+            "previewStart": "0:05",
+            "previewEnd": "0:07",
+            "originalDuration": "0:10"
+        },
+        {
+            "file": "../test/media/drag2.wav",
+            "title": "DragB",
+            "previewStart": "0:02",
+            "previewEnd": "0:04",
+            "originalDuration": "0:12"
+        }
+    ],
+    "theme": {
+        "coverSize": 480,
+        "layoutStyle": "vertical",
+        "infoStyle": "overlaid",
+        "contentWidth": 400,
+        "nativePlayer": false
+    }
+}

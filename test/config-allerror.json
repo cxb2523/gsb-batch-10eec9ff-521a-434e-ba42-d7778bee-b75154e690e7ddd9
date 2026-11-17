@@ -1,0 +1,14 @@
+{
+    "title": "all error test",
+    "media": [
+        { "file": "../test/media/missing1.wav", "title": "Broken1", "feature": true },
+        { "file": "../test/media/missing2.wav", "title": "Broken2" }
+    ],
+    "theme": {
+        "coverSize": 480,
+        "layoutStyle": "vertical",
+        "infoStyle": "overlaid",
+        "contentWidth": 400,
+        "nativePlayer": false
+    }
+}

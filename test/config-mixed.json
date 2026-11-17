@@ -1,0 +1,16 @@
+{
+    "title": "mixed locked/error test",
+    "media": [
+        { "file": "../test/media/ok1.wav", "title": "Ok1", "feature": true },
+        { "title": "LockedMid", "locked": true },
+        { "file": "../test/media/missing.wav", "title": "Broken" },
+        { "file": "../test/media/ok2.wav", "title": "Ok2" }
+    ],
+    "theme": {
+        "coverSize": 480,
+        "layoutStyle": "vertical",
+        "infoStyle": "overlaid",
+        "contentWidth": 400,
+        "nativePlayer": false
+    }
+}

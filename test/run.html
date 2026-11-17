@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>RUNNING</title>
+</head>
+<body>
+    <h1>Scritch player tests</h1>
+    <pre id="results">RUNNING</pre>
+    <div id="frames"></div>
+<script>
+    const results = [];
+
+    function log(name, pass, detail){
+        results.push({name, pass: !!pass, detail});
+        render();
+    }
+    function render(){
+        document.getElementById('results').textContent =
+            results.map(r => (r.pass ? 'PASS' : 'FAIL') + ' ' + r.name + (r.detail ? ' -- ' + r.detail : '')).join('\n');
+    }
+    function finish(){
+        const fails = results.filter(r => !r.pass).length;
+        const summary = `DONE ${results.length - fails}/${results.length} passed`;
+        document.getElementById('results').textContent += '\n' + summary;
+        document.title = fails ? 'TESTS FAILED' : 'TESTS PASSED';
+        //report back to the local test server so headless runs can read the result
+        fetch('/__results', {method: 'POST', body: document.getElementById('results').textContent}).catch(() => {});
+    }
+    function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+    async function waitFor(fn, timeout, desc){
+        const start = Date.now();
+        while(Date.now() - start < (timeout || 15000)){
+            let ok = false;
+            try { ok = fn(); } catch(e) {}
+            if(ok) return;
+            await sleep(50);
+        }
+        throw new Error('timeout waiting for: ' + desc);
+    }
+    function loadPlayer(configUrl){
+        return new Promise((resolve, reject) => {
+            const iframe = document.createElement('iframe');
+            iframe.style.width = '800px';
+            iframe.style.height = '600px';
+            iframe.src = '../index.html?config=' + encodeURIComponent(configUrl);
+            iframe.onload = () => resolve(iframe);
+            iframe.onerror = () => reject(new Error('iframe failed to load'));
+            document.getElementById('frames').appendChild(iframe);
+        });
+    }
+    function unloadPlayer(iframe){
+        try { iframe.contentWindow.document.getElementById('player').pause(); } catch(e) {}
+        iframe.remove();
+    }
+    function approx(a, b, tol){ return Math.abs(a - b) <= tol; }
+
+    //--- scenario 1: preview track with loopCount replays from its preview start ---
+    async function scenarioLoopReplay(){
+        const iframe = await loadPlayer('test/config-loop.json');
+        const w = iframe.contentWindow;
+        const d = w.document;
+        try {
+            await waitFor(() => w.eval('media.length === 2 && media[0].duration && !media[0].needsDuration && media[1].duration && !media[1].needsDuration'), 15000, 'loop: metadata');
+            await waitFor(() => w.eval('currentEntry === media[0] && !currentEntry.loading'), 15000, 'loop: first track ready');
+
+            //start playback like a user would
+            w.eval('playEntry(currentEntry)');
+            await waitFor(() => w.eval('currentEntry.started === true'), 5000, 'loop: playback started');
+
+            const player = d.getElementById('player');
+            const fill = d.getElementById('scrubberFill');
+            const scrubber = d.getElementById('scrubber');
+            const timeEl = d.querySelector('#controls .time');
+
+            //simulate playback reaching the preview end (audioStart=4, previewEnd=7 -> audio time 3)
+            player.currentTime = 2.9;
+            player.dispatchEvent(new w.Event('timeupdate'));
+            player.pause();
+
+            log('loop: remainingLoops decremented', w.eval('currentEntry.remainingLoops') === 1, 'remainingLoops=' + w.eval('currentEntry.remainingLoops'));
+            log('loop: replay starts at preview start (audio time)', approx(player.currentTime, 1, 0.3), 'currentTime=' + player.currentTime);
+            log('loop: fill reset to preview start', fill.style.width === '0%', 'width=' + fill.style.width);
+            log('loop: scrubber reset to preview start', scrubber.style.left === '0%', 'left=' + scrubber.style.left);
+            log('loop: time text reset to preview start', timeEl.textContent.includes('00:05 / 00:10'), JSON.stringify(timeEl.textContent));
+
+            //second loop
+            player.currentTime = 2.9;
+            player.dispatchEvent(new w.Event('timeupdate'));
+            player.pause();
+            log('loop: second replay resets again', w.eval('currentEntry.remainingLoops') === 0 && fill.style.width === '0%' && approx(player.currentTime, 1, 0.3),
+                'remainingLoops=' + w.eval('currentEntry.remainingLoops') + ' width=' + fill.style.width + ' currentTime=' + player.currentTime);
+
+            //loops exhausted -> advances to next track with a clean scrubber
+            player.currentTime = 2.9;
+            player.dispatchEvent(new w.Event('timeupdate'));
+            player.pause();
+            log('loop: advances to next track after loops exhausted', w.eval('currentEntry === media[1]'));
+            log('loop: next track scrubber clean', fill.style.width === '0%' && scrubber.style.left === '0%', 'width=' + fill.style.width + ' left=' + scrubber.style.left);
+            log('loop: next track time text from its own start', timeEl.textContent.includes('00:00 / 00:06'), JSON.stringify(timeEl.textContent));
+            log('loop: next track not marked as preview', !d.getElementById('scrubberTrackContainer').classList.contains('preview'));
+        } catch(e) {
+            log('loop: exception', false, e.message);
+        } finally {
+            unloadPlayer(iframe);
+        }
+    }
+
+    //--- scenario 2: drag the scrubber, then switch tracks ---
+    async function scenarioDragThenSwitch(){
+        const iframe = await loadPlayer('test/config-drag.json');
+        const w = iframe.contentWindow;
+        const d = w.document;
+        try {
+            await waitFor(() => w.eval('media.length === 2 && media[0].duration && !media[0].needsDuration && media[1].duration && !media[1].needsDuration'), 15000, 'drag: metadata');
+            await waitFor(() => w.eval('currentEntry === media[0] && !currentEntry.loading'), 15000, 'drag: first track ready');
+
+            const player = d.getElementById('player');
+            const fill = d.getElementById('scrubberFill');
+            const scrubber = d.getElementById('scrubber');
+            const timeEl = d.querySelector('#controls .time');
+            const container = d.getElementById('scrubberTrackContainer');
+
+            //drag the scrubber to ~80% of the preview region with real pointer events
+            const rect = d.getElementById('scrubberTrack').getBoundingClientRect();
+            const x = rect.x + rect.width * 0.8;
+            container.dispatchEvent(new w.PointerEvent('pointerdown', {clientX: x, bubbles: true}));
+            w.document.dispatchEvent(new w.PointerEvent('pointermove', {clientX: x, bubbles: true}));
+            w.document.dispatchEvent(new w.PointerEvent('pointerup', {clientX: x, bubbles: true}));
+
+            //expected audio position: preview 5..7 of original 10, file 6s, audioStart=4
+            //t(~0.85 of preview) -> audio time 4 + (0.85*2 + 1) ~= 2.7
+            log('drag: release seeks player to dragged position', player.currentTime > 2.0 && player.currentTime < 3.2, 'currentTime=' + player.currentTime);
+            log('drag: scrubPosition matches player position', approx(w.eval('scrubPosition') * 6, player.currentTime, 0.05), 'scrubPosition=' + w.eval('scrubPosition'));
+            log('drag: fill shows dragged progress', fill.style.width !== '0%' && fill.style.width !== '', 'width=' + fill.style.width);
+
+            //switch to the next track right after dragging
+            w.nextTrack();
+            log('switch: moved to next entry', w.eval('currentEntry === media[1]'));
+            log('switch: drag state cleared', w.eval('scrubberDragged') === false);
+            log('switch: fill cleared', fill.style.width === '0%', 'width=' + fill.style.width);
+            log('switch: scrubber cleared', scrubber.style.left === '0%', 'left=' + scrubber.style.left);
+            log('switch: time text from new track preview start', timeEl.textContent.includes('00:02 / 00:12'), JSON.stringify(timeEl.textContent));
+
+            //old dragged position must not leak into the new track's playback position
+            await waitFor(() => w.eval('currentEntry.started === true'), 5000, 'drag: new track started');
+            log('switch: old drag position not carried over', player.currentTime < 1, 'currentTime=' + player.currentTime);
+            player.pause();
+
+            //switching mid-drag must also drop the drag state
+            const rect2 = d.getElementById('scrubberTrack').getBoundingClientRect();
+            const x2 = rect2.x + rect2.width * 0.8;
+            container.dispatchEvent(new w.PointerEvent('pointerdown', {clientX: x2, bubbles: true}));
+            log('mid-drag: drag active before switch', w.eval('scrubberDragged') === true);
+            w.nextTrack(); //wraps around to media[0]
+            log('mid-drag: moved to wrapped entry', w.eval('currentEntry === media[0]'));
+            log('mid-drag: drag state cleared on switch', w.eval('scrubberDragged') === false);
+            log('mid-drag: fill cleared on switch', fill.style.width === '0%', 'width=' + fill.style.width);
+            const ct = player.currentTime;
+            w.document.dispatchEvent(new w.PointerEvent('pointerup', {clientX: x2, bubbles: true}));
+            log('mid-drag: stale release does not seek new track', player.currentTime === ct, 'before=' + ct + ' after=' + player.currentTime);
+        } catch(e) {
+            log('drag: exception', false, e.message);
+        } finally {
+            unloadPlayer(iframe);
+        }
+    }
+
+    //--- scenario 3: all tracks locked ---
+    async function scenarioAllLocked(){
+        const iframe = await loadPlayer('test/config-locked.json');
+        const w = iframe.contentWindow;
+        const d = w.document;
+        try {
+            await waitFor(() => w.eval('media.length === 3'), 15000, 'locked: media loaded');
+            await sleep(300);
+            log('locked: no track selected initially', d.querySelectorAll('.track.active').length === 0);
+            const r = w.eval('try { nextTrack(); prevTrack(); "ok" } catch(e) { "err: " + e.message }');
+            log('locked: next/prev do not throw', r === 'ok', r);
+            log('locked: next/prev select nothing', d.querySelectorAll('.track.active').length === 0 && w.eval('currentEntry.trackEl === undefined'));
+        } catch(e) {
+            log('locked: exception', false, e.message);
+        } finally {
+            unloadPlayer(iframe);
+        }
+    }
+
+    //--- scenario 4: locked and broken tracks are skipped when switching ---
+    async function scenarioMixedLockedError(){
+        const iframe = await loadPlayer('test/config-mixed.json');
+        const w = iframe.contentWindow;
+        const d = w.document;
+        try {
+            await waitFor(() => w.eval('media.length === 4 && media[2].error === true && media[0].duration && media[3].duration'), 15000, 'mixed: load states');
+            log('mixed: playable first track selected', w.eval('currentEntry === media[0]'));
+            w.nextTrack();
+            log('mixed: next skips locked and broken tracks', w.eval('currentEntry === media[3]'));
+            log('mixed: skipped tracks not active', !w.eval('media[1].trackEl.classList.contains("active")') && !w.eval('media[2].trackEl.classList.contains("active")'));
+            w.prevTrack();
+            log('mixed: prev skips locked and broken tracks', w.eval('currentEntry === media[0]'));
+        } catch(e) {
+            log('mixed: exception', false, e.message);
+        } finally {
+            unloadPlayer(iframe);
+        }
+    }
+
+    //--- scenario 5: all tracks fail to load ---
+    async function scenarioAllError(){
+        const iframe = await loadPlayer('test/config-allerror.json');
+        const w = iframe.contentWindow;
+        const d = w.document;
+        try {
+            await waitFor(() => w.eval('media.length === 2 && media.every(e => e.error === true)'), 15000, 'allerror: errors');
+            const r = w.eval('try { nextTrack(); prevTrack(); "ok" } catch(e) { "err: " + e.message }');
+            log('allerror: next/prev do not throw', r === 'ok', r);
+            log('allerror: switching does not select another broken track', w.eval('currentEntry === media[0]') && !w.eval('media[1].trackEl.classList.contains("active")'));
+        } catch(e) {
+            log('allerror: exception', false, e.message);
+        } finally {
+            unloadPlayer(iframe);
+        }
+    }
+
+    (async () => {
+        try {
+            await scenarioLoopReplay();
+            await scenarioDragThenSwitch();
+            await scenarioAllLocked();
+            await scenarioMixedLockedError();
+            await scenarioAllError();
+        } catch(e) {
+            log('harness', false, e.message);
+        }
+        finish();
+    })();
+</script>
+</body>
+</html>

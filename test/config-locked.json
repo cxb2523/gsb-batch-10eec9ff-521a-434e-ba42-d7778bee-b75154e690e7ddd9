@@ -1,0 +1,15 @@
+{
+    "title": "locked test",
+    "media": [
+        { "title": "Locked1", "locked": true, "feature": true },
+        { "title": "Locked2", "locked": true },
+        { "title": "Locked3", "locked": true }
+    ],
+    "theme": {
+        "coverSize": 480,
+        "layoutStyle": "vertical",
+        "infoStyle": "overlaid",
+        "contentWidth": 400,
+        "nativePlayer": false
+    }
+}

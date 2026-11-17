@@ -1,0 +1,25 @@
+{
+    "title": "loop test",
+    "media": [
+        {
+            "file": "../test/media/loop1.wav",
+            "title": "LoopPreview",
+            "feature": true,
+            "previewStart": "0:05",
+            "previewEnd": "0:07",
+            "originalDuration": "0:10",
+            "loopCount": 2
+        },
+        {
+            "file": "../test/media/plain1.wav",
+            "title": "Plain"
+        }
+    ],
+    "theme": {
+        "coverSize": 480,
+        "layoutStyle": "vertical",
+        "infoStyle": "overlaid",
+        "contentWidth": 400,
+        "nativePlayer": false
+    }
+}
