@@ -61,6 +61,8 @@ export class Renderer {
   private mix = 0;
   private mixStart = 0;
   private mixDuration = 1;
+  /** Set by show(): the next frame ignores the last one, so a new scene starts without trails of the old. */
+  private trailsCut = false;
   private clock = 0;
   private lost = false;
 
@@ -158,15 +160,20 @@ export class Renderer {
 
   /** Shows `scene`, taking over from the one on screen over `seconds` (0: at once). */
   show(scene: Scene, seconds: number): void {
+    // A new slot starts clean: its own clock, angle and palette phase, nothing kept from the scene before.
     const slot: Slot = { scene, time: Math.random() * 20, angle: 0, palShift: 0 };
+    // The next frame stands on its own: no trails of the old picture bleed into the new one.
+    this.trailsCut = true;
     if (!this.a || seconds <= 0) {
       this.a = slot;
       this.b = null;
       this.mix = 0;
       return;
     }
-    // A transition still running ends where it is: its new scene becomes the old one.
-    if (this.b) this.a = this.b;
+    // A transition still running is not forced to its end: the new one takes over from
+    // whichever scene is mostly on screen now, so the picture does not jump. Its mix,
+    // start and length are this call's: it runs from 0 to 1 over the full `seconds`.
+    if (this.b && this.mix >= 0.5) this.a = this.b;
     this.b = slot;
     this.mix = 0;
     this.mixStart = this.clock;
@@ -228,7 +235,11 @@ export class Renderer {
       const x = pick(this.a!.scene);
       return this.b ? x + (pick(this.b.scene) - x) * eased : x;
     };
-    gl.uniform1f(s('uFeedback'), blend((x) => x.feedback) * (pulse.calm ? 0.9 : 1));
+    // The frame after a show() ignores the frame before it: the old scene's trails
+    // and colours are gone at once instead of fading out of the feedback.
+    const feedback = this.trailsCut ? 0 : blend((x) => x.feedback) * (pulse.calm ? 0.9 : 1);
+    this.trailsCut = false;
+    gl.uniform1f(s('uFeedback'), feedback);
     gl.uniform1f(s('uFbZoom'), blend((x) => x.feedbackZoom));
     gl.uniform1f(s('uFbTurn'), blend((x) => x.feedbackTurn));
     gl.uniform1f(s('uDt'), dt);

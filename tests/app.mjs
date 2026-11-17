@@ -162,6 +162,29 @@ try {
   await click('#visuals');
   check('new picture', await until(`document.querySelector('#f-scene').textContent !== ${JSON.stringify(sceneBefore)}`, 3000), true);
 
+  // A new picture asked for again while one is still coming in: it settles, never black
+  await click('#visuals');
+  await sleep(200);
+  await click('#visuals');
+  let darkest = 1;
+  for (let i = 0; i < 8; i++) {
+    darkest = Math.min(darkest, (await picture(`retake-${i}`)).mean);
+    await sleep(150);
+  }
+  check('picture re-taken mid-change: never black', darkest > 0.03, true);
+
+  // The song changes while a picture change is still running: the new song's
+  // first scene comes in cleanly, the picture never black
+  await click('#visuals');
+  const seedBefore = await evaluate(`document.querySelector('#seed').value`);
+  await click('#next');
+  check('song changed mid-change', await until(`document.querySelector('#seed').value !== ${JSON.stringify(seedBefore)}`, 3000), true);
+  for (let i = 0; i < 8; i++) {
+    darkest = Math.min(darkest, (await picture(`song-change-${i}`)).mean);
+    await sleep(150);
+  }
+  check('new song’s first scene: never black', darkest > 0.03, true);
+
   // Pause and play
   await click('#play');
   check('paused', await until(`document.body.dataset.state === 'paused'`, 3000), true);
