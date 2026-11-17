@@ -3,7 +3,7 @@
 // Independent of the renderer (no DOM dependency), so it can be used from any
 // custom render loop.
 
-import { CLOUD_GENERA_IDS } from './clouds.js';
+import { aggregateCover, CLOUD_GENERA_IDS } from './clouds.js';
 import type { AtmosphereState } from './state.js';
 
 export interface AnimatorOptions {
@@ -38,6 +38,11 @@ const TAU_2PI = Math.PI * 2;
 
 /** how much of the time constant rain or snow takes to stop (it starts at the whole of it) */
 const FALL_STOP = 0.25;
+
+/** below this a falling drop or flake is not drawn at all (features.ts gates the variants at the same 0.001) */
+const FALL_GONE = 0.001;
+
+const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 /**
  * Deep-copy the state's nested parts (including `filter.tint`, which is an
@@ -111,12 +116,24 @@ export class StateAnimator {
     c.moonPhase += (target.moonPhase - c.moonPhase) * k;
     c.moonEclipse += (target.moonEclipse - c.moonEclipse) * k;
 
-    c.cloudCover += (target.cloudCover - c.cloudCover) * k;
     // follow each cloud genus independently, so a cumulus sky settling into a
     // stratocumulus sky reads as "the billowing lumps flattening out"
+    //
+    // The total cover is not followed on its own. A resolved state may report
+    // a cover its genera don't quite add up to (resolveWeather takes an
+    // observed cloudCover as it comes), so what follows the target is the
+    // residual between the two — the cover itself is re-aggregated from the
+    // current genera every frame. Followed independently, the two drift
+    // apart mid-transition: the deck visibly gone while the total still
+    // hides the sun, or a total pressing the sun that no genus accounts for.
+    const coverResidual = c.cloudCover - aggregateCover(c.clouds);
     for (const g of CLOUD_GENERA_IDS) {
       c.clouds[g] += (target.clouds[g] - c.clouds[g]) * k;
     }
+    const targetResidual = target.cloudCover - aggregateCover(target.clouds);
+    c.cloudCover = clamp01(
+      aggregateCover(c.clouds) + coverResidual + (targetResidual - coverResidual) * k,
+    );
     c.features.anvil += (target.features.anvil - c.features.anvil) * k;
     c.features.velum += (target.features.velum - c.features.velum) * k;
     c.features.lenticular += (target.features.lenticular - c.features.lenticular) * k;
@@ -129,8 +146,17 @@ export class StateAnimator {
     // were still crossing the next sky eight seconds after a cut, and a
     // storm's rain was still coming down two scenes later
     const kStop = 1 - Math.exp(-dt / (o.tau * FALL_STOP));
-    c.rain += (target.rain - c.rain) * (target.rain < c.rain ? kStop : k);
-    c.snow += (target.snow - c.snow) * (target.snow < c.snow ? kStop : k);
+    // A change of precipitation type passes through a dry moment. Resolved
+    // weather is rain or snow, never both (resolveWeather picks one from
+    // precipitationType), so no transition frame may show both either: the
+    // old fall stops first — below FALL_GONE nothing of it is drawn, so it
+    // is gone for good — and the new one starts only once the air is dry.
+    if (target.rain < c.rain && c.rain < FALL_GONE) c.rain = 0;
+    if (target.snow < c.snow && c.snow < FALL_GONE) c.snow = 0;
+    if (target.rain <= c.rain || c.snow === 0)
+      c.rain += (target.rain - c.rain) * (target.rain < c.rain ? kStop : k);
+    if (target.snow <= c.snow || c.rain === 0)
+      c.snow += (target.snow - c.snow) * (target.snow < c.snow ? kStop : k);
     c.wind += (target.wind - c.wind) * k;
     c.thunder += (target.thunder - c.thunder) * k;
     c.haze += (target.haze - c.haze) * k;
