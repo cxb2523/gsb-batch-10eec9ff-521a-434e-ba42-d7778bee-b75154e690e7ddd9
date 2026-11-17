@@ -109,12 +109,14 @@ export function monoLows(L, R, fc = 110) {
   }
 }
 
-// time-varying lowpass, cutoff fn(t) read every 32 samples, bypassed at >= 17 kHz
+// time-varying lowpass, cutoff fn(t) tracked per sample (coefficients recomputed only when
+// the cutoff actually changes), bypassed at >= 17 kHz
 export function sweepLP(L, R, fn, leak = 0, q = 0.6) {
   const a = new SVF(18000, q), b = new SVF(18000, q), a2 = new SVF(18000, q), b2 = new SVF(18000, q);
-  let w = 0;
+  let w = 0, fLast = -1;
   for (let i = 0; i < L.length; i++) {
-    if ((i & 31) === 0) { const f = fn(i / SR); w = Math.max(0, Math.min(1, (17000 - f) / 6000)); a.set(f, q); b.set(f, q); a2.set(f, q); b2.set(f, q); }
+    const f = fn(i / SR);
+    if (f !== fLast) { fLast = f; w = Math.max(0, Math.min(1, (17000 - f) / 6000)); a.set(f, q); b.set(f, q); a2.set(f, q); b2.set(f, q); }
     a2.run(a.run(L[i])); b2.run(b.run(R[i]));
     if (w > 0) { const x = L[i], y = R[i]; L[i] = x + (a2.lp + (x - a2.lp) * leak - x) * w; R[i] = y + (b2.lp + (y - b2.lp) * leak - y) * w; }
   }

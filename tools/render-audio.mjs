@@ -29,5 +29,10 @@ for (const s of SHOTS) {
   for (let a = i0; a + w <= i1; a += w) { let q = 0; for (let i = a; i < a + w; i++) q += L[i] * L[i] + R[i] * R[i]; mx = Math.max(mx, q / (2 * w)); }
   console.log(`${s.id} ${s.name.padEnd(8)} ${s.t0.toFixed(1).padStart(5)} ${s.t1.toFixed(1).padStart(6)}   ${fmt(db(p))}    ${fmt(db(Math.sqrt(e / (2 * (i1 - i0)))))}    ${fmt(db(Math.sqrt(mx)))}`);
 }
+console.log('\nshot           t0     t1   set     underwater  muffle music/sfx Hz  consistent');
+for (const m of report.muffle) {
+  console.log(`${m.id} ${m.name.padEnd(8)} ${m.t0.toFixed(1).padStart(5)} ${m.t1.toFixed(1).padStart(6)}  ${m.set.padEnd(5)}  ${String(m.underwater).padEnd(9)}   ${`${Math.round(m.musicHz)}/${Math.round(m.sfxHz)}`.padStart(13)}       ${m.ok ? 'ok' : 'MISMATCH'}`);
+}
+console.log(`muffle follows the shot list: ${report.muffleOk ? 'ok' : 'MISMATCH'}`);
 if (process.argv.includes('--cues')) { console.log('\ncues:'); for (const [t, k, l] of report.cues) console.log(`  ${t.toFixed(2).padStart(6)}  ${k.padEnd(5)} ${l}`); }
 console.log(`\nwrote ${join(root, 'out', 'score.wav')}`);

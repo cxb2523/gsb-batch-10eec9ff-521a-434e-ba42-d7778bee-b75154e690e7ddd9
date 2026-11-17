@@ -16,15 +16,31 @@ import { buildSfx } from './audio-sfx.js';
 export const PEAK_DB = -1.0;
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
-// cutoff curve (Hz) for the underwater perspective: per sample-block lookup with a short glide
-function muffleCurve(hzUnder, rate = 1000) {
-  const n = Math.ceil(DURATION * rate) + 2, a = new Float32Array(n), k = 1 - Math.exp(-1 / (0.012 * rate));
-  let y = Math.log(20000);
-  for (let i = 0; i < n; i++) {
-    const t = i / rate, s = SHOTS.find((x) => t >= x.t0 && t < x.t1) || SHOTS[SHOTS.length - 1];
-    y += (Math.log(s.set === 'under' ? hzUnder : 20000) - y) * k; a[i] = y;
+// Underwater muffle, locked to the shot list. The cutoff glides in the log domain along a
+// cosine ramp that starts exactly at each shot boundary where the set changes and is fully
+// settled MUFFLE_RAMP seconds later: never early, never late, no residue in the next shot.
+export const MUFFLE_RAMP = 0.06;      // s for the cutoff to glide fully across a boundary
+export const MUFFLE_MUSIC_HZ = 650;   // score cutoff under water
+export const MUFFLE_SFX_HZ = 420;     // open-air sfx cutoff under water
+export const MUFFLE_AIR_HZ = 20000;   // above water: effectively open
+export function muffleCurve(hzUnder, { shots = SHOTS, ramp = MUFFLE_RAMP, hzAir = MUFFLE_AIR_HZ } = {}) {
+  const target = (s) => (s.set === 'under' ? hzUnder : hzAir);
+  const bounds = []; // [t, fromHz, toHz, logFrom, logTo] at every boundary where the target changes
+  for (let i = 1; i < shots.length; i++) {
+    const a = target(shots[i - 1]), b = target(shots[i]);
+    if (a !== b) bounds.push([shots[i].t0, a, b, Math.log(a), Math.log(b)]);
   }
-  return (t) => Math.exp(a[Math.min(n - 1, Math.round(t * rate))]);
+  const v0 = target(shots[0]);
+  return (t) => {
+    let v = v0;
+    for (const [tb, a, b, la, lb] of bounds) {
+      if (t < tb) break;
+      const u = ramp > 0 ? Math.min(1, (t - tb) / ramp) : 1;
+      // exact targets outside the ramp: settled segments sit bit-exactly on the shot's value
+      v = u <= 0 ? a : u >= 1 ? b : Math.exp(la + (lb - la) * (1 - Math.cos(u * Math.PI)) / 2);
+    }
+    return v;
+  };
 }
 const mixInto = (dst, src, g = 1) => { for (let i = 0; i < dst.L.length; i++) { dst.L[i] += src.L[i] * g; dst.R[i] += src.R[i] * g; } };
 
@@ -46,9 +62,11 @@ export function renderScore(sampleRate = 48000, opts = {}) {
   const tRev = now();
 
   // ---- perspective: under the surface the score and the air go behind water
+  // (music + air sfx only; the in-water sounds and the free voices are never muffled)
   const M = G.music.dry, X = G.sfx.dry;
-  sweepLP(M.L, M.R, muffleCurve(650), 0.03);
-  sweepLP(X.L, X.R, muffleCurve(420), 0.01);
+  const muffleMusic = muffleCurve(MUFFLE_MUSIC_HZ), muffleSfx = muffleCurve(MUFFLE_SFX_HZ);
+  sweepLP(M.L, M.R, muffleMusic, 0.03);
+  sweepLP(X.L, X.R, muffleSfx, 0.01);
   { const [a, b] = activeRange(G.under.dry.L, G.under.dry.R); eq(G.under.dry.L.subarray(a, b), G.under.dry.R.subarray(a, b), () => [Biquad.lp(1400, 0.6)]); }
 
   // ---- silence is carved after the reverbs so it is real
@@ -89,10 +107,24 @@ export function renderScore(sampleRate = 48000, opts = {}) {
 
   const res = { L, R };
   if (opts.report) {
+    // per-shot muffle state, sampled where the curve is settled (shot midpoint):
+    // lets the report show that every shot's muffle matches its underwater state
+    const muffle = SHOTS.map((s) => {
+      const tm = (s.t0 + s.t1) / 2, under = s.set === 'under';
+      const musicHz = muffleMusic(tm), sfxHz = muffleSfx(tm);
+      const wantMusic = under ? MUFFLE_MUSIC_HZ : MUFFLE_AIR_HZ, wantSfx = under ? MUFFLE_SFX_HZ : MUFFLE_AIR_HZ;
+      return {
+        id: s.id, name: s.name, t0: s.t0, t1: s.t1, set: s.set, underwater: under,
+        musicHz: +musicHz.toFixed(1), sfxHz: +sfxHz.toFixed(1),
+        ok: Math.abs(musicHz - wantMusic) < 1 && Math.abs(sfxHz - wantSfx) < 1,
+      };
+    });
     res.report = {
       sampleRate: SR, samples: N, peakDb: +gainToDb(peakOf(L, R)).toFixed(2), rmsDb: +gainToDb(rmsOf(L, R)).toFixed(2),
       glueGrDb: +glueGr.toFixed(2), limiterGrDb: +limGr.toFixed(2),
       cues: report.sort((a, b) => a[0] - b[0]),
+      muffle,
+      muffleOk: muffle.every((m) => m.ok),
       timingsMs: { music: Math.round(tMusic - T0), sfx: Math.round(tSfx - tMusic), reverbs: Math.round(tRev - tSfx), master: Math.round(T1 - tRev), total: Math.round(T1 - T0) },
     };
   }
