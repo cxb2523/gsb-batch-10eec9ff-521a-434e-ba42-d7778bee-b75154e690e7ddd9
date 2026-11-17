@@ -14,7 +14,11 @@ export default class ClipState extends EventEmitter {
   }
 
   reset() {
-    this._chunks = [];
+    // Clear in place: Loader captures the chunks array by reference when it
+    // is constructed, so replacing the array would leave the loader writing
+    // into a stale buffer that playback never reads.
+    this._chunks = this._chunks || [];
+    this._chunks.length = 0;
     this._chunkIndex = 0;
     this._chunksBufferingFinished = false;
   }

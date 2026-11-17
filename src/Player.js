@@ -117,7 +117,9 @@ export default class Player {
       track.fileSize,
       track.initialPosition,
       track.lastAllowedPosition
-    );
+      // A preload may be cancelled (superseded by another playNext, disposed,
+      // etc.) or fail; that is not an exceptional state for the player itself.
+    ).catch(noop);
   }
 
   preLoad(url, fileSize, initialPosition = 0, lastAllowedPosition = 1) {

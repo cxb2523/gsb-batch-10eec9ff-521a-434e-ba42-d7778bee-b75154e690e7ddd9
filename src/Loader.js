@@ -41,6 +41,18 @@ export default class Loader extends EventEmitter {
         ? FetchStrategy.LAZY
         : FetchStrategy.GREEDY;
     this._cancelled = false;
+    // Whether a fetch loop is currently running. The loop is single-flight:
+    // no matter how many times buffer() is called (preload, playback, seek),
+    // at most one loop advances the fetch cursor.
+    this._fetching = false;
+    // Set when playback requested the full file while a preload was still in
+    // flight. The running loop finishes its current preload batch and then
+    // seamlessly continues fetching the rest of the file.
+    this._continueAfterPreload = false;
+    this._preloadOnly = false;
+    // Incremented on every cancel() so that promise chains belonging to a
+    // stale fetch loop can never interfere with a freshly started one.
+    this._generation = 0;
 
     this._clipState.on('chunkIndexManuallyChanged', (newIndex) => {
       this.cancel();
@@ -68,12 +80,18 @@ export default class Loader extends EventEmitter {
 
   cancel() {
     this._cancelled = true;
+    this._fetching = false;
+    this._continueAfterPreload = false;
+    this._generation += 1;
     this._sleep && this._sleep.cancel();
     Object.keys(this._jobs).forEach((chunkIndex) => {
       this._jobs[chunkIndex].cancel();
       delete this._jobs[chunkIndex];
     });
     this._loadStarted = false;
+    // Settle any promise returned by buffer() so callers (e.g. Clip#preBuffer)
+    // never wait forever on a load that was just cancelled.
+    this._fire('loadcancelled');
   }
 
   _getRange(chunkIndex) {
@@ -83,20 +101,34 @@ export default class Loader extends EventEmitter {
   }
 
   buffer(preloadOnly = false, initialChunk = 0) {
-    if (!this._loadStarted) {
+    if (this._fetching) {
+      // A fetch loop is already running. Never start a competing loop — two
+      // loops would advance the shared cursor past unfetched chunks and
+      // re-request chunks that are already buffered. If playback now needs
+      // the full file while a preload is in flight, the running loop is
+      // upgraded instead: it finishes the current preload batch and then
+      // keeps fetching the remainder of the file.
+      if (this._preloadOnly && !preloadOnly) {
+        this._preloadOnly = false;
+        this._loadStarted = true;
+        this._continueAfterPreload = true;
+      }
+    } else if (!this.loaded) {
       this._loadStarted = !preloadOnly;
+      this._fetching = true;
       this._initialChunk = initialChunk;
       this._canPlayThrough = false;
       this._preloadOnly = preloadOnly;
       this._cancelled = false;
+      this._continueAfterPreload = false;
 
       this._cursor = createFetchCursor({
-        index: initialChunk,
+        index: this._firstMissingChunkIndex(initialChunk),
         size: this._clipState.totalChunksCount,
         strategy: preloadOnly ? FetchStrategy.PRELOAD_ONLY : this._fetchStrategy,
       });
 
-      this._fetchNextChunks();
+      this._fetchNextChunks(this._generation);
     }
     return new Promise((resolve, reject) => {
       const ready = preloadOnly ? this._canPlayThrough : this.loaded;
@@ -105,8 +137,20 @@ export default class Loader extends EventEmitter {
       } else {
         this.once(preloadOnly ? 'canPlayThrough' : 'load', resolve);
         this.once('loaderror', reject);
+        this.once('loadcancelled', () =>
+          reject(new Error('Loader was cancelled before loading finished'))
+        );
       }
     });
+  }
+
+  _firstMissingChunkIndex(fromIndex) {
+    const chunks = this._clipState.chunks;
+    let index = fromIndex;
+    while (index < this._clipState.totalChunksCount && chunks[index]) {
+      index += 1;
+    }
+    return index;
   }
 
   _checkCanplaythrough() {
@@ -219,31 +263,59 @@ export default class Loader extends EventEmitter {
     this._cursor = this._cursor.seek(this._clipState.chunkIndex);
   }
 
-  _fetchNextChunks() {
-    if (this._cancelled) return Promise.resolve();
-
-    const startTime = Date.now();
-    const nextChunks = this._cursor.chunks().map(this._fetchChunk.bind(this));
-
-    if (nextChunks.length === 0) {
+  _fetchNextChunks(generation) {
+    if (this._cancelled || generation !== this._generation) {
       return Promise.resolve();
     }
 
-    this._sleep = new CancellableSleep(
+    const startTime = Date.now();
+    let nextChunkIndexes = this._cursor.chunks();
+
+    if (nextChunkIndexes.length === 0) {
+      if (this._continueAfterPreload && !this.loaded) {
+        // The preload batch is done and playback requested the rest of the
+        // file in the meantime: continue from the first chunk that is still
+        // missing instead of restarting (and re-requesting) from the top.
+        this._continueAfterPreload = false;
+        this._cursor = createFetchCursor({
+          index: this._firstMissingChunkIndex(this._initialChunk),
+          size: this._clipState.totalChunksCount,
+          strategy: this._fetchStrategy,
+        });
+        nextChunkIndexes = this._cursor.chunks();
+      }
+
+      if (nextChunkIndexes.length === 0) {
+        this._fetching = false;
+        return Promise.resolve();
+      }
+    }
+
+    const nextChunks = nextChunkIndexes.map(this._fetchChunk.bind(this));
+
+    const sleep = new CancellableSleep(
       LOAD_BATCH_SIZE * DELAY_BETWEEN_FETCHES - (Date.now() - startTime)
     );
+    this._sleep = sleep;
 
     return Promise.all(nextChunks)
-      .then(() => this._sleep.wait())
-      .then(() => this._seekFetchCursor())
-      .then(() => this._fetchNextChunks())
+      .then(() => sleep.wait())
+      .then(() => {
+        // A stale loop (cancelled and superseded by a fresh one) must never
+        // touch the shared cursor.
+        if (this._cancelled || generation !== this._generation) {
+          return Promise.resolve();
+        }
+        this._seekFetchCursor();
+        return this._fetchNextChunks(generation);
+      })
       .catch((err) => {
         if (err !== SLEEP_CANCELLED) throw err;
       });
   }
 
   _fetchChunk(chunkIndex) {
-    if (!!this._clipState.chunks[chunkIndex]) {
+    if (!!this._clipState.chunks[chunkIndex] || !!this._jobs[chunkIndex]) {
       return Promise.resolve();
     }
 
@@ -283,7 +355,9 @@ export default class Loader extends EventEmitter {
         err.url = this.url;
         err.customCode = 'COULD_NOT_LOAD';
         this._fire('loaderror', err);
-        this._loadStarted = false;
+        // Halt the fetch loop so a subsequent buffer() call (e.g. when the
+        // track is played again after a failed preload) starts fresh.
+        this.cancel();
       });
   }
 }

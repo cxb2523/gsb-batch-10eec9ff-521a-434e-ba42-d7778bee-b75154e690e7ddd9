@@ -191,6 +191,12 @@ export default class Clip extends EventEmitter {
 
   dispose() {
     this.stop();
+    // Disposing always halts any in-flight loading, including preloads
+    // (stop() alone deliberately leaves a preload-only clip's loader alive).
+    this._shouldStopBuffering = true;
+    if (this._loader) {
+      this._loader.cancel();
+    }
     this._preBuffering = false;
     this._preBuffered = false;
     this._buffering = false;
@@ -260,7 +266,7 @@ export default class Clip extends EventEmitter {
   }
 
   stop() {
-    this._shouldStopBuffering = true;
+    const wasPlaying = this._playbackState !== PLAYBACK_STATE.STOPPED;
 
     if (this._useMediaSource) {
       this._stopUsingMediaSource();
@@ -268,12 +274,22 @@ export default class Clip extends EventEmitter {
       this._stopUsingAudioContext();
     }
 
-    if (this._loader) {
-      this._loader.cancel();
+    // Only interrupt loading when this clip was actually playing (or
+    // buffering for playback). A clip that is merely preloading — e.g. the
+    // next track while the current one is playing — must keep its in-flight
+    // preload alive when the current track is stopped (Player#stopAll calls
+    // stop() on every known clip).
+    if (wasPlaying || this._buffering) {
+      this._shouldStopBuffering = true;
+
+      if (this._loader) {
+        this._loader.cancel();
+      }
+
+      this._preBuffering = false;
+      this._buffering = false;
     }
 
-    this._preBuffering = false;
-    this._buffering = false;
     this._playbackState = PLAYBACK_STATE.STOPPED;
     this._fire('stop');
 
