@@ -120,9 +120,23 @@ export class Transport {
       return;
     }
     // Insert a tempo boundary at a specific audio time to keep phase continuity.
-    const time = Math.max(atTime, this.startTime);
-    this.insertTempoEvent({ time, bpm }, true);
+    this.insertTempoEvent({ time: this.getTempoChangeTime(atTime), bpm }, true);
     this.emit('tempo');
+  }
+
+  /**
+   * Resolve the audio time at which a tempo boundary is applied.
+   *
+   * Tempo boundaries are clamped to the current anchor (start / seek time):
+   * a tempo event can never rewrite the tempo map before the transport's
+   * origin, so both the main thread and the audio worklet agree on where the
+   * new tempo takes effect.
+   */
+  getTempoChangeTime(atTime: number): number {
+    if (!Number.isFinite(atTime)) {
+      return this.startTime;
+    }
+    return Math.max(atTime, this.startTime);
   }
 
   scheduleTempoChange(bpm: number, atTime: number): void {
@@ -132,8 +146,7 @@ export class Transport {
     if (this.state === 'stopped') {
       throw new Error('Transport.scheduleTempoChange: transport is stopped.');
     }
-    const time = Math.max(atTime, this.startTime);
-    this.insertTempoEvent({ time, bpm }, false);
+    this.insertTempoEvent({ time: this.getTempoChangeTime(atTime), bpm }, false);
     this.emit('tempo');
   }
 

@@ -31,6 +31,9 @@ class TransportClockProcessor extends AudioWorkletProcessor {
         this._running = true;
         this._startTime = message.time;
         this._startBeat = message.beat;
+        if (Number.isFinite(message.bpm)) {
+          this._bpm = message.bpm;
+        }
         this._tempoEvents = [{ time: this._startTime, bpm: this._bpm }];
         this._nextTickTime = message.time;
         this._phaseSamples = 0;
@@ -44,6 +47,9 @@ class TransportClockProcessor extends AudioWorkletProcessor {
         break;
       case 'seek':
         this._pausedBeat = message.beat;
+        if (Number.isFinite(message.bpm)) {
+          this._bpm = message.bpm;
+        }
         if (this._running) {
           this._startTime = message.time;
           this._startBeat = message.beat;
@@ -57,15 +63,24 @@ class TransportClockProcessor extends AudioWorkletProcessor {
       case 'tempo':
         this._bpm = message.bpm;
         if (this._running) {
-          this._insertTempoEvent({ time: message.time, bpm: message.bpm }, true);
+          this._insertTempoEvent({ time: this._clampTempoTime(message.time), bpm: message.bpm }, true);
         }
         break;
       case 'schedule-tempo':
-        this._insertTempoEvent({ time: message.time, bpm: message.bpm }, false);
+        this._insertTempoEvent({ time: this._clampTempoTime(message.time), bpm: message.bpm }, false);
         break;
       default:
         break;
     }
+  }
+
+  _clampTempoTime(time) {
+    // A tempo boundary can never precede this clock's own anchor, otherwise the
+    // main thread and the worklet would integrate different tempo segments.
+    if (!Number.isFinite(time)) {
+      return this._startTime;
+    }
+    return Math.max(time, this._startTime);
   }
 
   _insertTempoEvent(event, replaceFuture) {

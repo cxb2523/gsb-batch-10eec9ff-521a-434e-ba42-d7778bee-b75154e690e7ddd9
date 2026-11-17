@@ -3,9 +3,9 @@ import { transportClockWorklet } from './worklets';
 
 type WorkletCommand =
   | { type: 'init'; bpm: number; startBeat: number; tickIntervalSec: number }
-  | { type: 'start'; time: number; beat: number }
+  | { type: 'start'; time: number; beat: number; bpm: number }
   | { type: 'stop'; time: number }
-  | { type: 'seek'; time: number; beat: number }
+  | { type: 'seek'; time: number; beat: number; bpm: number }
   | { type: 'tempo'; time: number; bpm: number }
   | { type: 'schedule-tempo'; time: number; bpm: number };
 
@@ -142,32 +142,60 @@ export class WorkletTransport implements TransportLike {
   }
 
   start(atTime = this.context.currentTime): void {
+    const wasPlaying = this.transport.isPlaying;
     this.transport.start(atTime);
-    this.post({ type: 'start', time: atTime, beat: this.transport.getBeatAtTime(atTime) });
+    // Only transition the worklet clock when the main transport actually
+    // started; re-posting 'start' would re-anchor the worklet to a new origin
+    // and desync it from the main thread's tempo map.
+    if (!wasPlaying) {
+      this.post({
+        type: 'start',
+        time: atTime,
+        beat: this.transport.getBeatAtTime(atTime),
+        bpm: this.transport.bpm,
+      });
+    }
     this.emit('start');
   }
 
   stop(atTime = this.context.currentTime): void {
+    const wasPlaying = this.transport.isPlaying;
     this.transport.stop(atTime);
-    this.post({ type: 'stop', time: atTime });
+    if (wasPlaying) {
+      this.post({ type: 'stop', time: atTime });
+    }
     this.emit('stop');
   }
 
   seek(beat: number, atTime = this.context.currentTime): void {
     this.transport.seek(beat, atTime);
-    this.post({ type: 'seek', time: atTime, beat });
+    this.post({ type: 'seek', time: atTime, beat, bpm: this.transport.bpm });
     this.emit('seek');
   }
 
   setTempo(bpm: number, atTime = this.context.currentTime): void {
     this.transport.setTempo(bpm, atTime);
-    this.post({ type: 'tempo', time: atTime, bpm });
+    // While stopped the tempo only applies to the next start(); posting a
+    // tempo command now would append an event that predates the worklet's
+    // own start anchor and corrupt its tempo map. The bpm rides along with
+    // the next start/seek command instead.
+    if (this.transport.isPlaying) {
+      this.post({
+        type: 'tempo',
+        time: this.transport.getTempoChangeTime(atTime),
+        bpm,
+      });
+    }
     this.emit('tempo');
   }
 
   scheduleTempoChange(bpm: number, atTime: number): void {
     this.transport.scheduleTempoChange(bpm, atTime);
-    this.post({ type: 'schedule-tempo', time: atTime, bpm });
+    this.post({
+      type: 'schedule-tempo',
+      time: this.transport.getTempoChangeTime(atTime),
+      bpm,
+    });
     this.emit('tempo');
   }
 

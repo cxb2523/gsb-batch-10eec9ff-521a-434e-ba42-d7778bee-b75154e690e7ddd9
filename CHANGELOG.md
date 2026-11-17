@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Transport tempo sync** - Live `setTempo()` calls now clamp the tempo boundary to the transport anchor on both the main thread and the `transport-clock` worklet, so both sides agree on the beat position at the same audio time and beat history before the boundary is preserved.
+- **Transport tempo while stopped** - `setTempo()` no longer posts a tempo command to the worklet while stopped; the new BPM travels with the next `start`/`seek` command instead of corrupting the worklet's tempo map.
+- **Transport seek tempo map** - Seeking re-anchors the tempo map on both sides, discarding stale tempo boundaries.
+- **WorkletTransport start/stop** - Repeated `start()`/`stop()` calls no longer re-anchor the worklet clock or emit duplicate commands.
+
 ## [0.1.13] - 2026-02-15
 
 ### Added

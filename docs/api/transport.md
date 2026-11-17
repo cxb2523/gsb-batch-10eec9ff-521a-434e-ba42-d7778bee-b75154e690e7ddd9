@@ -466,6 +466,15 @@ function StepSequencer() {
 - Tempo changes are tracked with a tempo map for accurate beat/time conversion
 - `setTempo()` changes tempo immediately
 - `scheduleTempoChange()` schedules a tempo change for a future time
+- Tempo boundaries are clamped to the transport's current anchor (its start or
+  most recent seek time), so changing tempo can never rewrite beat positions
+  before the transport origin. `WorkletTransport` applies the same clamp, which
+  keeps the main thread and the audio-thread clock in agreement.
+- While stopped, `setTempo()` only updates the tempo used by the next `start()`
+  and does not send a command to the worklet. `scheduleTempoChange()` throws
+  while stopped.
+- `seek()` re-anchors the tempo map: previously scheduled tempo boundaries are
+  discarded and the current BPM applies from the new position.
 
 ### Phase Calculation
 

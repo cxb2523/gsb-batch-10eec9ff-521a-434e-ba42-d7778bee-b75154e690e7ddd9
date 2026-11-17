@@ -3,6 +3,7 @@ import { Scheduler, Schedulable } from '../scheduler';
 import { PhaseSequencer, SequencerStepEvent } from '../sequencer';
 import { WorkletTransport } from '../transportWorklet';
 import { TransportBus } from '../transportBus';
+import { transportClockWorklet } from '../worklets';
 
 // Mock AudioContext
 const createMockAudioContext = (currentTime = 0) => ({
@@ -194,6 +195,82 @@ describe('Transport', () => {
 
       expect(() => transport.setTempo(0)).toThrow();
       expect(() => transport.setTempo(-10)).toThrow();
+    });
+
+    it('should keep history and hit the boundary exactly on a live tempo change', () => {
+      const context = createMockAudioContext(0);
+      const transport = new Transport(context, { bpm: 120 });
+      transport.start(0);
+
+      transport.setTempo(60, 2);
+
+      // Before the boundary the old tempo map is untouched.
+      expect(transport.getBeatAtTime(1)).toBeCloseTo(2);
+      // The boundary beat is measured with the old tempo.
+      expect(transport.getBeatAtTime(2)).toBeCloseTo(4);
+      // Afterwards the new tempo applies.
+      expect(transport.getBeatAtTime(3)).toBeCloseTo(5);
+      expect(transport.getTimeAtBeat(5)).toBeCloseTo(3);
+    });
+
+    it('should clamp a live tempo change to the transport start time', () => {
+      const context = createMockAudioContext(10);
+      const transport = new Transport(context, { bpm: 120 });
+      transport.start(10);
+
+      transport.setTempo(60, 4);
+
+      expect(transport.getTempoChangeTime(4)).toBe(10);
+      expect(transport.getBeatAtTime(10)).toBeCloseTo(0);
+      expect(transport.getBeatAtTime(11)).toBeCloseTo(1);
+      // No tempo segment before the anchor.
+      expect(transport.getBeatAtTime(9)).toBe(0);
+    });
+
+    it('should apply a stopped-state tempo change on the next start only', () => {
+      const context = createMockAudioContext(0);
+      const transport = new Transport(context, { bpm: 120 });
+      transport.start(0);
+      transport.stop(3);
+      const pausedBeat = transport.currentBeat;
+      expect(pausedBeat).toBeCloseTo(6);
+
+      transport.setTempo(90);
+
+      // The paused position is unaffected by the stopped-state change.
+      expect(transport.currentBeat).toBeCloseTo(pausedBeat);
+
+      transport.start(5);
+      expect(transport.getBeatAtTime(5)).toBeCloseTo(pausedBeat);
+      expect(transport.getBeatAtTime(6)).toBeCloseTo(pausedBeat + 1.5);
+    });
+
+    it('should rebase the tempo map on seek', () => {
+      const context = createMockAudioContext(0);
+      const transport = new Transport(context, { bpm: 120 });
+      transport.start(0);
+      transport.setTempo(60, 2);
+
+      transport.seek(16, 4);
+
+      // Everything before the new anchor is pinned to the seek beat.
+      expect(transport.getBeatAtTime(3)).toBeCloseTo(16);
+      expect(transport.getBeatAtTime(4)).toBeCloseTo(16);
+      // The old tempo boundary is discarded; the current bpm applies anew.
+      expect(transport.getBeatAtTime(5)).toBeCloseTo(17);
+      expect(transport.getTimeAtBeat(18)).toBeCloseTo(6);
+    });
+
+    it('should throw from scheduleTempoChange while stopped and for invalid bpm', () => {
+      const context = createMockAudioContext(0);
+      const transport = new Transport(context, { bpm: 120 });
+
+      expect(() => transport.scheduleTempoChange(180, 1)).toThrow(
+        'transport is stopped'
+      );
+      expect(() => transport.scheduleTempoChange(0, 1)).toThrow();
+      expect(() => transport.scheduleTempoChange(-1, 1)).toThrow();
+      expect(transport.bpm).toBe(120);
     });
   });
 
@@ -809,6 +886,262 @@ describe('WorkletTransport', () => {
     await expect(WorkletTransport.create(context)).rejects.toThrow(
       'AudioWorklet is not supported'
     );
+  });
+});
+
+/**
+ * Runs the real transport-clock worklet source in a tiny sandbox so tests can
+ * compare the main-thread transport's beat math with the audio-thread clock.
+ */
+const createWorkletProcessor = () => {
+  const state = { currentTime: 0 };
+  const posted: Array<Record<string, any>> = [];
+
+  class MockAudioWorkletProcessor {
+    port = {
+      onmessage: null as ((event: { data: unknown }) => void) | null,
+      postMessage: (message: Record<string, any>) => posted.push(message),
+    };
+  }
+
+  let ProcessorClass: any;
+  const scope: Record<string, any> = {
+    sampleRate: 44100,
+    AudioWorkletProcessor: MockAudioWorkletProcessor,
+    registerProcessor: (_name: string, processor: any) => {
+      ProcessorClass = processor;
+    },
+  };
+  Object.defineProperty(scope, 'currentTime', {
+    enumerable: true,
+    get: () => state.currentTime,
+  });
+
+  // eslint-disable-next-line no-new-func
+  new Function('scope', `with (scope) {\n${transportClockWorklet}\n}`)(scope);
+
+  const processor = new ProcessorClass();
+
+  return {
+    posted,
+    setTime(time: number) {
+      state.currentTime = time;
+    },
+    send(message: Record<string, any>) {
+      processor.port.onmessage?.({ data: message });
+    },
+    beatAt(time: number) {
+      return processor._getBeatAtTime(time) as number;
+    },
+    getTempoEvents() {
+      return processor._tempoEvents as Array<{ time: number; bpm: number }>;
+    },
+  };
+};
+
+const createWorkletSync = (transport: WorkletTransport) => {
+  const worklet = createWorkletProcessor();
+  const commands: Array<Record<string, any>> = [];
+  let cursor = 0;
+  const flush = () => {
+    const node = transport.getNode();
+    const calls = (node?.port.postMessage as jest.Mock).mock.calls ?? [];
+    for (; cursor < calls.length; cursor += 1) {
+      commands.push(calls[cursor][0]);
+      worklet.send(calls[cursor][0]);
+    }
+  };
+  return { worklet, flush, commands };
+};
+
+describe('Transport/Worklet tempo consistency', () => {
+  const originalAudioWorkletNode = (global as any).AudioWorkletNode;
+
+  beforeEach(() => {
+    (global as any).AudioWorkletNode = MockAudioWorkletNode;
+  });
+
+  afterEach(() => {
+    (global as any).AudioWorkletNode = originalAudioWorkletNode;
+  });
+
+  const expectAgreement = (
+    transport: WorkletTransport,
+    worklet: ReturnType<typeof createWorkletProcessor>,
+    time: number
+  ) => {
+    expect(worklet.beatAt(time)).toBeCloseTo(transport.getBeatAtTime(time), 10);
+  };
+
+  it('keeps beat positions continuous across a live tempo change', async () => {
+    const context = createMockAudioContext(10);
+    const transport = await WorkletTransport.create(context, { bpm: 120 });
+    const { worklet, flush } = createWorkletSync(transport);
+
+    transport.start(10);
+    flush();
+    expectAgreement(transport, worklet, 12);
+    expect(transport.getBeatAtTime(12)).toBeCloseTo(4);
+
+    transport.setTempo(240, 12);
+    flush();
+
+    // The boundary itself and everything before it keep the old tempo map.
+    expect(transport.getBeatAtTime(11)).toBeCloseTo(2);
+    expect(transport.getBeatAtTime(12)).toBeCloseTo(4);
+    expectAgreement(transport, worklet, 11);
+    expectAgreement(transport, worklet, 12);
+    // After the boundary both sides advance at 240 BPM (4 beats/sec).
+    expect(transport.getBeatAtTime(13)).toBeCloseTo(8);
+    expectAgreement(transport, worklet, 13);
+    expectAgreement(transport, worklet, 12.5);
+  });
+
+  it('clamps a live tempo change to the worklet start time', async () => {
+    const context = createMockAudioContext(10);
+    const transport = await WorkletTransport.create(context, { bpm: 120 });
+    const { worklet, flush, commands } = createWorkletSync(transport);
+
+    transport.start(10);
+    flush();
+    // A tempo time before the transport origin must not rewrite history.
+    transport.setTempo(60, 5);
+    flush();
+
+    const tempoMessages = commands.filter((m) => m.type === 'tempo');
+    expect(tempoMessages).toHaveLength(1);
+    expect(tempoMessages[0].time).toBe(10);
+    expect(worklet.getTempoEvents()[0].time).toBe(10);
+
+    expect(transport.getBeatAtTime(10)).toBeCloseTo(0);
+    expectAgreement(transport, worklet, 10);
+    expect(transport.getBeatAtTime(11)).toBeCloseTo(1);
+    expectAgreement(transport, worklet, 11);
+  });
+
+  it('applies a stopped-state tempo change on the next start instead of posting it', async () => {
+    const context = createMockAudioContext(0);
+    const transport = await WorkletTransport.create(context, { bpm: 120 });
+    const { worklet, flush, commands } = createWorkletSync(transport);
+
+    transport.start(0);
+    transport.setTempo(180, 5);
+    transport.stop(6);
+    flush();
+
+    const tempoCommandCount = () =>
+      commands.filter((m) => m.type === 'tempo').length;
+    const tempoCommandsBefore = tempoCommandCount();
+    const beforeStoppedChange = commands.length;
+    transport.setTempo(90);
+    flush();
+
+    // No tempo command while stopped: it would append an event that predates
+    // the worklet's own anchor and corrupt its tempo map.
+    expect(commands.length).toBe(beforeStoppedChange);
+    expect(tempoCommandCount()).toBe(tempoCommandsBefore);
+    expect(transport.bpm).toBe(90);
+
+    transport.start(8);
+    flush();
+
+    const startMessages = commands.filter((m) => m.type === 'start');
+    expect(startMessages).toHaveLength(2);
+    expect(startMessages[1].bpm).toBe(90);
+    expect(worklet.getTempoEvents()).toEqual([{ time: 8, bpm: 90 }]);
+
+    // 13 beats were reached before the stop; 90 BPM adds 1.5 beats per second.
+    expect(transport.getBeatAtTime(9)).toBeCloseTo(14.5);
+    expectAgreement(transport, worklet, 9);
+    expectAgreement(transport, worklet, 8);
+  });
+
+  it('re-anchors the tempo map after a seek', async () => {
+    const context = createMockAudioContext(0);
+    const transport = await WorkletTransport.create(context, { bpm: 120 });
+    const { worklet, flush } = createWorkletSync(transport);
+
+    transport.start(0);
+    flush();
+    transport.seek(8, 2);
+    flush();
+    expect(worklet.getTempoEvents()).toEqual([{ time: 2, bpm: 120 }]);
+
+    transport.setTempo(60, 3);
+    flush();
+
+    expect(worklet.getTempoEvents()).toEqual([
+      { time: 2, bpm: 120 },
+      { time: 3, bpm: 60 },
+    ]);
+    expect(transport.getBeatAtTime(2)).toBeCloseTo(8);
+    expect(transport.getBeatAtTime(3)).toBeCloseTo(10);
+    expect(transport.getBeatAtTime(4)).toBeCloseTo(11);
+    expectAgreement(transport, worklet, 2);
+    expectAgreement(transport, worklet, 3);
+    expectAgreement(transport, worklet, 4);
+    // Before the seek anchor the beat stays pinned to the seek position.
+    expectAgreement(transport, worklet, 1);
+  });
+
+  it('clamps a post-seek tempo change to the new anchor', async () => {
+    const context = createMockAudioContext(0);
+    const transport = await WorkletTransport.create(context, { bpm: 120 });
+    const { worklet, flush, commands } = createWorkletSync(transport);
+
+    transport.start(0);
+    transport.seek(8, 2);
+    flush();
+    transport.setTempo(60, 1);
+    flush();
+
+    const tempoMessages = commands.filter((m) => m.type === 'tempo');
+    expect(tempoMessages).toHaveLength(1);
+    expect(tempoMessages[0].time).toBe(2);
+    expect(worklet.getTempoEvents()[0].time).toBe(2);
+    expect(transport.getBeatAtTime(3)).toBeCloseTo(9);
+    expectAgreement(transport, worklet, 3);
+  });
+
+  it('keeps main thread and worklet in sync for scheduled tempo changes', async () => {
+    const context = createMockAudioContext(0);
+    const transport = await WorkletTransport.create(context, { bpm: 120 });
+    const { worklet, flush } = createWorkletSync(transport);
+
+    transport.start(0);
+    transport.scheduleTempoChange(240, 2);
+    flush();
+
+    // The reported bpm only flips once the event time arrives.
+    expect(transport.bpm).toBe(120);
+    expect(worklet.getTempoEvents()).toEqual([
+      { time: 0, bpm: 120 },
+      { time: 2, bpm: 240 },
+    ]);
+    expect(transport.getBeatAtTime(1)).toBeCloseTo(2);
+    expect(transport.getBeatAtTime(2)).toBeCloseTo(4);
+    expect(transport.getBeatAtTime(3)).toBeCloseTo(8);
+    expectAgreement(transport, worklet, 2);
+    expectAgreement(transport, worklet, 3);
+  });
+
+  it('still throws from scheduleTempoChange while stopped and rejects invalid bpm', async () => {
+    const context = createMockAudioContext(0);
+    const transport = await WorkletTransport.create(context, { bpm: 120 });
+    const { commands } = createWorkletSync(transport);
+    const postedBefore = commands.length;
+
+    expect(() => transport.scheduleTempoChange(180, 10)).toThrow(
+      'transport is stopped'
+    );
+    expect(() => transport.scheduleTempoChange(0, 10)).toThrow();
+    expect(() => transport.setTempo(0)).toThrow();
+    expect(() => transport.setTempo(-1)).toThrow();
+    // Nothing reaches the worklet for rejected or stopped commands.
+    expect(commands.length).toBe(postedBefore);
+    expect(transport.bpm).toBe(120);
+
+    transport.dispose();
   });
 });
 
