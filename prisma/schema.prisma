@@ -1,0 +1,309 @@
+// Prisma schema for Phonq.
+// Database: Neon (serverless PostgreSQL). Driver adapter: @prisma/adapter-neon.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id             String          @id @default(cuid())
+  name           String?
+  email          String?         @unique
+  emailVerified  DateTime?
+  image          String?
+  accounts       Account[]
+  sessions       Session[]
+  authenticators Authenticator[]
+  playlists      Playlist[]
+  favorites      Favorite[]
+  listens        Listen[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@map("users")
+}
+
+model Account {
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@id([identifier, token])
+  @@map("verification_tokens")
+}
+
+model Authenticator {
+  credentialID         String  @id @unique
+  userId               String
+  counter              Int
+  credentialDeviceType String
+  credentialBackedUp   Boolean
+  credentialPublicKey  String?
+  user                 User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, credentialID])
+  @@map("authenticators")
+}
+
+model Playlist {
+  id          String          @id @default(cuid())
+  name        String
+  description String?
+  isPublic    Boolean         @default(true)
+  userId      String
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tracks      PlaylistTrack[]
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@index([userId])
+  @@map("playlists")
+}
+
+model PlaylistTrack {
+  playlistId String
+  trackId    String
+  position   Int
+  addedAt    DateTime @default(now())
+  playlist   Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+
+  @@id([playlistId, trackId])
+  @@index([trackId])
+  @@map("playlist_tracks")
+}
+
+model Favorite {
+  userId    String
+  trackId   String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, trackId])
+  @@index([trackId])
+  @@map("favorites")
+}
+
+model Listen {
+  id         String   @id @default(cuid())
+  userId     String
+  trackId    String
+  progress   Float    @default(0)
+  completed  Boolean  @default(false)
+  listenedAt DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, trackId])
+  @@index([userId, listenedAt])
+  @@map("listens")
+}
+
+/// Offline catalog cache. Tracks are upserted on every successful live fetch
+/// so the app can keep serving a "smaller catalog" if the upstream API goes
+/// down (Jamendo suspensions, network failures, rate limits).
+model CachedTrack {
+  id                   String   @id
+  name                 String
+  duration             Int      @default(0)
+  artistId             String?
+  artistName           String   @default("Unknown Artist")
+  albumId              String?
+  albumName            String   @default("Unknown Album")
+  audioUrl             String   @default("")
+  downloadUrl          String?
+  image                String?
+  imageSmall           String?
+  licenseName          String?
+  genre                String?
+  bpm                  Int?
+  speed                String?
+  vocalInstrumental    String?
+  tags                 String?
+  popularityWeek       Int      @default(0)
+  popularityTotal      Int      @default(0)
+  listensTotal         Int      @default(0)
+  downloadsTotal       Int      @default(0)
+  releaseDate          String?
+  audioDownloadAllowed Boolean  @default(false)
+  source               String   @default("jamendo") // "jamendo" | "youtube"
+  /// Set when `source` is "youtube": the YouTube video id used for playback via
+  /// the IFrame Player API (no direct audio stream exists for these tracks).
+  videoId              String?
+  cachedAt             DateTime @default(now())
+
+  @@index([cachedAt])
+  @@index([artistName])
+  @@map("cached_tracks")
+}
+
+/// YouTube lookup cache. Search results (search.list, 100 units) are stored
+/// permanently so a song's video mapping survives across users — once a song
+/// has been searched by anyone, later lookups only need a cheap videos.list
+/// (1 unit) to refresh metadata. Also stores playlist/channel-seeded items
+/// (playlistItems.list, 1 unit) for bulk backfilling genre gaps.
+model YouTubeVideo {
+  videoId      String                @id
+  title        String
+  artistName   String                @default("")
+  duration     Int                   @default(0)
+  thumbnail    String?
+  channelId    String?
+  channelTitle String?
+  embeddable   Boolean               @default(true)
+  /// Phonk subgenre slug when seeded for a genre gap, else null.
+  subgenre     String?
+  /// Where the video was discovered: "search" | "playlist" | "channel".
+  source       String                @default("search")
+  mappings     YouTubeVideoMapping[]
+  createdAt    DateTime              @default(now())
+  updatedAt    DateTime              @updatedAt
+
+  @@index([subgenre])
+  @@index([artistName])
+  @@map("youtube_videos")
+}
+
+/// song_title + artist → video_id resolution cache. The DB-first lookup skips
+/// search.list entirely on cache hits, turning the 100-search/day cap into
+/// effectively unlimited plays once the catalog is seeded.
+model YouTubeVideoMapping {
+  id        String       @id @default(cuid())
+  videoId   String
+  video     YouTubeVideo @relation(fields: [videoId], references: [videoId], onDelete: Cascade)
+  /// Normalized song title (lowercase, punctuation stripped).
+  songKey   String
+  /// Normalized artist (lowercase, punctuation stripped).
+  artistKey String
+  /// The raw search query that produced this mapping (for audit/debugging).
+  query     String
+  createdAt DateTime     @default(now())
+
+  @@unique([songKey, artistKey])
+  @@index([videoId])
+  @@map("youtube_video_mappings")
+}
+
+/// Rolling daily YouTube API quota ledger (units). Kept for backward-compatible
+/// status reporting; per-project, per-operation usage is now tracked in Redis
+/// by `youtube-pool.ts` so the 10-project quota pool is shared across
+/// instances. This row is still maintained as a durable, cross-instance roll-up.
+model YouTubeQuota {
+  id        Int    @id @default(1)
+  /// Calendar date (YYYY-MM-DD) the ledger covers.
+  date      String @unique
+  unitsUsed Int    @default(0)
+  searches  Int    @default(0)
+
+  @@map("youtube_quota")
+}
+
+/// Lean YouTube metadata catalog. Lives in a dedicated Neon DB when
+/// `YOUTUBE_DATABASE_URL` is set (isolated blast radius from user data), else in
+/// the main app DB. One row per video (~1 KB), so 500MB ≈ 400-500k songs.
+/// Thumbnails are not stored — reconstructed client-side from the video id.
+model Song {
+  videoId      String    @id @map("video_id") @db.VarChar(11)
+  title        String    @db.Text
+  artist       String    @db.Text
+  channelId    String?   @map("channel_id") @db.VarChar(24)
+  channelTitle String?   @map("channel_title") @db.Text
+  durationSec  Int       @default(0) @map("duration_sec") @db.SmallInt
+  /// Phonk subgenre slug when seeded for a genre gap, else null (general pool).
+  genreTag     String?   @map("genre_tag") @db.VarChar(32)
+  qualityScore Int       @default(0) @map("quality_score") @db.SmallInt
+  embedStatus  Boolean   @default(true) @map("embed_status")
+  lastPlayedAt DateTime? @map("last_played_at")
+  cachedAt     DateTime  @default(now()) @updatedAt @map("cached_at") @db.Timestamp(6)
+  /// "search" | "playlist" | "channel".
+  source       String    @default("search")
+
+  @@index([genreTag], name: "idx_song_genre")
+  @@index([lastPlayedAt], name: "idx_song_last_played")
+  @@index([qualityScore], name: "idx_song_quality")
+  @@map("songs")
+}
+
+/// Daily YouTube API call log (per project, per endpoint). Drives burn-rate
+/// visibility and surfaces a suspended project / runaway job before quota is
+/// silently exhausted — read by the nightly maintenance view, not hot path.
+model ApiCallLog {
+  id         BigInt   @id @default(autoincrement()) @db.BigInt
+  projectId  Int?     @map("project_id") @db.SmallInt
+  endpoint   String   @db.VarChar(32)
+  unitCost   Int      @default(1) @map("unit_cost") @db.SmallInt
+  calledAt   DateTime @default(now()) @map("called_at") @db.Timestamp(6)
+
+  @@index([projectId, calledAt])
+  @@index([calledAt])
+  @@map("api_call_log")
+}
+
+/// Daily Redis bandwidth ledger — one row per calendar date, accumulated from
+/// the in-process meter in `yt-redis` (`flushUsage()`) whenever a YouTube API
+/// call is recorded. Tracks approximate bytes read/written so the monthly
+/// Upstash egress budget (~10 GB) is visible before the provider throttles.
+model RedisUsageLog {
+  id         BigInt   @id @default(autoincrement()) @db.BigInt
+  /// Calendar date (YYYY-MM-DD) the ledger covers.
+  date       String   @unique @db.VarChar(10)
+  /// Redis operations performed that day.
+  ops        Int      @default(0)
+  /// Approximate bytes read from Redis that day.
+  readBytes  BigInt   @default(0) @map("read_bytes") @db.BigInt
+  /// Approximate bytes written to Redis that day.
+  writeBytes BigInt   @default(0) @map("write_bytes") @db.BigInt
+  /// Cache GETs that hit.
+  hits       Int      @default(0)
+  /// Cache GETs that missed.
+  misses     Int      @default(0)
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamp(6)
+
+  @@map("redis_usage_log")
+}
+
+/// Single-row catalog health/status flag. Lets the frontend and /api/health
+/// report "live | degraded | static" so clients can surface cached/fallback
+/// content proactively instead of waiting for a failed request.
+model CatalogStatus {
+  id          Int       @id @default(1)
+  provider    String    @default("live") // "live" | "degraded" | "static"
+  cacheCount  Int       @default(0)
+  lastSuccess DateTime?
+  lastFailure DateTime?
+  error       String?
+  radios      Json?
+  updatedAt   DateTime  @updatedAt
+
+  @@map("catalog_status")
+}
