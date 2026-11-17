@@ -27,7 +27,7 @@ class SoundEngine {
   private typingRate = 0; // keystrokes per second (office)
   private probing = 0; // QC stations measuring right now
   private lastShot = new Map<string, number>();
-  private prev = new Map<string, SessionState>();
+  private prev = new Map<string, SessionState>(); // live baseline for one-shot transitions
   enabled = false;
   private listeners = new Set<() => void>();
 
@@ -230,10 +230,32 @@ class SoundEngine {
   };
   private prompt = () => this.tone(523, 0, 0.12, "sine", 0.1);
 
+  /**
+   * Fade every factory machine loop in or out together (real recordings and synth
+   * stand-ins). Called on theme/mode flips so no machine keeps humming off-screen;
+   * per-machine levels are re-applied by update() right after.
+   */
+  private setFactoryLoops(on: boolean) {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const v = on && this.enabled ? 1 : 0;
+    for (const g of [this.hum, this.buzz, this.rumble, this.servo]) g.gain.setTargetAtTime(v, t, 0.3);
+    for (const m of Object.keys(SAMPLES) as Machine[]) this.samples[m]?.gain.setTargetAtTime(v, t, 0.3);
+  }
+
   /** Diff the office against the last frame: drones follow activity, one-shots follow transitions. */
   update(sessions: Record<string, SessionState>) {
     if (!this.ctx) return;
-    const factory = useOffice.getState().theme === "factory";
+    const { theme, mode } = useOffice.getState();
+    const factory = theme === "factory";
+    const live = mode === "live";
+    // Machine loops, the QC probe and the typing beat belong to the live factory floor
+    // (typing is the office stand-in, so it stays off while the factory is up). Anything
+    // else — office/robots theme, or replay — fades the machines out instead of letting
+    // an invisible line keep running.
+    const loopsOn = factory && live;
+    this.setFactoryLoops(loopsOn);
+
     const list = Object.values(sessions);
     const busy = list.filter((s) => s.status !== "idle");
     const roles = busy.map((s) => roleFor(s));
@@ -248,41 +270,51 @@ class SoundEngine {
     const level = (n: number) => (n ? 0.55 + 0.2 * (Math.min(3, n) - 1) : 0);
     const machine = (m: Machine, n: number, synth: GainNode | null, synthPer: number) => {
       const real = this.samples[m];
-      if (real) set(real, factory ? level(n) : 0);
-      if (synth) set(synth, factory && !real ? synthPer * Math.min(3, n) : 0);
+      if (real) set(real, loopsOn ? level(n) : 0);
+      if (synth) set(synth, loopsOn && !real ? synthPer * Math.min(3, n) : 0);
     };
     machine("cnc", milling + (this.samples.stepper ? 0 : printing), this.hum, 0.05);
     machine("stepper", printing, null, 0);
     machine("laser", count("bash"), this.buzz, 0.025);
-    set(this.rumble, factory && busy.length ? 0.06 : 0);
-    set(this.servo, factory ? 0.012 * Math.min(3, count("reviewer")) : 0);
-    this.probing = factory ? count("reviewer") : 0;
-    this.typingRate = factory ? 0 : 6 * Math.min(4, count("coder") + count("bash"));
+    set(this.rumble, loopsOn && busy.length ? 0.06 : 0);
+    set(this.servo, loopsOn ? 0.012 * Math.min(3, count("reviewer")) : 0);
+    this.probing = loopsOn ? count("reviewer") : 0;
+    this.typingRate = live && !factory ? 6 * Math.min(4, count("coder") + count("bash")) : 0;
 
-    if (this.enabled) {
-      for (const s of list) {
-        const p = this.prev.get(s.key);
-        if (!p) this.shot("arrive", this.arrive);
-        else {
-          if (s.turns > p.turns) this.shot("ding", this.ding);
-          if (s.failCount > p.failCount) this.shot("fail", this.fail);
-          if (s.status === "waiting" && p.status !== "waiting") this.shot("alarm", this.alarm);
-          if (p.status === "idle" && s.status === "working") this.shot("prompt", this.prompt);
-          // A check finished cleanly: the QC station moved on (next tool, other role or turn end).
-          const checked = p.status !== "idle" && roleFor(p) === "reviewer";
-          const movedOn = s.toolCount > p.toolCount || roleFor(s) !== "reviewer" || s.status === "idle";
-          if (factory && checked && movedOn && s.failCount === p.failCount && s.lastOk !== false)
-            this.shot("pass", this.pass);
+    if (live) {
+      // One-shots fire on live state transitions only. Replay frames (including seeks
+      // that jump the playhead) are tracked silently so they never re-fire chimes.
+      if (this.enabled) {
+        for (const s of list) {
+          const p = this.prev.get(s.key);
+          if (!p) this.shot("arrive", this.arrive);
+          else {
+            if (s.turns > p.turns) this.shot("ding", this.ding);
+            if (s.failCount > p.failCount) this.shot("fail", this.fail);
+            if (s.status === "waiting" && p.status !== "waiting") this.shot("alarm", this.alarm);
+            if (p.status === "idle" && s.status === "working") this.shot("prompt", this.prompt);
+            // A check finished cleanly: the QC station moved on (next tool, other role or turn end).
+            const checked = p.status !== "idle" && roleFor(p) === "reviewer";
+            const movedOn = s.toolCount > p.toolCount || roleFor(s) !== "reviewer" || s.status === "idle";
+            if (factory && checked && movedOn && s.failCount === p.failCount && s.lastOk !== false)
+              this.shot("pass", this.pass);
+          }
         }
       }
+      this.prev = new Map(list.map((s) => [s.key, s]));
     }
-    this.prev = new Map(list.map((s) => [s.key, s]));
+    // Replay frames are ignored for transitions: the live baseline above is kept frozen
+    // while replaying, so returning to live re-syncs against the current session instead
+    // of firing a chime for every frame the playhead jumped past.
   }
 }
 
 export const sound = new SoundEngine();
 useOffice.subscribe((s, prev) => {
-  if (s.sessions !== prev.sessions || s.theme !== prev.theme) sound.update(s.sessions);
+  // Theme and mode decide which loops may run at all; replay status changes can move
+  // the playhead without touching sessions, and must still re-evaluate the mix.
+  if (s.sessions !== prev.sessions || s.theme !== prev.theme || s.mode !== prev.mode || s.replay !== prev.replay)
+    sound.update(s.sessions);
 });
 
 // Remembered "on" still needs a gesture before audio may start.
