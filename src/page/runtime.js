@@ -51,12 +51,14 @@
   const drained = enc => Promise.race([new Promise(r => enc.addEventListener('dequeue', r, { once: true })), sleep(2000)]);
 
   // Where encoded chunks go. 'mediabunny' muxes the MP4 inside the page and streams it out with positional writes.
-  // 'raw' appends the Annex B bitstream for ffmpeg to wrap.
+  // 'raw' appends the Annex B bitstream for ffmpeg to wrap. `kind` says which one was actually used, so the
+  // renderer can check that every shard of a parallel render packaged its part the same way.
   async function openSink(o) {
     if (o.mux === 'raw') {
       let parts = [], size = 0;
       const flush = async () => { if (!size) return; const blob = new Blob(parts); parts = []; size = 0; await post(`${o.base}/append?id=${o.sink}`, blob); };
       return {
+        kind: 'raw',
         async add(chunk) { const b = new Uint8Array(chunk.byteLength); chunk.copyTo(b); parts.push(b); size += b.length; if (size >= 4 << 20) await flush(); },
         finish: flush,
       };
@@ -71,6 +73,7 @@
     output.addVideoTrack(source, { frameRate: o.fps });
     await output.start();
     return {
+      kind: 'mediabunny',
       // Encoders tag colour inconsistently in the bitstream (hardware H.264 not at all), so the container tag is set
       // here: BT.709 with the range the encoder reports. ffmpeg later writes the same into the bitstream.
       add: (chunk, meta) => source.add(MB.EncodedPacket.fromEncodedChunk(chunk),
@@ -115,7 +118,7 @@
     await chain;
     if (failure) throw new Error(`encode failed: ${failure.message || failure}`);
     await sink.finish();
-    return { frames, bytes, ms: performance.now() - t0, renderMs, fullRange: full };
+    return { frames, bytes, ms: performance.now() - t0, renderMs, fullRange: full, mux: sink.kind };
   }
 
   // ---- encoder probe: how fast is one encoder config at this size, with drawing kept cheap? ----

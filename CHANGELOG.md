@@ -2,6 +2,12 @@
 
 Changes are listed by release, newest first. The sections dated before 0.1.0 record what was built on the way to the first release.
 
+## Unreleased
+
+### Fixed
+
+- A parallel render whose Chrome workers disagreed on colour range (some drawing on a GPU, others in software) failed inside the Mediabunny attempt, so with `--mux auto` the whole render was encoded a second time as raw bitstream before the same vague "the workers encoded different colour ranges" came back. The range check is no longer treated as a mux failure: the render stops at once with an error that names each worker's range and suggests `--workers 1`. The workers also report how each of them actually packaged its part, and if those ever disagree (one muxed with Mediabunny in the page, another fell back to the raw bitstream) the whole render is retried once as raw — never just the diverging shards, so parts from different attempts can never mix — and the summary's mux and colour range are the ones the shards really used. Covered by `test/shards.test.js`; a failed render still removes the `.part` file and the temporary folder, which `test/render.test.js` now asserts.
+
 ## 0.2.2 (2026-11-17)
 
 ### Fixed

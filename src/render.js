@@ -67,6 +67,42 @@ async function readInfo(page, log) {
   return info;
 }
 
+// The shards of one render must agree on how they packaged their bytes and on the colour range they encoded, or
+// ffmpeg cannot join their parts into one correct MP4. shards: [{ mux, fullRange }] as the workers reported them.
+// Returns the agreed values; otherwise throws a coded error: 'mux-diverged' (the render can be retried as one
+// raw-bitstream attempt) or 'range-diverged' (a GPU-vs-software difference between workers that no retry can fix).
+export function reconcileShards(shards) {
+  const mux = shards[0].mux, fullRange = shards[0].fullRange;
+  if (shards.some(s => s.mux !== mux)) {
+    const e = new Error(`the workers packaged their parts differently (${shards.map((s, i) => `worker ${i + 1}: ${s.mux}`).join(', ')}); the parts cannot be joined into one video`);
+    e.code = 'mux-diverged';
+    throw e;
+  }
+  if (shards.some(s => s.fullRange !== fullRange)) {
+    const e = new Error(`the workers encoded different colour ranges (${shards.map((s, i) => `worker ${i + 1}: ${s.fullRange ? 'full' : 'limited'}`).join(', ')}): some workers drew on a GPU and others in software. Re-run with --workers 1 or give every worker the same GPU.`);
+    e.code = 'range-diverged';
+    throw e;
+  }
+  return { mux, fullRange };
+}
+
+// Runs the encode attempts of one render. Every attempt encodes ALL shards the same way; when the first attempt
+// cannot produce uniform parts, the whole render is retried once with the raw bitstream path — never just the
+// diverging shards, so parts from different attempts can never mix. A colour-range disagreement is not retried:
+// it comes from the workers' GPUs, not from the muxer, and a second attempt would diverge the same way.
+export async function encodeWithFallback(attempt, { want, signal, log }) {
+  try { return await attempt(want === 'raw' ? 'raw' : 'mediabunny'); }
+  catch (e) {
+    if (want !== 'auto' || signal?.aborted || e.code === 'range-diverged') throw e;
+    // Without the npm package the page only says it "failed to fetch" mediabunny.mjs, so the cause is named here.
+    const why = e.code === 'mux-diverged' ? e.message
+      : hasMediabunny() ? e.message.split('\n')[0]
+      : `mediabunny is not installed: run npm ci in ${fileURLToPath(new URL('..', import.meta.url))}`;
+    log(`\nMediabunny path failed (${why}). Retrying the whole render with raw bitstream and ffmpeg.`);
+    return await attempt('raw');
+  }
+}
+
 export async function renderVideo(o) {
   const log = o.log || console.log, fps = o.fps ?? 24, scale = o.scale ?? 2, workers = Math.max(1, o.workers ?? 1), started = Date.now();
   const { root, url } = locate(o), out = resolve(o.out), part = out + '.part';   // written here first, renamed when complete
@@ -101,7 +137,8 @@ export async function renderVideo(o) {
     const ext = enc.codec === 'hevc' ? 'h265' : 'h264';
     // Each worker writes its own part into the temp folder: an MP4 muxed in the page by Mediabunny, or a raw Annex B
     // stream. ffmpeg then stream-copies the parts into the final file, which is where the colour tags are written
-    // into the bitstream, parallel parts are joined and audio is added.
+    // into the bitstream, parallel parts are joined and audio is added. Before that, reconcileShards checks that
+    // every shard really used the same muxer and encoded the same colour range.
     const attempt = async mux => {
       const jobs = [];
       for (let i = 0; i < ranges.length; i++) jobs.push(await server.createSink(join(tmp, `${mux}-${i}.${mux === 'raw' ? ext : 'mp4'}`)));
@@ -112,28 +149,19 @@ export async function renderVideo(o) {
           keyInterval: Math.max(1, Math.round(fps * 2)) })})`)));
       } catch (e) { o.signal?.throwIfAborted(); throw e; } finally { await Promise.all(jobs.map(j => j.close())); }
       const encodeMs = Date.now() - t0;
+      const agreed = reconcileShards(stats.map(s => ({ mux: s.mux ?? mux, fullRange: s.fullRange })));
       let inputs = jobs.map(j => j.path);
-      if (mux === 'raw' && inputs.length > 1) {   // Annex B streams join by plain concatenation
+      if (agreed.mux === 'raw' && inputs.length > 1) {   // Annex B streams join by plain concatenation
         const all = join(tmp, `all.${ext}`), w = createWriteStream(all);
         for (const p of inputs) await pipeline(createReadStream(p), w, { end: false });
         await new Promise(r => w.end(r)); inputs = [all];
       }
-      const fullRange = stats[0].fullRange;
-      if (stats.some(s => s.fullRange !== fullRange)) throw new Error('the workers encoded different colour ranges');
-      await finalize({ inputs, raw: mux === 'raw', codec: enc.codec, fps, audio: o.audio && resolve(o.audio), out: part, duration: frames / fps, tmp, signal: o.signal, fullRange });
-      return { mux, encodeMs, stats, fullRange };
+      await finalize({ inputs, raw: agreed.mux === 'raw', codec: enc.codec, fps, audio: o.audio && resolve(o.audio), out: part, duration: frames / fps, tmp, signal: o.signal, fullRange: agreed.fullRange });
+      return { mux: agreed.mux, encodeMs, stats, fullRange: agreed.fullRange };
     };
 
     mkdirSync(dirname(out), { recursive: true });
-    let res; const want = o.mux || 'auto';
-    try { res = await attempt(want === 'raw' ? 'raw' : 'mediabunny'); }
-    catch (e) {
-      if (want !== 'auto' || o.signal?.aborted) throw e;
-      // Without the npm package the page only says it "failed to fetch" mediabunny.mjs, so the cause is named here.
-      const why = hasMediabunny() ? e.message.split('\n')[0] : `mediabunny is not installed: run npm ci in ${fileURLToPath(new URL('..', import.meta.url))}`;
-      log(`\nMediabunny path failed (${why}). Retrying with raw bitstream and ffmpeg.`);
-      res = await attempt('raw');
-    }
+    const res = await encodeWithFallback(attempt, { want: o.mux || 'auto', signal: o.signal, log });
     if (process.stdout.isTTY) process.stdout.write('\r');
     rmSync(out, { force: true }); renameSync(part, out);
 

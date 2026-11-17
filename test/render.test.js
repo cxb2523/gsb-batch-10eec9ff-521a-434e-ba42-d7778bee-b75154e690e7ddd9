@@ -73,7 +73,9 @@ test('events: window.EVENTS is written as JSON', async () => {
   assert.deepEqual(JSON.parse(readFileSync(out, 'utf8')), [{ name: 'hit', t: 0.5 }]);
 });
 test('a page without the contract fails with a clear message', async () => {
-  await assert.rejects(renderVideo({ page: fileURLToPath(new URL('../package.json', import.meta.url)), out: join(dir, 'x.mp4'), ...quiet }), /renderAt/);
+  const out = join(dir, 'x.mp4');
+  await assert.rejects(renderVideo({ page: fileURLToPath(new URL('../package.json', import.meta.url)), out, ...quiet }), /renderAt/);
+  assert.ok(!existsSync(out) && !existsSync(out + '.part'));   // a failed render leaves nothing half-written behind
 });
 
 test('project: a transition overlaps two scenes and mixes them on the frame grid', async () => {
