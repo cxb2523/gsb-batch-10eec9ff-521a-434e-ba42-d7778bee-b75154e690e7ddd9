@@ -134,6 +134,9 @@ export default function player(state = initialState, action) {
                 fromServer: false,
                 playing: false,
                 time: 0,
+                duration: null,
+                loaded: false,
+                authorized: true,
                 subtitles: state.url ? [] : state.subtitles,
             };
 
@@ -146,6 +149,9 @@ export default function player(state = initialState, action) {
                 fromServer: false,
                 playing: false,
                 time: 0,
+                duration: null,
+                loaded: false,
+                authorized: true,
                 subtitles: state.url ? [] : state.subtitles,
             };
 
@@ -160,6 +166,9 @@ export default function player(state = initialState, action) {
                 fromServer: false,
                 playing: false,
                 time: 0,
+                duration: null,
+                loaded: false,
+                authorized: true,
                 subtitles: state.url ? [] : state.subtitles,
             };
 
@@ -171,6 +180,9 @@ export default function player(state = initialState, action) {
                 name: payload.name,
                 source: payload.source,
                 fromServer: true,
+                duration: null,
+                loaded: false,
+                authorized: true,
             };
 
         case PLAYER_COMPLETE_FROM_FILE:

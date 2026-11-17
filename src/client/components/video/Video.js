@@ -81,6 +81,7 @@ export default class Video extends Component {
             promise = this.element.play();
         } catch (error) {
             this.onNotAuthorized(error);
+            return;
         }
 
         if (promise) {
