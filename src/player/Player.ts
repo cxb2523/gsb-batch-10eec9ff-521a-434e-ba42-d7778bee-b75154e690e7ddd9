@@ -220,6 +220,13 @@ export class Player<TTrack extends TrackData = TrackData> {
   private _voiceStateSent: boolean = false;
   private _paused: boolean = false;
   private _destroyed: boolean = false;
+  /**
+   * State captured during a node move that could not yet be delivered to the
+   * target node (its Lavalink session is not established). The next resync()
+   * or playTrack() flushes it, so filters/position survive a migration even
+   * when the destination session comes up only after the move completed.
+   */
+  private _pendingNodeMigration: { resumePosition: number; trackEncoded: string | null } | null = null;
   private _loudnessNormalizer: boolean = false;
   private _ducking: boolean = false;
   private _fading: FadingSettings | null = null;
@@ -820,9 +827,37 @@ export class Player<TTrack extends TrackData = TrackData> {
     return this.currentTrack;
   }
 
-  /** Reassigns player to a new Lavalink node (for node failover / load balancing) */
+  /**
+   * Reassigns player to a new Lavalink node (node failover / load balancing).
+   *
+   * Migration contract:
+   * - The current playback position and the active filter set are captured
+   *   *before* the move; filters the target node genuinely cannot run are the
+   *   only ones removed — every surviving filter is re-applied on the new node.
+   * - An actively playing track resumes from its old position instead of
+   *   restarting; a paused track stays paused.
+   * - A failure to destroy the player on the old node never blocks the new
+   *   node from taking over.
+   * - When the target node has no session yet, the pending position (and the
+   *   filters held in the chain) are stashed and delivered by a later
+   *   resync()/playTrack() instead of being lost.
+   * - If the current track cannot be started on the new node, the player's
+   *   status and queue are preserved and the error is rethrown to the caller —
+   *   the player never silently collapses to idle.
+   */
   public async setNode(node: Node): Promise<void> {
     const oldNode = this._node;
+    if (oldNode === node) return;
+
+    // Capture the pre-move snapshot before anything can mutate it. The filter
+    // chain itself is the source of truth for filters: unsupported ones are
+    // pruned below, everything still in the chain must be re-applied on the
+    // target node (playTrack/resync always send the whole chain payload).
+    const wasPlaying = this._status === "playing" || this._status === "paused";
+    const wasPaused = this._paused;
+    const currentTrack = this.currentTrack;
+    const resumePosition = this.position;
+
     this.removeNodeListeners();
     this._node = node;
     this.setupNodeListeners();
@@ -833,20 +868,66 @@ export class Player<TTrack extends TrackData = TrackData> {
     this._voiceStateSent = false;
 
     // Moving between server families can leave filters the target can't run
-    // (e.g. NodeLink extras onto a Lavalink node). Drop them gracefully — a
-    // failover the user didn't initiate must degrade, not throw.
+    // (e.g. NodeLink extras onto a Lavalink node). Only the unsupported ones
+    // are dropped — supported filters stay active and get re-sent below.
     this.dropUnsupportedFilters(node);
 
-    // Clean up player state on old node so it stops streaming audio
-    if (oldNode.state === "connected" && oldNode.rest.sessionId != null) {
-      await oldNode.rest.destroyPlayer(oldNode.rest.sessionId, this.guildId).catch(() => undefined);
+    if (wasPlaying && currentTrack != null) {
+      this._pendingNodeMigration = {
+        resumePosition,
+        trackEncoded: currentTrack.encoded,
+      };
     }
 
-    if (this._status === "playing" && this.currentTrack != null) {
-      await this.playTrack(this.currentTrack, { position: this.position });
+    // Clean up player state on old node so it stops streaming audio. A failed
+    // destroy (dead socket, 5xx, …) must not abort the takeover — the old node
+    // is already abandoned and the player belongs to the new one now.
+    if (oldNode.state === "connected" && oldNode.rest.sessionId != null) {
+      await oldNode.rest.destroyPlayer(oldNode.rest.sessionId, this.guildId).catch((err: unknown) => {
+        this.events.emit(
+          "debug",
+          `Ignoring failed player destroy on old node ${oldNode.id} during migration: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
+    }
+
+    if (node.rest.sessionId == null) {
+      // The destination session does not exist yet. Do not throw the state
+      // away: the stashed position and the retained filters are flushed as
+      // soon as a resync() (nodeReady after reconnect) or the next
+      // playTrack() can reach the session.
+      this.events.emit(
+        "debug",
+        `Player for guild ${this.guildId} migrated to node ${node.id} before its session was ready — ` +
+          `position/filters will be applied on the next resync or playTrack`,
+      );
+      return;
+    }
+
+    if (wasPlaying && currentTrack != null) {
+      // Resume on the new node from the exact position captured pre-move.
+      // Forward the pause flag explicitly so a paused track doesn't restart
+      // audibly on the replacement node. playTrack() restores the prior
+      // status on failure rather than going idle; rethrow so the caller
+      // learns the track did not start there.
+      await this.playTrack(currentTrack, { position: resumePosition, paused: wasPaused });
+      if (wasPaused) {
+        this._status = "paused";
+      }
     } else {
-      // Not playing — still register the player (voice + volume/filters) on the new node
-      await this.resync().catch(() => undefined);
+      // Not playing — still register the player (voice + volume/filters) on
+      // the new node. resync() failures are non-fatal here: nothing audible
+      // was interrupted, and a later resync retries the full state.
+      await this.resync().catch((err: unknown) => {
+        this.events.emit(
+          "debug",
+          `Player resync after migration to node ${node.id} failed (will retry): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
     }
   }
 
@@ -854,7 +935,8 @@ export class Player<TTrack extends TrackData = TrackData> {
    * Removes any active filter the target node can't run, emitting a debug line
    * per dropped filter. Used on node moves so cross-family failover
    * (NodeLink ↔ Lavalink) never sends an unknown filter that the node ignores
-   * or rejects.
+   * or rejects. Every filter that survives this check remains in the chain and
+   * is re-applied to the new node by the following playTrack()/resync().
    */
   private dropUnsupportedFilters(node: Node): void {
     for (const filter of this.filters.getAll()) {
@@ -1226,6 +1308,9 @@ export class Player<TTrack extends TrackData = TrackData> {
     // The resumed session already holds working voice credentials — pushing
     // our stale pre-restart ones would kill the live connection
     this._voiceStateSent = true;
+    // The node's own live state supersedes any position held over from a
+    // migration that hadn't reached a session yet
+    this._pendingNodeMigration = null;
   }
 
   private scheduleQueueSave(): void {
@@ -1402,6 +1487,17 @@ export class Player<TTrack extends TrackData = TrackData> {
     const filterPayload = this.filters.toPayload();
     const hasFilterKeys = Object.keys(filterPayload).length > 0;
 
+    // A node move that happened while the target had no session stashed the
+    // resume position. Honor it when no explicit position was given for this
+    // request and the requested track is the one that was playing at the time.
+    const pendingMigration = this._pendingNodeMigration;
+    const effectivePosition =
+      options?.position ??
+      (pendingMigration != null &&
+      (pendingMigration.trackEncoded == null || pendingMigration.trackEncoded === track.encoded)
+        ? pendingMigration.resumePosition
+        : undefined);
+
     // Claim "playing" synchronously so a second play() racing this one
     // sees a non-idle status instead of starting a duplicate playback
     const previousStatus = this._status;
@@ -1440,7 +1536,7 @@ export class Player<TTrack extends TrackData = TrackData> {
             ...(options?.audioTrackId != null ? { audioTrackId: options.audioTrackId } : {}),
             ...(options?.language != null ? { language: options.language } : {}),
           },
-          position: options?.position,
+          position: effectivePosition,
           endTime: options?.endTime,
           volume,
           paused,
@@ -1462,9 +1558,12 @@ export class Player<TTrack extends TrackData = TrackData> {
       // playing, so only reset when this request actually adopted the track.
       const playingEncoded = playerState?.track?.encoded ?? null;
       if (playingEncoded == null || playingEncoded === track.encoded) {
-        this._position = options?.position ?? 0;
+        this._position = effectivePosition ?? 0;
         this._positionTimestamp = Date.now();
       }
+      // The node accepted playback — any state held over from a node move has
+      // now been delivered and must not leak into a later play() call.
+      this._pendingNodeMigration = null;
       this.cancelQueueEmptyDestroy();
     } catch (error) {
       // Restore the exact prior status — if a previous track was still playing
@@ -1490,6 +1589,7 @@ export class Player<TTrack extends TrackData = TrackData> {
     this._paused = false;
     this._position = 0;
     this._positionTimestamp = Date.now();
+    this._pendingNodeMigration = null;
   }
 
   /** Pauses current track playback (no-op when already paused) */
@@ -2157,6 +2257,17 @@ export class Player<TTrack extends TrackData = TrackData> {
     const filterPayload = this.filters.toPayload();
     const hasFilterKeys = Object.keys(filterPayload).length > 0;
 
+    // A node move made before the target session existed stashed the exact
+    // position to resume from. Prefer it over the (possibly stale)
+    // interpolated position while that migration is still pending.
+    const pendingMigration = this._pendingNodeMigration;
+    const resumePosition =
+      pendingMigration != null &&
+      current != null &&
+      (pendingMigration.trackEncoded == null || pendingMigration.trackEncoded === current.encoded)
+        ? pendingMigration.resumePosition
+        : this.position;
+
     await this._node.rest.updatePlayer(sessionId, this.guildId, {
       voice: {
         token: token!,
@@ -2167,7 +2278,7 @@ export class Player<TTrack extends TrackData = TrackData> {
       ...(current != null
         ? {
             track: { encoded: current.encoded },
-            position: this.position,
+            position: resumePosition,
             paused: this._paused,
           }
         : {}),
@@ -2179,6 +2290,12 @@ export class Player<TTrack extends TrackData = TrackData> {
       ...(this._crossfade != null ? { crossfade: this._crossfade } : {}),
     });
     this._voiceStateSent = true;
+    // State from the node move has now reached the session — drop the stash.
+    this._pendingNodeMigration = null;
+    if (current != null) {
+      this._position = resumePosition;
+      this._positionTimestamp = Date.now();
+    }
   }
 
   /** Replaces complete internal voice connection state */

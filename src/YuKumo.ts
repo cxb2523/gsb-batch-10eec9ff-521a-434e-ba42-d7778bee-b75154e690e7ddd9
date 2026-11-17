@@ -227,8 +227,8 @@ export class YuKumo {
     this.playerDefaults = {
       maxErrorsPerTime:
         options.playerDefaults?.maxErrorsPerTime !== undefined
-            ? options.playerDefaults.maxErrorsPerTime
-            : { threshold: 35000, maxAmount: 3 },
+          ? options.playerDefaults.maxErrorsPerTime
+          : { threshold: 35000, maxAmount: 3 },
       minAutoPlayMs: options.playerDefaults?.minAutoPlayMs ?? 10000,
       queueEmptyDestroyMs: options.playerDefaults?.queueEmptyDestroyMs ?? 0,
       autoplay: options.playerDefaults?.autoplay ?? false,
@@ -487,7 +487,10 @@ export class YuKumo {
       .filter((p) => !p.destroyed)
       .map((p) => p.toJSON());
 
-    const voiceStates: Record<string, { channelId: string | null; sessionId: string | null; endpoint: string | null; token: string | null }> = {};
+    const voiceStates: Record<
+      string,
+      { channelId: string | null; sessionId: string | null; endpoint: string | null; token: string | null }
+    > = {};
     for (const state of this.voice.getAll()) {
       voiceStates[state.guildId] = {
         channelId: state.channelId,
@@ -654,9 +657,7 @@ export class YuKumo {
     // Determine if fallback search should run:
     // Direct URLs and explicit URIs (e.g. https://, http://, spotify:) are never fallback-searched
     const isDirectUri = /^https?:\/\//i.test(resolved.query) || /^[a-zA-Z0-9]+:/.test(resolved.query);
-    const fallbacks = resolved.disableFallback !== true
-      ? (resolved.fallback ?? this.searchFallback)
-      : [];
+    const fallbacks = resolved.disableFallback !== true ? (resolved.fallback ?? this.searchFallback) : [];
 
     if (isDirectUri || fallbacks.length === 0) {
       return primaryResult;
@@ -1343,8 +1344,16 @@ export class YuKumo {
     for (const player of affectedPlayers) {
       const replacementNode = this.nodes.pick(player.guildId);
       if (replacementNode != null && replacementNode.id !== failedNodeId) {
-        player.setNode(replacementNode).catch(() => {
-          // failover migration error
+        player.setNode(replacementNode).catch((err: unknown) => {
+          // The player keeps its state (track/filters/position) on the
+          // replacement node and can be recovered via resync/playTrack — make
+          // the failed takeover visible instead of swallowing it silently.
+          this.events.emit(
+            "debug",
+            `Failover of player for guild ${player.guildId} to node ${replacementNode.id} failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
         });
         this.events.emit("playerMove", player.guildId, failedNodeId, replacementNode.id);
       }
