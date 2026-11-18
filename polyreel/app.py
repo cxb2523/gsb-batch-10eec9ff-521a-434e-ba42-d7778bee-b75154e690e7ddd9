@@ -27,6 +27,8 @@ from .ui import BAR_HEIGHT, CloseButton, Drawer, TileControls, TrafficLight, lig
 
 HOVER_ZONE = 24        # px from the bottom edge that reveals the drawer
 HIDE_DELAY_MS = 700
+RESIZE_DEBOUNCE_MS = 200   # re-solve only after the window size settles
+SCHEDULE_DEBOUNCE_MS = 120  # coalesce bursts of queue changes before a re-solve
 SHUTDOWN_WAIT = 2.0    # seconds to wait for players to stop when closing
 START_PARALLEL = 4     # videos opening at once; the next starts when one is up
 START_GIVE_UP = 10.0   # ...or when one has been opening this long
@@ -142,6 +144,14 @@ class MainWindow(QMainWindow):
         self._last_double_click = 0.0
         self._planning = False        # a plan is being worked out in the background
         self._replan = False          # something changed meanwhile: plan again after it
+        # Bumped on every playlist/settings change; a plan snapshots it so a
+        # result that arrives after another change can never be applied to
+        # state it was not computed for.
+        self._state_version = 0
+        # True while a resize drag's debounce is still running: results that
+        # come back then are held back instead of being applied for a frame to
+        # a size the user has already dragged past.
+        self._resizing = False
         self._planned.connect(self._apply_plan)
         self._beat_timer = QTimer(self, interval=100)   # performance log: is the window responsive?
         self._beat_timer.timeout.connect(PROFILER.beat)
@@ -159,7 +169,11 @@ class MainWindow(QMainWindow):
         self._skipped = 0
         self._skipped_timer = QTimer(self, singleShot=True, interval=800)
         self._skipped_timer.timeout.connect(self._report_skipped)
-        self._schedule_timer = QTimer(self, singleShot=True, interval=120)
+        # One coalescing timer for every reason to re-solve.  A resize drag
+        # restarts it with a longer debounce (one solve for the final size);
+        # queue/settings changes use the shorter one.  Because the timer is
+        # restarted rather than added to, the two can never fight each other.
+        self._schedule_timer = QTimer(self, singleShot=True, interval=SCHEDULE_DEBOUNCE_MS)
         self._schedule_timer.timeout.connect(self.schedule)
         self._lists_timer = QTimer(self, singleShot=True, interval=150)
         self._lists_timer.timeout.connect(self._refresh_lists)
@@ -308,7 +322,15 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- scheduling
     def schedule_soon(self) -> None:
-        self._schedule_timer.start()
+        """Re-solve shortly, coalescing bursts of playlist/settings changes."""
+        self._schedule_timer.start(SCHEDULE_DEBOUNCE_MS)
+
+    def schedule_after_resize(self) -> None:
+        """Re-solve once the window size has stopped changing.  While the
+        user keeps dragging, every resize event pushes this out, so a long
+        continuous resize produces a single solve for the final size."""
+        self._resizing = True
+        self._schedule_timer.start(RESIZE_DEBOUNCE_MS)
 
     def full_size(self) -> tuple[int, int]:
         return max(1, self.stage.width()), max(1, self.stage.height())
@@ -328,13 +350,21 @@ class MainWindow(QMainWindow):
         """Bump what no longer fits, start what does, and lay everything out.
 
         Working out the plan can take a moment with a big wall, so it runs on
-        a background thread and is applied when ready (unless things changed
-        in the meantime, in which case it is worked out again)."""
+        a background thread and is applied when ready.  A plan snapshots
+        everything it depends on (playlist contents and order, stage size,
+        settings and a state version); before the result is applied it is
+        re-checked against the current state, and any plan that has gone stale
+        in the meantime is discarded and replaced, so an old result is never
+        briefly applied on top of a newer state."""
         if self.bench or self.focus_tile or self._results_open or self._bench_pending:
             return
         if self._planning:
+            # Keep a single re-solve pending; its inputs are read from the
+            # live state when it runs, so it always covers the latest change.
             self._replan = True
             return
+        # Fired by the (debounced) timer: the size/state has settled.
+        self._resizing = False
         s = self.settings
         w, h = self.stage_size()
         args = (list(self.pl.playing), list(self.pl.queued), w, h, s.max_streams, s.min_area, s.lookahead)
@@ -358,9 +388,14 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, daemon=True, name="plan").start()
 
     def _plan_inputs(self) -> tuple:
-        """What a plan depends on, to tell whether it is still current."""
+        """What a plan depends on, to tell whether it is still current.
+
+        The state version covers every playlist change (adds, removals,
+        reordering, skips, probing results); listing the ids and their order
+        makes the tuple self-describing and catches any mismatch directly."""
         s = self.settings
-        return (tuple(it.id for it in self.pl.playing), tuple(it.id for it in self.pl.queued),
+        return (self._state_version,
+                tuple(it.id for it in self.pl.playing), tuple(it.id for it in self.pl.queued),
                 self.stage_size(), s.max_streams, s.min_area, s.lookahead, s.crop)
 
     def _apply_plan(self, result: tuple) -> None:
@@ -368,19 +403,36 @@ class MainWindow(QMainWindow):
         self._planning = False
         if p is None:
             return
-        if (self._replan or inputs != self._plan_inputs()
+        if (self._replan or self._resizing or inputs != self._plan_inputs()
                 or self.bench or self.focus_tile or self._results_open):
             self._replan = False
-            PROFILER.log("plan", "out of date when ready; planning again")
-            self.schedule_soon()
+            if self._schedule_timer.isActive():
+                # A change is still being debounced (typically a resize drag
+                # in progress): the pending timer covers the current state, so
+                # don't start another solve for an intermediate state.  This
+                # also keeps a result that finished just before the settle
+                # point from being briefly applied to a size already passed.
+                PROFILER.log("plan", "out of date when ready; waiting for the pending re-solve")
+            else:
+                PROFILER.log("plan", "out of date when ready; planning again")
+                self.schedule_soon()
             return
         s = self.settings
         for it in p.demote:
+            # The staleness check above guarantees the playlist has not
+            # changed since the plan was made; guard anyway so a stray result
+            # can never desync the tiles from the playlists.
+            if it not in self.pl.playing or it.id not in self.tiles:
+                PROFILER.log("plan", f"stale demote of {it.name} ignored")
+                continue
             tile = self.tiles.pop(it.id)
             pos = tile.position()
             self._release(tile)
             self.pl.demote(it, pos)
         for it in p.start:
+            if it not in self.pl.queued or it.id in self.tiles:
+                PROFILER.log("plan", f"stale start of {getattr(it, 'name', it)} ignored")
+                continue
             self.pl.start(it)
             tile = self._acquire()
             self.tiles[it.id] = tile
@@ -478,8 +530,12 @@ class MainWindow(QMainWindow):
         elif self.bench and self.bench.layout:
             self._bench_layout()
         else:
-            self._apply_layout(animate=False)   # stretch now, re-solve shortly
-            self.schedule_soon()
+            # Stretch the existing wall to every intermediate size instantly
+            # (no re-solve, so tiles don't jump while the window is dragged),
+            # and re-solve once for the final size only after the size stops
+            # changing.
+            self._apply_layout(animate=False)
+            self.schedule_after_resize()
         self._place_overlays()
 
     # ------------------------------------------------------------- tile events
@@ -629,6 +685,7 @@ class MainWindow(QMainWindow):
             if it:
                 self.pl.remove(it)
         self._update_message()
+        self.schedule_soon()
 
     def show_menu(self, global_pos, tile: VideoTile | None) -> None:
         m = QMenu(self)
@@ -866,6 +923,9 @@ class MainWindow(QMainWindow):
             self._skip_id(tile.item.id)
 
     def _lists_changed(self) -> None:
+        # Every playlist mutation (add, remove, reorder, start, demote,
+        # finish, probing metadata) invalidates any plan in flight.
+        self._state_version += 1
         if not self._lists_timer.isActive():
             self._lists_timer.start()
 
