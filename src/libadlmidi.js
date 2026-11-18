@@ -76,6 +76,22 @@ export { Emulator, TrackOption };
  * @property {boolean} [deepTremolo] - Enable deep tremolo
  */
 
+/**
+ * Result of applying a runtime {@link AdlMidi#configure} call.
+ *
+ * `requested` mirrors the capacity values that were sent in the configure
+ * message; `obtained` holds the values libADLMIDI actually granted, which may
+ * be lower when a request exceeds the implementation's limits. Only the
+ * capacity keys present in the configure settings are included.
+ * @typedef {Object} ConfigureResult
+ * @property {Object} requested - Requested capacity settings
+ * @property {number} [requested.numChips] - Requested number of chips
+ * @property {number} [requested.numFourOpChannels] - Requested number of 4-op channels
+ * @property {Object} obtained - Actually granted capacity settings
+ * @property {number} [obtained.numChips] - Obtained number of chips
+ * @property {number} [obtained.numFourOpChannels] - Obtained number of 4-op channels
+ */
+
 export class AdlMidi {
     /** @type {boolean} */
     #ready = false;
@@ -408,13 +424,26 @@ export class AdlMidi {
     }
 
     /**
-     * Configure synth settings at runtime
+     * Configure synth settings at runtime.
+     *
+     * Capacity settings (numChips / numFourOpChannels) are applied via a
+     * controlled sequence that releases held notes and re-synchronizes the
+     * playback state, so the new topology takes effect without tearing down
+     * the audio stream. The resolved result separates the requested capacity
+     * from the capacity actually granted by libADLMIDI, which can also be
+     * queried via getNumChipsObtained() / getNumFourOpChannelsObtained().
+     *
      * @param {ConfigureSettings} settings - Settings object
-     * @returns {Promise<void>}
+     * @returns {Promise<ConfigureResult>} Requested vs. obtained capacity
      */
     async configure(settings) {
         return new Promise((resolve) => {
-            this.#onceMessage('configured', () => resolve());
+            this.#onceMessage('configured',
+                /** @param {{requested?: Object, obtained?: Object}} msg */
+                (msg) => resolve({
+                    requested: msg.requested || {},
+                    obtained: msg.obtained || {}
+                }));
             this.#send({ type: 'configure', settings });
         });
     }

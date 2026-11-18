@@ -130,6 +130,96 @@ class AdlMidiProcessor extends AudioWorkletProcessor {
         }
     }
 
+    /**
+     * Apply a capacity change (chip count and/or 4-op channel count) through
+     * a controlled sequence so it takes effect without interrupting the audio
+     * stream.
+     *
+     * libADLMIDI may be unable to satisfy the requested capacity (hardware /
+     * memory limits). Held notes and already-allocated channels would
+     * otherwise keep the new topology from being applied cleanly, producing
+     * stuck notes and scrambled channel allocation. To avoid that:
+     *   1. panic() releases every held note / channel occupancy.
+     *   2. the requested capacity is written to WASM.
+     *   3. rt_resetState() re-synchronizes the real-time playback state with
+     *      the new channel topology.
+     *
+     * The play mode (realtime/file) is intentionally left untouched, and the
+     * audio render loop keeps running, so the stream itself is not torn down.
+     *
+     * @param {{numChips?: number, numFourOpChannels?: number}} settings
+     */
+    applyCapacityChange(settings) {
+        if (!this.midi) return;
+
+        this.adl._adl_panic(this.midi);
+
+        if (settings.numChips !== undefined) {
+            this.adl._adl_setNumChips(this.midi, settings.numChips);
+        }
+        if (settings.numFourOpChannels !== undefined) {
+            this.adl._adl_setNumFourOpsChn(this.midi, settings.numFourOpChannels);
+        }
+
+        // Re-sync real-time playback state with the new topology so no
+        // residual key presses / channel allocations survive.
+        this.adl._adl_rt_resetState(this.midi);
+    }
+
+    /**
+     * Apply a runtime configure message through the controlled path.
+     *
+     * The emulator switch (when requested) still happens first, exactly as in
+     * {@link applySettings}, because adl_switchEmulator performs a partial
+     * reset. Capacity settings (numChips / numFourOpChannels) are then
+     * detached from the regular flow and applied via
+     * {@link applyCapacityChange}; the remaining settings keep the exact
+     * order used by {@link applySettings}.
+     *
+     * @param {object} settings - Settings from the configure message
+     * @returns {{requested: object, obtained: object}} Requested values from
+     *   the message versus the values actually granted by libADLMIDI. Only
+     *   capacity keys present in `settings` are included.
+     */
+    reconfigure(settings) {
+        const requested = {};
+        const obtained = {};
+
+        // Emulator first: adl_switchEmulator performs a partialReset, so it
+        // must precede the other settings (unchanged from applySettings).
+        if (settings.emulator !== undefined) {
+            this.adl._adl_switchEmulator(this.midi, settings.emulator);
+        }
+
+        const hasCapacityChange =
+            settings.numChips !== undefined ||
+            settings.numFourOpChannels !== undefined;
+
+        if (hasCapacityChange) {
+            this.applyCapacityChange(settings);
+
+            if (settings.numChips !== undefined) {
+                requested.numChips = settings.numChips;
+                obtained.numChips = this.adl._adl_getNumChipsObtained(this.midi);
+            }
+            if (settings.numFourOpChannels !== undefined) {
+                requested.numFourOpChannels = settings.numFourOpChannels;
+                obtained.numFourOpChannels = this.adl._adl_getNumFourOpsChnObtained(this.midi);
+            }
+        }
+
+        // All other settings still apply in the existing order; the emulator
+        // and capacity branches above are skipped here as they were handled.
+        this.applySettings({
+            bank: settings.bank,
+            softPan: settings.softPan,
+            deepVibrato: settings.deepVibrato,
+            deepTremolo: settings.deepTremolo,
+        });
+
+        return { requested, obtained };
+    }
+
     // ================== Instrument Editing API ==================
 
     // Structure sizes (imported from shared utils)
@@ -332,12 +422,22 @@ class AdlMidiProcessor extends AudioWorkletProcessor {
                 this.adl._adl_panic(this.midi);
                 break;
 
-            case 'configure':
-                // Update settings at runtime
+            case 'configure': {
+                // Update settings at runtime through the controlled path:
+                // capacity changes get their notes/occupancy cleared and the
+                // playback state re-synced, while other settings keep their
+                // existing application order.
                 Object.assign(this.settings, msg.settings);
-                this.applySettings(msg.settings);
-                this.port.postMessage({ type: 'configured' });
+                const result = this.reconfigure(msg.settings);
+                // Report requested vs. actually granted capacity so the main
+                // thread can tell them apart (libADLMIDI may clamp values).
+                this.port.postMessage({
+                    type: 'configured',
+                    requested: result.requested,
+                    obtained: result.obtained
+                });
                 break;
+            }
 
             case 'loadBankData':
                 this.loadBankData(msg.data);
@@ -362,11 +462,15 @@ class AdlMidiProcessor extends AudioWorkletProcessor {
             }
 
             case 'setNumChips':
-                this.adl._adl_setNumChips(this.midi, msg.chips);
+                // Use the controlled path so held notes / channel occupancy
+                // cannot prevent the new topology from taking effect.
+                this.settings.numChips = msg.chips;
+                this.applyCapacityChange({ numChips: msg.chips });
                 break;
 
             case 'setNumFourOpChannels':
-                this.adl._adl_setNumFourOpsChn(this.midi, msg.channels);
+                this.settings.numFourOpChannels = msg.channels;
+                this.applyCapacityChange({ numFourOpChannels: msg.channels });
                 break;
 
             case 'getNumFourOpChannels':

@@ -247,7 +247,12 @@ export class AdlMidiCore {
     /**
      * Get the number of 4-operator channels.
      *
-     * @returns {number} Count of channels
+     * This is the requested channel count (the last value passed to
+     * {@link setNumFourOpChannels} or {@link configure}). Use
+     * {@link getNumFourOpChannelsObtained} for the effective count actually
+     * granted by libADLMIDI.
+     *
+     * @returns {number} Requested channel count
      */
     getNumFourOpChannels() {
         this._ensurePlayer();
@@ -257,11 +262,104 @@ export class AdlMidiCore {
     /**
      * Get the number of 4-operator channels obtained.
      *
-     * @returns {number} Count of channels obtained
+     * This is the effective 4-op channel count actually granted by
+     * libADLMIDI, which may be lower than the requested count (or the value
+     * resolved for an auto request of -1).
+     *
+     * @returns {number} Effectively obtained channel count
      */
     getNumFourOpChannelsObtained() {
         this._ensurePlayer();
         return this._module._adl_getNumFourOpsChnObtained(this._player);
+    }
+
+    /**
+     * Apply a batch of synth settings at runtime.
+     *
+     * Capacity settings (`numChips`, `numFourOpChannels`) are applied through
+     * a controlled sequence: active notes and channel allocations are released
+     * first (panic), the requested capacity is written, and the real-time
+     * playback state is re-synchronized, so held keys or occupied channels
+     * cannot prevent the new topology from taking effect. The remaining
+     * settings follow the same order as the individual setters.
+     *
+     * libADLMIDI may not be able to satisfy a requested capacity. The return
+     * value separates the requested values from the values actually granted,
+     * which are the same numbers reported by {@link getNumChipsObtained} and
+     * {@link getNumFourOpChannelsObtained}. Only capacity keys present in
+     * `settings` appear in the returned objects.
+     *
+     * @param {Object} settings
+     * @param {number} [settings.numChips] - Requested number of emulated OPL3 chips
+     * @param {number} [settings.numFourOpChannels] - Requested number of 4-op channels (-1 = auto)
+     * @param {number} [settings.emulator] - Emulator core ID
+     * @param {number} [settings.bank] - FM bank number
+     * @param {boolean} [settings.softPan] - Soft stereo panning
+     * @param {boolean} [settings.deepVibrato] - Deep vibrato
+     * @param {boolean} [settings.deepTremolo] - Deep tremolo
+     * @returns {{requested: Object, obtained: Object}} Requested vs. actually
+     *   obtained capacity values (e.g.
+     *   `{ requested: { numChips: 10 }, obtained: { numChips: 6 } }`).
+     */
+    configure(settings) {
+        this._ensurePlayer();
+
+        const requested = {};
+        const obtained = {};
+
+        // Emulator first: adl_switchEmulator performs a partialReset, so it
+        // must precede the other settings, matching the individual setters'
+        // established order.
+        if (settings.emulator !== undefined) {
+            this._module._adl_switchEmulator(this._player, settings.emulator);
+        }
+
+        const hasCapacityChange =
+            settings.numChips !== undefined ||
+            settings.numFourOpChannels !== undefined;
+
+        if (hasCapacityChange) {
+            // Release all held notes and channel occupancy so the new
+            // topology can be applied without stuck keys or stale
+            // allocations.
+            this._module._adl_panic(this._player);
+
+            if (settings.numChips !== undefined) {
+                this._module._adl_setNumChips(this._player, settings.numChips);
+            }
+            if (settings.numFourOpChannels !== undefined) {
+                this._module._adl_setNumFourOpsChn(this._player, settings.numFourOpChannels);
+            }
+
+            // Re-sync real-time playback state with the new topology.
+            this._module._adl_rt_resetState(this._player);
+
+            if (settings.numChips !== undefined) {
+                requested.numChips = settings.numChips;
+                obtained.numChips = this._module._adl_getNumChipsObtained(this._player);
+            }
+            if (settings.numFourOpChannels !== undefined) {
+                requested.numFourOpChannels = settings.numFourOpChannels;
+                obtained.numFourOpChannels = this._module._adl_getNumFourOpsChnObtained(this._player);
+            }
+        }
+
+        // Remaining settings keep the established application order
+        // (bank, soft pan, vibrato, tremolo — emulator handled above).
+        if (settings.bank !== undefined) {
+            this._module._adl_setBank(this._player, settings.bank);
+        }
+        if (settings.softPan !== undefined) {
+            this._module._adl_setSoftPanEnabled(this._player, settings.softPan ? 1 : 0);
+        }
+        if (settings.deepVibrato !== undefined) {
+            this._module._adl_setHVibrato(this._player, settings.deepVibrato ? 1 : 0);
+        }
+        if (settings.deepTremolo !== undefined) {
+            this._module._adl_setHTremolo(this._player, settings.deepTremolo ? 1 : 0);
+        }
+
+        return { requested, obtained };
     }
 
     /**
@@ -444,7 +542,12 @@ export class AdlMidiCore {
     /**
      * Get the number of emulated chips.
      *
-     * @returns {number}
+     * This is the requested chip count (the last value passed to
+     * {@link setNumChips} or {@link configure}); it may exceed the number of
+     * chips libADLMIDI was actually able to allocate. Use
+     * {@link getNumChipsObtained} for the effective count.
+     *
+     * @returns {number} Requested chip count
      */
     getNumChips() {
         this._ensurePlayer();
@@ -454,7 +557,11 @@ export class AdlMidiCore {
     /**
      * Get the number of emulated chips obtained.
      *
-     * @returns {number}
+     * This is the effective chip count actually granted by libADLMIDI, which
+     * may be lower than the requested count when the request exceeds the
+     * implementation's limits.
+     *
+     * @returns {number} Effectively obtained chip count
      */
     getNumChipsObtained() {
         this._ensurePlayer();
