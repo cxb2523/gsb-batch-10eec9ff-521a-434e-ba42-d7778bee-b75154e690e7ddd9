@@ -20,6 +20,7 @@ export class SkySystem {
 
     this.sunDir = new THREE.Vector3(0, 1, 0);
     this.sunColor = new THREE.Color(0xffffff);
+    this.lightDir = new THREE.Vector3(0, 1, 0); // direction of the light the water should reflect
     this.dayFactor = 1;
 
     this.stars = this.buildStars();
@@ -99,6 +100,7 @@ export class SkySystem {
       this.sunColor.copy(this._sunWhite).lerp(this._sunWarm, horizonWarmth);
       this.sunLight.color.copy(this.sunColor);
       this.sunLight.intensity = lerp(0.15, 2.9, f) * (1 - cloud * 0.4);
+      this.lightDir.copy(this.sunDir);
       this.sunLight.position.copy(this.sunDir).multiplyScalar(120);
     } else {
       const moonDir = this.sunDir.clone().multiplyScalar(-1);
@@ -106,7 +108,8 @@ export class SkySystem {
       this.sunColor.copy(this._moonBlue);
       this.sunLight.color.copy(this._moonBlue);
       this.sunLight.intensity = 0.32 * (1 - cloud * 0.3);
-      this.sunLight.position.copy(moonDir).normalize().multiplyScalar(120);
+      this.lightDir.copy(moonDir).normalize();
+      this.sunLight.position.copy(this.lightDir).multiplyScalar(120);
     }
 
     this.hemiLight.color.copy(this._hemiSkyNight).lerp(this._hemiSkyDay, f);
@@ -126,10 +129,9 @@ export class SkySystem {
 
     this.stars.material.opacity = (1 - f) * (1 - cloud * 0.8) * 0.9;
 
-    // water picks up the active light source
-    this.water.setSun(
-      isDay ? this.sunDir : this.sunLight.position.clone().normalize(),
-      this.sunColor
-    );
+    // water picks up whichever light source is active: the sun by day, the
+    // moon at night. Written every frame so a location/quality rebuild can
+    // never leave the surface reflecting a stale sun.
+    this.water.setSun(this.lightDir, this.sunColor);
   }
 }

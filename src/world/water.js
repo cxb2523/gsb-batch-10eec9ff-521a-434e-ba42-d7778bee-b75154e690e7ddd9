@@ -11,6 +11,9 @@ let cachedNormals = null;
  * Generates a tileable water normal map from layered value noise drawn to a
  * canvas. Quality is plenty for a stylized surface and avoids CDN texture
  * dependencies entirely.
+ *
+ * The texture is shared by every Water build (and every quality level), so it
+ * is generated exactly once and must never be disposed with the surface.
  */
 function generateWaterNormals(size = 256) {
   if (cachedNormals) return cachedNormals;
@@ -63,62 +66,147 @@ function generateWaterNormals(size = 256) {
   return tex;
 }
 
+// The Water addon keeps its reflection WebGLRenderTarget in a closure and never
+// exposes it, so wrapping the surface in `.dispose()` is not enough to release
+// the framebuffer/renderbuffer it owns. Capture the target the first time the
+// addon binds it, then dispose it properly when the surface is rebuilt.
+const reflectionTargets = new WeakMap();
+
+function captureReflectionTarget(water) {
+  const base = water.onBeforeRender;
+  const mirrorSampler = water.material.uniforms.mirrorSampler;
+
+  water.onBeforeRender = function (renderer, scene, camera) {
+    if (reflectionTargets.has(water)) return base.call(this, renderer, scene, camera);
+
+    const setRenderTarget = renderer.setRenderTarget;
+    renderer.setRenderTarget = function (target, ...rest) {
+      if (target && target.isRenderTarget && target.texture === mirrorSampler.value) {
+        reflectionTargets.set(water, target);
+      }
+      return setRenderTarget.call(this, target, ...rest);
+    };
+
+    try {
+      return base.call(this, renderer, scene, camera);
+    } finally {
+      renderer.setRenderTarget = setRenderTarget;
+      // Once found, stop intercepting and run the addon's own hook directly.
+      if (reflectionTargets.has(water)) water.onBeforeRender = base;
+    }
+  };
+}
+
+/** Releases everything a Water instance owns except the shared normal map. */
+function disposeWater(water) {
+  if (!water) return;
+
+  // The render target owns the reflection texture, framebuffer and renderbuffer.
+  // (If the surface never rendered, no GPU resources were allocated yet.)
+  const target = reflectionTargets.get(water);
+  if (target) {
+    reflectionTargets.delete(water);
+    target.dispose();
+  }
+
+  water.geometry?.dispose();
+  water.material?.dispose();
+  // Drop the addon's per-instance render hook so a stale surface can never
+  // render into a disposed target.
+  water.onBeforeRender = () => {};
+}
+
 export class WaterSurface {
   constructor(scene, quality = "high") {
     this.scene = scene;
-    this.quality = quality;
+    this.quality = CONFIG.quality[quality] ? quality : "high";
     this.params = { color: 0x1f5f53, distortion: 1.7, size: 3.2, timeScale: 0.6 };
     this.water = null;
+    // Animation phase survives rebuilds so a quality change doesn't visibly
+    // restart the ripples from zero.
+    this.time = 0;
+    // Last sun written by the sky system, re-applied when the surface is
+    // rebuilt so a quality change can never reset it to a default sun.
+    this.sunDirection = new THREE.Vector3(0.3, 0.8, 0.2).normalize();
+    this.sunColor = new THREE.Color(0xffffff);
     this.build();
   }
 
+  /** Reflection texture edge length for the current quality preset. */
+  get textureSize() {
+    return CONFIG.quality[this.quality]?.waterTex ?? 1024;
+  }
+
   build() {
-    const texSize = CONFIG.quality[this.quality]?.waterTex ?? 1024;
+    if (this.water) this.disposeSurface();
+
+    const texSize = this.textureSize;
     const geometry = new THREE.PlaneGeometry(CONFIG.water.size, CONFIG.water.size);
     const water = new Water(geometry, {
       textureWidth: texSize,
       textureHeight: texSize,
       waterNormals: generateWaterNormals(),
-      sunDirection: new THREE.Vector3(0.3, 0.8, 0.2),
-      sunColor: 0xffffff,
+      sunDirection: this.sunDirection.clone(),
+      sunColor: this.sunColor.clone(),
       waterColor: this.params.color,
       distortionScale: this.params.distortion,
       fog: true,
     });
     water.rotation.x = -Math.PI / 2;
     water.position.y = CONFIG.water.level;
-    water.material.uniforms.size.value = this.params.size;
+    water.material.uniforms.time.value = this.time;
+
     this.scene.add(water);
     this.water = water;
+    captureReflectionTarget(water);
+    this.applyParams();
   }
 
-  setParams(p) {
-    this.params = { ...this.params, ...p };
+  /** Removes and releases the current surface (keeps the shared normal map). */
+  disposeSurface() {
+    const old = this.water;
+    if (!old) return;
+    this.scene.remove(old);
+    disposeWater(old);
+    this.water = null;
+  }
+
+  /** Pushes the stored parameter set into the live material uniforms. */
+  applyParams() {
+    if (!this.water) return;
     const u = this.water.material.uniforms;
     u.waterColor.value.setHex(this.params.color);
     u.distortionScale.value = this.params.distortion;
     u.size.value = this.params.size;
+    // timeScale is read by update(); nothing else to write here.
+  }
+
+  setParams(p = {}) {
+    this.params = { ...this.params, ...p };
+    this.applyParams();
   }
 
   setSun(direction, color) {
+    if (direction) this.sunDirection.copy(direction).normalize();
+    if (color) this.sunColor.copy(color);
+    if (!this.water) return;
     const u = this.water.material.uniforms;
-    u.sunDirection.value.copy(direction).normalize();
-    u.sunColor.value.copy(color);
+    u.sunDirection.value.copy(this.sunDirection);
+    u.sunColor.value.copy(this.sunColor);
   }
 
   update(dt) {
-    this.water.material.uniforms.time.value += dt * this.params.timeScale;
+    this.time += dt * this.params.timeScale;
+    if (this.water) this.water.material.uniforms.time.value = this.time;
   }
 
   setQuality(quality) {
-    if (quality === this.quality) return;
-    this.quality = quality;
-    const old = this.water;
-    this.scene.remove(old);
-    // free GPU resources of the old reflection target + material
-    old.material.uniforms.mirrorSampler.value?.dispose?.();
-    old.material.dispose();
-    old.geometry.dispose();
+    const next = CONFIG.quality[quality] ? quality : "high";
+    if (next === this.quality && this.water) return;
+    this.quality = next;
+    // Full rebuild: new reflection target at the new size; the old target,
+    // material and geometry are released by build() -> disposeSurface().
+    // Location params and the last sun/moon state stay applied.
     this.build();
   }
 }

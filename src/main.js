@@ -86,8 +86,11 @@ const screens = new Screens({
     hud.toast("Save erased — fresh logbook ready", "warn");
   },
   onQualityChange: (q) => {
+    // Renderer and water must move together, and the fresh water surface must
+    // immediately receive the current sun/fog state rather than defaults.
     core.setQuality(q);
     water.setQuality(q);
+    sky.update(gclock.hours, cloudFactor, currentLoc());
     saveGame();
   },
 });
@@ -103,14 +106,25 @@ function applySettings() {
 
 function travelTo(locId, silent = false) {
   const loc = LOCATION_BY_ID[locId] ?? LOCATION_BY_ID.lake;
-  S.world.current = loc.id;
+  // Tear down anything that references the old environment before it is
+  // rebuilt, so no bobber/fish mesh or pending bite survives the trip.
   bite.cancel();
   bobber.hide();
   if (fight.active) fight.end();
+  casting.setBend(0);
+  casting.setLineTension(0);
+
+  S.world.current = loc.id;
   env.load(loc);
   casting.attachTo(env.playerSpot);
   rig.setAnchor(env.playerSpot);
+
+  // Water: adopt the new spot's look immediately (colour, distortion, size,
+  // time scale) instead of waiting for the next uniform write.
   water.setParams(loc.water);
+  // Sky/fog/light are recomputed from the new location right away, and the
+  // water gets the active sun/moon direction before this frame renders.
+  sky.update(gclock.hours, cloudFactor, loc);
   effects.setLocationAmbient(loc);
   audio.setAmbience(loc.ambience, gclock.segment);
   hud.updateLocation();
