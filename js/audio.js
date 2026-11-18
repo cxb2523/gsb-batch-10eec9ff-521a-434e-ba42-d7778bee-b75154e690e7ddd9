@@ -4,6 +4,7 @@
 const Sound = (() => {
   let ac = null, master, sfxBus, bgmBus, musicGain, duck;
   let unlocked = false, want = null, theme = null, timer = 0, step = 0, nextT = 0;
+  let musicGen = 0;   // 음악 요청 세대: bgm()이 호출될 때마다 증가. await 도중 들어온 새 요청에 밀린 옛 요청은 소리를 내지 않는다
   const lastPlay = {};
   const set = () => (typeof Game !== 'undefined' && Game.save && Game.save.settings) || {};
   const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
@@ -34,6 +35,7 @@ const Sound = (() => {
   // 설정의 켜기/끄기와 음량을 반영
   function refresh() {
     const s = set();
+    if (s.bgm === false) stopFanfare();   // 배경음을 끄면 팡파르(짧은 곡)도 멈추고 눌려 있던 음량을 복구한다
     const mv = s.bgm === false ? 0 : (s.bgmVol ?? 40) / 100 * 0.8 * trackVol(fileKey);
     if (musicGain) musicGain.gain.value = mv;
     if (player && player.el) { player.el.volume = Math.min(1, mv); if (s.bgm === false) player.el.pause(); else if (unlocked && player.el.paused && !document.hidden) player.el.play().catch(() => {}); }
@@ -339,11 +341,12 @@ const Sound = (() => {
   async function bgm(key, o = {}) {
     if (want && want.key === key) return;
     want = { key, o };
-    const my = ++seq;
+    const my = ++seq, myGen = ++musicGen;   // 새 요청이 들어올 때마다 세대가 바뀐다
     stopLoop();
+    stopFanfare();   // 재생 중이던 짧은 곡은 멈추고 배경음 음량을 복구한다 (둘이 겹치거나 영구히 눌리지 않게)
     let url = null;
     for (const f of o.files || []) { url = await findFile(f); if (url) break; }
-    if (my !== seq) return;          // 그 사이에 다른 곡으로 바뀜
+    if (my !== seq || myGen !== musicGen) return;          // 그 사이에 다른 곡으로 바뀜
     if (url) { stopLoop(); playFile(url, fileKeyOf(url)); return; }
     stopFile();
     if (unlocked) startLoop();
@@ -374,7 +377,7 @@ const Sound = (() => {
   async function previewLoop(key) {
     const url = await findFile(key); if (!url) return false;
     const info = await loopInfo(key); if (!info || !info.use) return false;
-    previewing = true; ++seq; stopLoop();
+    previewing = true; ++seq; stopLoop(); stopFanfare();
     await playFile(url, key, Math.max(info.use.start, info.use.end - 3));
     return true;
   }
@@ -392,34 +395,60 @@ const Sound = (() => {
   const dungeon = dg => bgm('dg:' + dg.id + (dg.daily ? dg.seed : ''), { mode: MOODS[dg.id] || 'major', files: dg.daily ? dailyFiles(dg.seed >>> 0) : [dg.id, ...((window.MUSIC_ALIAS || {})[dg.id] ? [window.MUSIC_ALIAS[dg.id]] : []), 'dungeon'] });
   // 특별한 순간의 곡 (수배범·도둑질·몬스터하우스·이야기): 파일이 있을 때만 틀고, 없으면 fallback (합성 배경음으로 바꾸지 않는다)
   async function special(key, fallback) {
+    const myGen = musicGen;
     const url = await findFile(key);
+    // 불러오는 사이 다른 장소 음악이 요청됐으면 그 요청을 우선한다 (옛 요청이 소리를 내지 않게)
+    if (myGen !== musicGen) return;
     if (url) bgm('sp:' + key, { files: [key] }); else if (fallback) fallback();
   }
   // 이야기 장면 동안만 잠깐 다른 곡: 끝나면 원래 곡으로 (그 사이에 다른 곡으로 바뀌었으면 그대로 둔다)
   async function scene(key) {
-    const prev = want, url = key && await findFile(key);
-    if (!url || (want && want.key === 'sp:' + key)) return () => {};
+    const prev = want, myGen = musicGen;   // 요청 시점의 세대만 기억한다 (자기는 올리지 않는다)
+    const url = key && await findFile(key);
+    // 파일이 없거나, 불러오는 사이 다른 음악 요청이 들어왔으면(세대 변경) 아무것도 하지 않는다
+    if (!url || (want && want.key === 'sp:' + key) || myGen !== musicGen) return () => {};
     bgm('sp:' + key, { files: [key] });
-    return () => { if (want && want.key === 'sp:' + key && prev) { want = null; bgm(prev.key, prev.o); } };
+    const genAfter = musicGen;   // 내부 bgm()이 동기적으로 올려 놓은 세대. 이후 다른 요청이 없으면 복구를 허용한다
+    // 복구 함수: 장면이 끝날 때 세대가 그대로면(사용자가 다른 곡으로 갈아타지 않았으면) 요청 전 곡으로 돌린다
+    return () => { if (genAfter === musicGen && want && want.key === 'sp:' + key && prev) { want = null; bgm(prev.key, prev.o); } };
   }
   // 팡파르: 짧은 곡을 한 번 (승급·보상 등). 그동안 배경음을 줄였다가 끝나면 다시. 파일이 없거나 배경음을 껐으면 합성 효과음(sfx)
   const fanCache = new Map();
-  let fan = null;
+  let fan = null, fanTok = 0;
+  // 배경음 음량(duck)을 1로 되돌린다. 짧은 곡이 끝나거나 새 음악 요청에 가로막힐 때 호출
+  function restoreDuck() {
+    if (!ac || !duck) return;
+    const t = ac.currentTime;
+    duck.gain.cancelScheduledValues(t);
+    duck.gain.setValueAtTime(duck.gain.value, t);
+    duck.gain.linearRampToValueAtTime(1, t + 0.8);
+  }
+  // 재생 중인 짧은 곡을 멈추고 배경음 음량을 복구한다 (새 배경음 요청·설정 변경·미리 듣기 등)
+  function stopFanfare() {
+    fanTok++;
+    const f = fan; fan = null;
+    if (f) { try { f.src.stop(); } catch (e) { /* 이미 끝남 */ } }
+    restoreDuck();
+  }
   async function fanfare(key, sfx) {
+    const myTok = ++fanTok;   // 불러오는 사이에 다른 팡파르나 bgm 요청이 있으면 이 요청은 소리를 내지 않는다
     const url = await findFile(key);
-    if (!url || !unlocked || !ctx() || !canFetch(url) || set().bgm === false) { if (sfx) play(sfx); return; }
+    if (myTok !== fanTok || !url || !unlocked || !ctx() || !canFetch(url) || set().bgm === false) { if (sfx && myTok === fanTok) play(sfx); return; }
     try {
       if (!fanCache.has(url)) fanCache.set(url, await new Promise(async (res, rej) => ac.decodeAudioData(await (await fetch(url)).arrayBuffer(), res, rej)));
+      if (myTok !== fanTok) return;   // 디코딩하는 사이 새 요청이 들어옴
       const buf = fanCache.get(url);
-      if (fan) { try { fan.src.stop(); } catch (e) { /* 이미 끝남 */ } }
       const src = ac.createBufferSource(), g = ac.createGain();
       g.gain.value = (set().bgmVol ?? 40) / 100 * 0.8 * trackVol(key);
       src.buffer = buf; src.connect(g); g.connect(master);
-      const t = ac.currentTime, my = fan = { src };
+      // 이전 짧은 곡이 아직 끝나지 않았으면 교체한다 (음량 복구는 새 곡이 다시 눌러야 하므로 생략)
+      if (fan) { try { fan.src.stop(); } catch (e) { /* 이미 끝남 */ } }
+      const t = ac.currentTime;
+      fan = { src, tok: myTok };
       duck.gain.cancelScheduledValues(t); duck.gain.setValueAtTime(duck.gain.value, t); duck.gain.linearRampToValueAtTime(0, t + 0.15);
-      src.onended = () => { if (fan !== my) return; fan = null; const t2 = ac.currentTime; duck.gain.cancelScheduledValues(t2); duck.gain.setValueAtTime(duck.gain.value, t2); duck.gain.linearRampToValueAtTime(1, t2 + 0.8); };
+      src.onended = () => { if (!fan || fan.tok !== myTok) return; fan = null; restoreDuck(); };
       src.start(t + 0.1);
-    } catch (e) { if (sfx) play(sfx); }
+    } catch (e) { if (sfx && myTok === fanTok) play(sfx); }
   }
   const boss = () => bgm('boss', { mode: 'minor', bpm: 150, root: 45, prog: [0, 5, 6, 4], wave: 'sawtooth', sparse: 0.3, files: ['boss'] });
 
