@@ -397,6 +397,148 @@
               sandBeforeUndo > 0 && sandAfterClear === 0 && sandAfterUndo === sandBeforeUndo,
               'before=' + sandBeforeUndo + ' cleared=' + sandAfterClear + ' undo=' + sandAfterUndo)
 
+        // g3) 引擎能力：快照在网格尺寸变化后仍可按新网格重采样还原。
+        // 模拟「归零后拖动窗口改变尺寸再撤回」：先快照，再强制换一个宽高比的网格，
+        // restore 不应返回 false，且归零瞬间的内容（中部一团沙）按归一化位置回来。
+        {
+          const probe = new window.SandSim(document.createElement('canvas'), { seed: 4242 })
+          probe.clear(); probe.place(0.5, 0.4, 'sand', 5, 1)
+          for (let i = 0; i < 40; i++) probe.step(0.02)
+          const snap = probe.snapshot()
+          const oldW = probe.gridW, oldH = probe.gridH
+          const hadSand = probe.countOf(S.SAND) > 0
+          const origIW = window.innerWidth
+          try {
+            Object.defineProperty(window, 'innerWidth', { configurable: true, value: 480 })
+            Object.defineProperty(window, 'innerHeight', { configurable: true, value: 900 })
+            probe.resize()
+          } finally {
+            Object.defineProperty(window, 'innerWidth', { configurable: true, value: origIW })
+          }
+          const resized = probe.gridW !== oldW || probe.gridH !== oldH
+          const restored = probe.restore(snap)
+          // 沙粒 40 步后已落到画面下半部，按归一化坐标扫一大片区域确认内容跟着回来了
+          let foundSand = 0
+          for (let yy = 0.35; yy <= 0.99; yy += 0.04) {
+            for (let xx = 0.3; xx <= 0.7; xx += 0.04) {
+              if (probe.cellAt(xx, yy) === S.SAND) foundSand++
+            }
+          }
+          check('尺寸变化后快照按新网格重采样还原（不返回 false、内容按位置回来）',
+                resized && restored === true && hadSand && foundSand > 0,
+                'old=' + oldW + 'x' + oldH + ' new=' + probe.gridW + 'x' + probe.gridH +
+                ' restored=' + restored + ' sand=' + probe.countOf(S.SAND) + ' hits=' + foundSand)
+          const badOk = probe.restore({ w: 3, h: 3, type: new Uint8Array(8), meta: new Uint8Array(9), life: new Uint8Array(9) })
+          check('损坏快照安全拒绝（返回 false 而不是抛错）', badOk === false, 'ret=' + badOk)
+          probe.dispose && probe.dispose()
+        }
+
+        // g4) 真实链路（按钮 + app 调度）：归零 → 改变窗口尺寸 → 撤回。
+        // 结果必须与按钮状态一致：撤回成功且按钮立刻回到「归零」，不允许停在「撤回」。
+        {
+          const btn = document.getElementById('clear')
+          sand.clear(); sand.place(0.5, 0.5, 'water', 5, 1); sand.place(0.3, 0.3, 'sand', 4, 1)
+          for (let i = 0; i < 160; i++) sand.step(0.02)   // 足够多子步，让颗粒真正落底
+          const before = { water: sand.countOf(S.WATER), sand: sand.countOf(S.SAND) }
+          const oldW = sand.gridW, oldH = sand.gridH
+          const origIW = window.innerWidth, origIH = window.innerHeight
+          try {
+            Object.defineProperty(window, 'innerWidth', { configurable: true, value: 480 })
+            Object.defineProperty(window, 'innerHeight', { configurable: true, value: 900 })
+            btn.click()                          // 归零（武装撤回）
+            const armedAfterClear = hook.clearUndoArmed()
+            const emptyAfterClear = sand.fullness() === 0
+            sand.resize()                        // 窗口期内窗口改尺寸（与 resize 监听等价的引擎调用）
+            const gridChanged = sand.gridW !== oldW || sand.gridH !== oldH
+            btn.click()                          // 撤回
+            const disarmedAfterUndo = hook.clearUndoArmed() === false
+            const labelReset = btn.textContent === '归零'
+            // 重采样会让颗粒数随网格面积变化（最近邻上采样约 ×1.2），用比例容差，
+            // 再按归一化位置确认「归零那一刻」的水（落底中部）和沙（左下落底）都回来了
+            const waterRatio = before.water ? sand.countOf(S.WATER) / before.water : 1
+            const sandRatio = before.sand ? sand.countOf(S.SAND) / before.sand : 1
+            const countsClose = waterRatio > 0.5 && waterRatio < 1.6 && sandRatio > 0.5 && sandRatio < 1.6
+            let bottomWater = 0, lowerSand = 0
+            {
+              const lastRow = (sand.gridH - 1) * sand.gridW
+              for (let x = 0; x < sand.gridW; x++) if (sand.type[lastRow + x] === S.WATER) bottomWater++
+              for (let yy = 0.7; yy <= 0.99; yy += 0.03) {
+                for (let xx = 0.15; xx <= 0.45; xx += 0.03) {
+                  if (sand.cellAt(xx, yy) === S.SAND) lowerSand++
+                }
+              }
+            }
+            const cameBack = countsClose && bottomWater > 0 && lowerSand > 0 && sand.fullness() > 0
+            check('归零后改尺寸再撤回：重采样还原成功且按钮回「归零」',
+                  armedAfterClear && emptyAfterClear && gridChanged &&
+                  disarmedAfterUndo && labelReset && cameBack,
+                  'gridChanged=' + gridChanged + ' armed=' + armedAfterClear +
+                  ' disarmed=' + disarmedAfterUndo + ' label="' + btn.textContent +
+                  '" before=' + JSON.stringify(before) +
+                  ' after={water:' + sand.countOf(S.WATER) + ',sand:' + sand.countOf(S.SAND) +
+                  '} ratios={w:' + waterRatio.toFixed(2) + ',s:' + sandRatio.toFixed(2) +
+                  '} bottomWater=' + bottomWater + ' lowerSand=' + lowerSand)
+          } finally {
+            Object.defineProperty(window, 'innerWidth', { configurable: true, value: origIW })
+            Object.defineProperty(window, 'innerHeight', { configurable: true, value: origIH })
+          }
+        }
+
+        // g5) 归零后到撤回 / 窗口过期前，AI 不得再倒料——哪怕耐心时间已经过了好几轮。
+        {
+          const btn = document.getElementById('clear')
+          sand.clear()
+          state.aiOn = true
+          state.aiPatience = 2                    // 取最小耐心，多推进几个周期
+          let places = 0
+          const os = sand.place.bind(sand)
+          sand.place = function () { places++; return os.apply(null, arguments) }
+          btn.click()                              // 归零并武装撤回
+          const armed = hook.clearUndoArmed()
+          const t0 = 3e12
+          state.lastUserActivity = t0 - 60000      // 用户早已停笔，AI 本应接手
+          for (let k = 0; k < 6; k++) {
+            const t = t0 + k * 3000                // 每次都跨过一个耐心周期
+            hook.aiTick(t)
+            hook.advanceAiPour(t)
+          }
+          sand.place = os
+          check('撤回窗口期内 AI 不倒料（超过耐心时间也一样）',
+                armed && places === 0 && sand.fullness() === 0,
+                'armed=' + armed + ' places=' + places + ' fullness=' + sand.fullness().toFixed(3))
+
+          // g6) 窗口过期：按钮自动回「归零」；窗口一关，AI 立即按原节奏恢复倒料
+          let captured = null
+          const realSetTimeout = window.setTimeout
+          window.setTimeout = function (fn, ms) { if (ms === 10000) { captured = fn; return 0 } return realSetTimeout.apply(window, arguments) }
+          try { hook.cancelClearUndo(); btn.click() } finally { window.setTimeout = realSetTimeout }
+          const armedAgain = hook.clearUndoArmed() && typeof captured === 'function'
+          captured()                               // 触发 10 秒窗口过期
+          const expired = hook.clearUndoArmed() === false && btn.textContent === '归零'
+          let places2 = 0
+          const os2 = sand.place.bind(sand)
+          sand.place = function () { places2++; return os2.apply(null, arguments) }
+          // g5 期间 aiTick 把 nextDropAt 推到了 t0+耐心 附近，这里必须用更晚的时间戳，
+          // 否则 AI 还没到下一个周期就不会起浇
+          const t1 = t0 + 1e8
+          hook.aiTick(t1)
+          for (let k = 0; k < 6; k++) hook.advanceAiPour(t1)
+          sand.place = os2
+          check('撤回窗口过期后按钮回「归零」，且 AI 恢复倒料',
+                armedAgain && expired && places2 >= 1,
+                'armedAgain=' + armedAgain + ' expired=' + expired + ' places=' + places2)
+          // 恢复耐心旋钮默认值，并通过真实 input 事件重置 nextDropAt——
+          // 否则后续 j/k/l 测试用的 2e12 时间戳会小于被推到 3e12 的下一次 AI 周期
+          state.aiOn = false
+          state.aiPatience = 4.0
+          const patienceInput = document.getElementById('patience')
+          if (patienceInput) {
+            patienceInput.value = '4'
+            patienceInput.dispatchEvent(new Event('input', { bubbles: true }))
+          }
+          hook.cancelClearUndo()
+        }
+
         // h) 导出
         let surl = ''
         try { surl = sand.captureDataURL() } catch (e) {}

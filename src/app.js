@@ -257,6 +257,10 @@
   function aiTick(now) {
     if (state.mode === 'fine' || state.mode === 'still') { nextDropAt = now + state.aiPatience * 1000; return }
     if (!state.aiOn) { nextDropAt = now + state.aiPatience * 1000; return }
+    // 沙模式「归零」撤回窗口开着时，AI 必须完全停手：撤回要还原的是用户点「归零」
+    // 那一刻的沙盘，窗口内新倒的料会把它污染。窗口关闭（撤回 / 过期 / 再落笔 / 切模式）
+    // 后本分支自然放行，AI 按原节奏接手。
+    if (state.mode === 'sand' && clearUndoArmed) { nextDropAt = now + state.aiPatience * 1000; return }
     if (now < nextDropAt) return
     const sinceUser = now - state.lastUserActivity
     if (sinceUser < YIELD_GRACE) {
@@ -316,6 +320,9 @@
   // 沙模式 AI 每帧推进一次连浇；用户刚动则让位（本帧不浇）
   function advanceAiPour(now) {
     if (state.mode !== 'sand' || !sand || !state.aiOn) { aiPour = null; return }
+    // 归零撤回窗口内绝不倒料（与 aiTick 的拦截互为兜底，防止窗口开启瞬间
+    // 已存在的连浇继续往清空的盘里落新料）。
+    if (clearUndoArmed) { aiPour = null; return }
     if (!aiPour) return
     if (now - state.lastUserActivity < YIELD_GRACE) return  // 用户刚动 → 让位
     if (now >= aiPour.until) { aiPour = null; return }
@@ -726,9 +733,14 @@
   }
   function performClearUndo() {
     if (!clearUndoArmed || !clearUndoSnap) { cancelClearUndo(); return }
-    if (clearUndoSnap.mode === 'sand' && sand) sand.restore(clearUndoSnap.snap)
-    else engine.restoreDye()
+    const snapMode = clearUndoSnap.mode
+    let ok = true
+    if (snapMode === 'sand' && sand) ok = sand.restore(clearUndoSnap.snap)
+    else ok = engine.restoreDye()
+    // 还原失败（快照已不可用）也必须关闭窗口：按钮回到「归零」，不允许停在
+    // 「撤回」却点了没反应。沙引擎在尺寸不一致时会重采样快照，通常仍能成功。
     cancelClearUndo()
+    if (!ok && snapMode === 'sand' && sand) sand.clear()
   }
 
   on($('clear'), 'click', () => {
