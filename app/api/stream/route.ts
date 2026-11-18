@@ -1,7 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 
-// VidSrc base URLs for fallback
-const VIDSRC_BASE_URLS = ["https://vidsrc.icu", "https://vidsrc.stream", "https://vidsrc.me", "https://vidsrc.to"]
+import { buildEmbedCandidates, probeCandidates } from "@/lib/vidsrc"
 
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams
@@ -14,39 +13,31 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Missing tmdbId parameter" }, { status: 400 })
   }
 
-  // Construct the appropriate URL based on content type
-  let embedUrl: string | null = null
-
-  // Try each base URL until we find one that works
-  for (const baseUrl of VIDSRC_BASE_URLS) {
-    try {
-      if (type === "movie") {
-        embedUrl = `${baseUrl}/embed/${tmdbId}`
-      } else if (type === "tv" && season && episode) {
-        embedUrl = `${baseUrl}/embed/tv/${tmdbId}/${season}/${episode}`
-      } else {
-        return NextResponse.json({ error: "Invalid parameters for TV show" }, { status: 400 })
-      }
-
-      // Check if the URL is accessible
-      const response = await fetch(embedUrl, {
-        method: "HEAD",
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        },
-      })
-
-      if (response.ok) {
-        // Return the working embed URL
-        return NextResponse.json({ embedUrl })
-      }
-    } catch (error) {
-      console.error(`Error checking ${embedUrl}:`, error)
-      // Continue to the next base URL
-    }
+  if (type !== "movie" && type !== "tv") {
+    return NextResponse.json({ error: "Invalid parameters for TV show" }, { status: 400 })
   }
 
-  // If no working URL was found
-  return NextResponse.json({ error: "No available streaming sources found" }, { status: 404 })
+  const seasonNum = season ? Number.parseInt(season, 10) : NaN
+  const episodeNum = episode ? Number.parseInt(episode, 10) : NaN
+
+  if (type === "tv" && (!season || !episode || Number.isNaN(seasonNum) || Number.isNaN(episodeNum))) {
+    return NextResponse.json({ error: "Invalid parameters for TV show" }, { status: 400 })
+  }
+
+  // Build the full priority-ordered candidate list from the shared
+  // VidSrc helpers so the domain list lives in exactly one place.
+  const candidates = buildEmbedCandidates(type, tmdbId, seasonNum, episodeNum)
+
+  // Keep only the sources the server can reach, preserving priority order.
+  const availableCandidates = await probeCandidates(candidates)
+
+  if (availableCandidates.length === 0) {
+    return NextResponse.json({ error: "No available streaming sources found" }, { status: 404 })
+  }
+
+  return NextResponse.json({
+    candidates: availableCandidates,
+    // Kept for backwards compatibility with any single-source consumer.
+    embedUrl: availableCandidates[0],
+  })
 }
