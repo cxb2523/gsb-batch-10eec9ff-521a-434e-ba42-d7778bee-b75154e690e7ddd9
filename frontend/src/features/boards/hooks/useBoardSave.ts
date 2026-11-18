@@ -18,7 +18,7 @@ import { encryptBoardFile } from '@/lib/crypto-format';
 import { dataUrlToBytes } from '@/lib/image-resize';
 import { setHighestSeenRevision } from '@/lib/revision-store';
 import { getBoard, uploadBoardFile } from '../api';
-import { sealAndSaveBoard, type SealedSaveResult } from '../board-save';
+import { sealAndSaveBoard, clearPendingRekey, type SealedSaveResult } from '../board-save';
 import { isEditable, type BoardLoadOutcome } from '../board-load';
 import { toBoardMetadata, type BoardMetadata } from '../board-metadata';
 import { classifySaveError, classifySaveResponse } from '../board-save-policy';
@@ -152,6 +152,8 @@ export function useBoardSave(params: UseBoardSaveParams) {
   // effect, so the baseline is in place before the editor can report its first change.
   useLayoutEffect(() => {
     clearSaveTimers();
+    // Whatever a save of this board retained belongs to the visit that ended.
+    clearPendingRekey();
     firstChangeTimeRef.current = null;
     pendingElementsRef.current = null;
     pendingAppStateRef.current = null;
