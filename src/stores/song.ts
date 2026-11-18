@@ -16,9 +16,15 @@ class Audio {
     return this._context;
   }
 
+  /**
+   * Shared output node. Playback, note previews, volume, and mute all route
+   * through this single gain node.
+   */
   gainNode(): GainNode {
     if (this._gainNode === undefined) {
-      this._gainNode = this.context().createGain();
+      const context = this.context();
+      this._gainNode = context.createGain();
+      this._gainNode.connect(context.destination);
     }
     return this._gainNode;
   }
@@ -36,6 +42,41 @@ export const useSongStore = defineStore("song", () => {
     new SampleTrack("Hi-Hat", "data/hi_hat.wav", player.value.length),
   ]);
   const volume = ref(100.0);
+  /** Grid index of the step that is currently audible. */
+  const playingIndex = ref(-1);
+  let frame = 0;
+
+  /**
+   * Follow the audio clock and update the highlighted grid step.
+   *
+   * The audio clock is authoritative, so the highlight stays aligned with the
+   * sound even when tempo changes or the scheduler timer is delayed.
+   */
+  function followPlayhead(): void {
+    const context = audio.context();
+    playingIndex.value = player.value.position(context.currentTime);
+
+    // Guard the animation frame API so the store also works in environments
+    // without a rendering loop, such as unit tests.
+    if (player.value.loop && typeof requestAnimationFrame === "function") {
+      frame = requestAnimationFrame(followPlayhead);
+    }
+  }
+
+  function startPlayhead(): void {
+    if (typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(frame);
+    }
+    followPlayhead();
+  }
+
+  function stopPlayhead(): void {
+    if (typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(frame);
+    }
+    frame = 0;
+    playingIndex.value = -1;
+  }
 
   function resetAlert(): void {
     alert.message = "";
@@ -47,7 +88,12 @@ export const useSongStore = defineStore("song", () => {
 
   function setTempo(value: number): void {
     tempo.value = value;
-    player.value.tempo = value;
+
+    // Ignore transient invalid values, such as an empty input field, so that
+    // a running loop keeps its last valid tempo instead of stalling.
+    if (Number.isFinite(value) && value > 0) {
+      player.value.tempo = value;
+    }
   }
 
   function setVolume(value: number): void {
@@ -58,10 +104,9 @@ export const useSongStore = defineStore("song", () => {
   function playNote(trackName: string): void {
     const context = audio.context();
     context.resume();
-    audio.gainNode().connect(context.destination);
 
     const track = tracks.filter((track) => track.name == trackName)[0];
-    track.note(audio.context(), audio.gainNode(), 0.0);
+    track.note(context, audio.gainNode(), context.currentTime);
   }
 
   function toggleNoteActive(trackName: string, noteIndex: number): void {
@@ -70,22 +115,22 @@ export const useSongStore = defineStore("song", () => {
   }
 
   function togglePlaying(): void {
-    if (!player.value.loop && tempo.value <= 0) {
+    if (player.value.loop) {
+      player.value.stop();
+      stopPlayhead();
+      return;
+    }
+
+    if (!Number.isFinite(tempo.value) || tempo.value <= 0) {
       alert.message = "Tempo must be a postive number";
       alert.type = "error";
       return;
     }
 
-    player.value.loop = !player.value.loop;
-    if (player.value.loop) {
-      const context = audio.context();
-      context.resume();
-      const gainNode = audio.gainNode();
-
-      gainNode.connect(context.destination);
-      player.value.timer = context.currentTime;
-      player.value.playTick(context, gainNode, tracks);
-    }
+    const context = audio.context();
+    context.resume();
+    player.value.start(context, audio.gainNode(), tracks);
+    startPlayhead();
   }
 
   return {
@@ -93,6 +138,7 @@ export const useSongStore = defineStore("song", () => {
     audio,
     loadSamples,
     player,
+    playingIndex,
     playNote,
     resetAlert,
     setTempo,

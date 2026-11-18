@@ -10,7 +10,10 @@
       class="btn mr-1"
       v-for="note of props.track.notes"
       :key="note.index"
-      :class="{ 'btn-secondary': note.active }"
+      :class="{
+        'btn-accent': note.index === song.playingIndex,
+        'btn-secondary': note.active,
+      }"
       @click="() => song.toggleNoteActive(props.track.name, note.index)"
     ></button>
   </div>
