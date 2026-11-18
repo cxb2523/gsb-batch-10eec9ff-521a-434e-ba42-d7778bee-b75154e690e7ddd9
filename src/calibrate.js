@@ -12,6 +12,7 @@ const Calib = {
   invH: null,
   stage: null,
   handleEls: [],
+  dragging: false, // a corner handle owns the pointer
 
   init() {
     this.stage = document.getElementById('stage');
@@ -24,6 +25,7 @@ const Calib = {
       let dragging = false;
       el.addEventListener('pointerdown', e => {
         dragging = true;
+        this.dragging = true;
         el.setPointerCapture(e.pointerId);
         e.stopPropagation();
       });
@@ -38,7 +40,7 @@ const Calib = {
         this.apply();
         this.save();
       });
-      el.addEventListener('pointerup', () => { dragging = false; });
+      el.addEventListener('pointerup', () => { dragging = false; this.dragging = false; });
     }
     try {
       const raw = localStorage.getItem(this.KEY);

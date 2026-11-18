@@ -115,7 +115,7 @@ const Editor = {
     bindProp('pY', (s, v) => { s.y = v; });
     bindProp('pW', (s, v) => { if (s.t === 'b') s.w = Math.max(4, v); });
     bindProp('pH', (s, v) => { if (s.t === 'b') s.h = Math.max(4, v); });
-    bindProp('pA', (s, v) => { if (s.t === 'b') s.a = v * Math.PI / 180; });
+    bindProp('pA', (s, v) => { if (s.t === 'b' || s.t === 'p') s.a = v * Math.PI / 180; });
     bindProp('pR', (s, v) => { if (s.t === 'c') s.r = Math.max(4, v); });
     document.getElementById('pKind').addEventListener('change', e => {
       const s = this.selected;
@@ -138,7 +138,7 @@ const Editor = {
     window.addEventListener('dblclick', e => this.insertVertex(e));
     // right-click a selected polygon's corner to remove it
     window.addEventListener('contextmenu', e => {
-      if (G.state !== 'edit' || Calib.active || HeadEditor.active) return;
+      if (G.state !== 'edit' || HeadEditor.active) return;
       if (e.target.closest && (e.target.closest('#toolbar') || e.target.closest('#props'))) return;
       if (this.polyDraft) { e.preventDefault(); this.popDraftPoint(); return; }
       if (this.removeVertex(e)) e.preventDefault();
@@ -147,13 +147,23 @@ const Editor = {
   },
 
   closePoly() {
-    const pts = this.polyDraft;
+    const raw = this.polyDraft;
     this.polyDraft = null;
-    if (!pts || pts.length < 3) return;
+    if (!raw || raw.length < 3) return;
+    // drop consecutive click duplicates so the outline has no zero-length edges
+    const pts = [];
+    for (const p of raw) {
+      const last = pts[pts.length - 1];
+      if (!last || dist2(last[0], last[1], p[0], p[1]) > 1e-12) pts.push(p);
+    }
+    if (pts.length > 1 && dist2(pts[0][0], pts[0][1], pts[pts.length - 1][0], pts[pts.length - 1][1]) <= 1e-12) pts.pop();
+    if (pts.length < 3) return;
     const cx = pts.reduce((a, q) => a + q[0], 0) / pts.length;
     const cy = pts.reduce((a, q) => a + q[1], 0) / pts.length;
     this.snapshot();
-    const s = { t: 'p', x: cx, y: cy, pts: pts.map(([x, y]) => [x - cx, y - cy]) };
+    // store vertices relative to the shape origin, exactly like the editor,
+    // the renderer and the collision code expect them
+    const s = { t: 'p', x: cx, y: cy, a: 0, pts: pts.map(([x, y]) => [x - cx, y - cy]) };
     ArenaStore.current.shapes.push(s);
     ArenaStore.save();
     this.setTool('select');
@@ -166,19 +176,20 @@ const Editor = {
     if (!this.polyDraft.length) this.polyDraft = null;
   },
 
-  // world-space corners of a polygon shape
-  polyVerts(s) { return s.pts.map(([dx, dy]) => [s.x + dx, s.y + dy]); },
+  // world-space corners of a polygon/box shape (rotation-aware)
+  polyVerts(s) { return shapeWorldVertices(s) || []; },
 
   vertexAt(s, x, y, rad = 11) {
-    for (let i = 0; i < s.pts.length; i++) {
-      if (dist2(x, y, s.x + s.pts[i][0], s.y + s.pts[i][1]) < rad * rad) return i;
+    const v = this.polyVerts(s);
+    for (let i = 0; i < v.length; i++) {
+      if (dist2(x, y, v[i][0], v[i][1]) < rad * rad) return i;
     }
     return -1;
   },
 
   insertVertex(e) {
     const s = this.selected;
-    if (G.state !== 'edit' || Calib.active || HeadEditor.active || !s || s.t !== 'p') return;
+    if (G.state !== 'edit' || HeadEditor.active || !s || s.t !== 'p') return;
     if (e.target.closest && (e.target.closest('#toolbar') || e.target.closest('#props'))) return;
     const p = this.world(e);
     if (this.vertexAt(s, p.x, p.y) >= 0) return;
@@ -193,7 +204,9 @@ const Editor = {
     }
     if (best < 0) return;
     this.snapshot();
-    s.pts.splice(best, 0, [p.x - s.x, p.y - s.y]);
+    // store the new corner in shape-local space, like every other vertex
+    const l = shapeWorldToLocal(s, p.x, p.y);
+    s.pts.splice(best, 0, [l.x, l.y]);
     ArenaStore.save();
     this.updateProps();
   },
@@ -244,6 +257,9 @@ const Editor = {
       s.t === 'c' ? 'Circle' : s.t === 'p' ? `Polygon · ${s.pts.length} pts` : (s.h <= 12 ? 'Wall' : 'Box');
     document.querySelectorAll('#props .boxonly').forEach(el => { el.style.display = s.t === 'b' ? 'flex' : 'none'; });
     document.querySelectorAll('#props .circonly').forEach(el => { el.style.display = s.t === 'c' ? 'flex' : 'none'; });
+    document.querySelectorAll('#props .angleonly').forEach(el => {
+      el.style.display = (s.t === 'b' || s.t === 'p') ? 'flex' : 'none';
+    });
     const set = (id, v) => {
       const el = document.getElementById(id);
       if (document.activeElement !== el) el.value = Math.round(v * 10) / 10;
@@ -252,6 +268,7 @@ const Editor = {
     set('pY', s.y);
     if (s.t === 'b') { set('pW', s.w); set('pH', s.h); set('pA', (s.a || 0) * 180 / Math.PI); }
     else if (s.t === 'c') set('pR', s.r);
+    else if (s.t === 'p') set('pA', (s.a || 0) * 180 / Math.PI);
     const kindEl = document.getElementById('pKind');
     if (document.activeElement !== kindEl) kindEl.value = s.k || 'solid';
   },
@@ -282,10 +299,14 @@ const Editor = {
     this.updateProps();
   },
 
+  // Pointer coordinates are always un-warped through the active corner-pin, so
+  // editing stays aligned with the wall even while calibration is on. The four
+  // calibration handles stop propagation themselves, so dragging them never
+  // reaches the editor.
   world(e) { return Calib.worldFromClient(e.clientX, e.clientY); },
 
   onDown(e) {
-    if (G.state !== 'edit' || Calib.active || HeadEditor.active) return;
+    if (G.state !== 'edit' || HeadEditor.active) return;
     if (e.target.closest && (e.target.closest('#toolbar') || e.target.closest('#props'))) return;
     const p = this.world(e);
     const shapes = ArenaStore.current.shapes;
@@ -352,7 +373,10 @@ const Editor = {
   },
 
   onMove(e) {
-    if (G.state !== 'edit' || Calib.active) return;
+    if (G.state !== 'edit') return;
+    // While calibrating, a corner handle owns the pointer; everything else is
+    // still editable and always un-warps into the same logical space.
+    if (Calib.active && Calib.dragging) return;
     this.cursor = this.world(e); // rubber-band line while outlining a polygon
     if (!this.drag) return;
     const p = this.cursor, s = this.selected, d = this.drag;
@@ -379,16 +403,16 @@ const Editor = {
       s.x = p.x - d.ox;
       s.y = p.y - d.oy;
     } else if (d.mode === 'vertex') {
-      s.pts[d.vi] = [p.x - s.x, p.y - s.y];
+      const l = shapeWorldToLocal(s, p.x, p.y);
+      s.pts[d.vi] = [l.x, l.y];
     } else if (d.mode === 'resize') {
       if (s.t === 'c') {
         s.r = Math.max(6, Math.hypot(p.x - s.x, p.y - s.y));
       } else {
-        const ca = Math.cos(-(s.a || 0)), sa = Math.sin(-(s.a || 0));
-        const lx = (p.x - s.x) * ca - (p.y - s.y) * sa;
-        const ly = (p.x - s.x) * sa + (p.y - s.y) * ca;
-        s.w = Math.max(10, Math.abs(lx) * 2);
-        s.h = Math.max(8, Math.abs(ly) * 2);
+        // measure the drag in the shape's local frame, then mirror it
+        const l = shapeWorldToLocal(s, p.x, p.y);
+        s.w = Math.max(10, Math.abs(l.x) * 2);
+        s.h = Math.max(8, Math.abs(l.y) * 2);
       }
     }
     ArenaStore.save();
@@ -396,7 +420,7 @@ const Editor = {
   },
 
   key(e) {
-    if (G.state !== 'edit' || Calib.active) return;
+    if (G.state !== 'edit') return;
     if (this.polyDraft && (e.code === 'Backspace' || e.code === 'Delete')) { this.popDraftPoint(); return; }
     if ((e.ctrlKey || e.metaKey) && e.code === 'KeyZ') { this.undo(); return; }
     if ((e.ctrlKey || e.metaKey) && e.code === 'KeyD') {
@@ -424,18 +448,20 @@ const Editor = {
       s.a = (s.a || 0) + (e.code === 'KeyE' ? 1 : -1) * Math.PI / 60;
       ArenaStore.save();
       this.updateProps();
+    } else if (s.t === 'p' && (e.code === 'KeyQ' || e.code === 'KeyE')) {
+      // rotating a polygon keeps its local vertices untouched; the shared
+      // transform maps them back to the exact same drawn/collided outline
+      s.a = (s.a || 0) + (e.code === 'KeyE' ? 1 : -1) * Math.PI / 60;
+      ArenaStore.save();
+      this.updateProps();
     }
   },
 
   handlePos(s) {
-    if (s.t === 'p') return null; // polygons use per-corner handles instead
+    if (!s || s.t === 'p') return null; // polygons use per-corner handles instead
     if (s.t === 'c') return { x: s.x + s.r, y: s.y };
-    const a = s.a || 0;
-    const ca = Math.cos(a), sa = Math.sin(a);
-    return {
-      x: s.x + (s.w / 2) * ca - (s.h / 2) * sa,
-      y: s.y + (s.w / 2) * sa + (s.h / 2) * ca,
-    };
+    // resize handle sits on the +x/+y corner, mapped through the shared transform
+    return shapeLocalToWorld(s, s.w / 2, s.h / 2);
   },
 
   draw(ctx) {
@@ -503,7 +529,9 @@ function drawShape(ctx, s, alpha, selected, glow) {
     ctx.globalAlpha = alpha;
     ctx.stroke();
   } else if (s.t === 'p') {
+    // draw from the same local vertices the collision code consumes
     ctx.translate(s.x, s.y);
+    ctx.rotate(s.a || 0);
     ctx.beginPath();
     s.pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
     ctx.closePath();
