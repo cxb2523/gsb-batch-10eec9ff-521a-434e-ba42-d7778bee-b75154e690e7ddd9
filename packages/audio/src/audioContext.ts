@@ -22,6 +22,18 @@ export interface MusicTrack {
   timer: ReturnType<typeof setTimeout> | null
 }
 
+/**
+ * @internal An effect chain inserted on a group's output. `entry` is fed by the
+ * group's gain node, `exit` feeds the downstream node, and `dispose` releases
+ * any connections the chain owns internally (e.g. a delay's feedback loop) so
+ * removing an effect never leaves dangling nodes behind.
+ */
+export interface GroupEffectChain {
+  entry: AudioNode
+  exit: AudioNode
+  dispose?: () => void
+}
+
 /** @internal */
 export interface AudioState {
   ctx: AudioContext | null
@@ -30,7 +42,7 @@ export interface AudioState {
   groupVolumes: Map<string, number>
   groupMuted: Map<string, boolean>
   groupSources: Map<string, Set<() => void>>
-  effects: Map<string, { entry: AudioNode; exit: AudioNode }>
+  effects: Map<string, GroupEffectChain>
   music: MusicTrack | null
   /** Tracks that are fading out and will be torn down by a timer. */
   fading: Set<MusicTrack>
@@ -99,9 +111,30 @@ function watchContext(ctx: AudioContext): () => void {
 function resetGraph(s: AudioState): void {
   s.unwatch?.()
   s.unwatch = null
+  // Tear effect chains down before dropping the map: a delay's feedback loop
+  // would otherwise keep both nodes alive and silently dangling.
+  for (const chain of s.effects.values()) {
+    try {
+      chain.dispose?.()
+    } catch {
+      /* nodes already gone */
+    }
+    try {
+      chain.entry.disconnect()
+    } catch {
+      /* already disconnected */
+    }
+    if (chain.exit !== chain.entry) {
+      try {
+        chain.exit.disconnect()
+      } catch {
+        /* already disconnected */
+      }
+    }
+  }
+  s.effects.clear()
   s.groupGainNodes.clear()
   s.groupSources.clear()
-  s.effects.clear()
   for (const t of s.fading) if (t.timer) clearTimeout(t.timer)
   s.fading.clear()
   s.music = null
@@ -194,6 +227,17 @@ export function getGroupGainNode(group: AudioGroup | 'master'): GainNode {
 }
 
 /**
+ * Write `level` to a group's gain node immediately, dropping any duck or fade
+ * that is still queued on the param. Stale automation is what makes a later
+ * duck restore an old level ("the volume never goes back to what I set").
+ */
+function applyGroupLevelNow(group: AudioGroup | 'master', level: number): void {
+  const node = getGroupGainNode(group)
+  node.gain.cancelScheduledValues(getAudioCtx().currentTime)
+  node.gain.value = level
+}
+
+/**
  * Set the volume for a named group ('sfx', 'music', or any custom name). Range 0–1.
  *
  * @example
@@ -203,10 +247,10 @@ export function getGroupGainNode(group: AudioGroup | 'master'): GainNode {
 export function setGroupVolume(group: AudioGroup, volume: number): void {
   const clamped = Math.max(0, Math.min(1, volume))
   S().groupVolumes.set(group, clamped)
-  if (S().groupMuted.get(group)) return // don't change the gain node while muted
-  const node = S().groupGainNodes.get(group)
-  if (node) node.gain.value = clamped
-  else getGroupGainNode(group).gain.value = clamped
+  // While muted the group must stay silent; the level is remembered and
+  // re-applied by setGroupMute(group, false).
+  if (S().groupMuted.get(group)) return
+  applyGroupLevelNow(group, clamped)
 }
 
 /**
@@ -217,10 +261,7 @@ export function setGroupVolume(group: AudioGroup, volume: number): void {
  * setMasterVolume(1)   // full volume
  */
 export function setMasterVolume(volume: number): void {
-  const clamped = Math.max(0, Math.min(1, volume))
-  S().groupVolumes.set('master', clamped)
-  if (S().groupMuted.get('master')) return
-  getGroupGainNode('master').gain.value = clamped
+  setGroupVolume('master', volume)
 }
 
 /** Read the current volume for a group or master (ignores mute state). */
@@ -237,16 +278,24 @@ export function getMasterVolume(): number {
  * Mute or unmute an audio group. Preserves the group's volume so unmuting
  * restores the exact level that was set before muting.
  *
+ * Only a real state change touches the gain node: re-setting the same mute
+ * value is a no-op, so e.g. an app that re-asserts "music is muted" every
+ * frame does not keep cancelling a duck that is running on that group.
+ *
  * @example
  * setGroupMute('music', true)  // mute music
  * setGroupMute('music', false) // restore to previous volume
  */
 export function setGroupMute(group: AudioGroup, muted: boolean): void {
-  const changed = (S().groupMuted.get(group) === true) !== muted
+  const wasMuted = S().groupMuted.get(group) === true
+  if (wasMuted === muted) return // no change — leave any running automation alone
   S().groupMuted.set(group, muted)
+
   const node = getGroupGainNode(group)
-  // A real change drops any duck or fade still queued on the node, or it would override this level later.
-  if (changed) node.gain.cancelScheduledValues(getAudioCtx().currentTime)
+  // A real change drops any duck or fade still queued on the node, or it would
+  // override this level later (audible group while "muted", or a stale level
+  // after unmuting).
+  node.gain.cancelScheduledValues(getAudioCtx().currentTime)
   node.gain.value = muted ? 0 : (S().groupVolumes.get(group) ?? 1)
 }
 

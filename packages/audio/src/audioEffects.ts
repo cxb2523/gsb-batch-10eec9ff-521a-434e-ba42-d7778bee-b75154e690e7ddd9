@@ -1,5 +1,5 @@
 import { getAudioCtx, getAudioState, getGroupGainNode } from './audioContext'
-import type { AudioGroup } from './audioContext'
+import type { AudioGroup, GroupEffectChain } from './audioContext'
 
 // ─── Effect option types ─────────────────────────────────────────────────────
 
@@ -48,12 +48,12 @@ export type GroupEffectOptions =
 
 // ─── Effect chain registry ────────────────────────────────────────────────────
 
-/** Tracks the inserted effect node (and optional extra nodes) per group. */
-const groupEffectNodes = (): Map<string, { entry: AudioNode; exit: AudioNode }> => getAudioState().effects
+/** Tracks the inserted effect chain per group. */
+const groupEffectNodes = (): Map<string, GroupEffectChain> => getAudioState().effects
 
 // ─── Effect factory ───────────────────────────────────────────────────────────
 
-function buildEffectChain(ctx: AudioContext, opts: GroupEffectOptions): { entry: AudioNode; exit: AudioNode } {
+function buildEffectChain(ctx: AudioContext, opts: GroupEffectOptions): GroupEffectChain {
   if (opts.type === 'reverb') {
     const { roomSize = 0.5 } = opts
     const convolver = ctx.createConvolver()
@@ -98,7 +98,23 @@ function buildEffectChain(ctx: AudioContext, opts: GroupEffectOptions): { entry:
   fb.gain.value = (opts as DelayEffectOptions).feedback ?? 0.3
   delay.connect(fb)
   fb.connect(delay)
-  return { entry: delay, exit: delay }
+  return {
+    entry: delay,
+    exit: delay,
+    // The feedback loop is internal to the chain: `clearGroupEffect` unhooks the
+    // delay from the group and the downstream node, so the delay → feedback and
+    // feedback → delay links must be dropped here or the pair stays alive
+    // forever (and keeps processing silence in the graph).
+    dispose: () => {
+      for (const node of [delay, fb]) {
+        try {
+          node.disconnect()
+        } catch {
+          /* already disconnected */
+        }
+      }
+    },
+  }
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -106,7 +122,9 @@ function buildEffectChain(ctx: AudioContext, opts: GroupEffectOptions): { entry:
 /**
  * Insert an audio effect on a group. Replaces any previously set effect.
  *
- * The signal graph becomes: `groupGain → effect → downstream`.
+ * The signal graph becomes: `groupGain → effect → downstream`. Only that one
+ * link is rewired: other fan-out connections from the group gain (analyser
+ * taps, analysers, recorders) are left intact.
  *
  * @example
  * // Add cave reverb to SFX group
@@ -116,15 +134,23 @@ function buildEffectChain(ctx: AudioContext, opts: GroupEffectOptions): { entry:
  * setGroupEffect('master', { type: 'lowpass', frequency: 800 })
  */
 export function setGroupEffect(group: AudioGroup | 'master', opts: GroupEffectOptions): void {
-  clearGroupEffect(group)
-
   const ctx = getAudioCtx()
   const groupGain = getGroupGainNode(group)
   const downstream: AudioNode = group === 'master' ? ctx.destination : getGroupGainNode('master')
 
+  // Drop the previous chain (and every node it owns) before building the new
+  // one, so a repeated call can never leave two chains on the same group.
+  clearGroupEffect(group)
+
   const chain = buildEffectChain(ctx, opts)
 
-  groupGain.disconnect()
+  // Remove only the direct group → downstream link; anything else the group
+  // gain feeds (e.g. an analyser tap) keeps its connection.
+  try {
+    groupGain.disconnect(downstream)
+  } catch {
+    /* no direct connection to remove */
+  }
   groupGain.connect(chain.entry)
   chain.exit.connect(downstream)
 
@@ -146,16 +172,19 @@ export function clearGroupEffect(group: AudioGroup | 'master'): void {
   const groupGain = getGroupGainNode(group)
   const downstream: AudioNode = group === 'master' ? ctx.destination : getGroupGainNode('master')
 
+  // Unhook the chain from both ends, then let it release internal links
+  // (a delay's feedback loop would otherwise keep its nodes alive forever).
   try {
-    groupGain.disconnect()
+    groupGain.disconnect(chain.entry)
   } catch {
     /* already disconnected */
   }
   try {
-    chain.exit.disconnect()
+    chain.exit.disconnect(downstream)
   } catch {
     /* already disconnected */
   }
+  chain.dispose?.()
 
   groupGain.connect(downstream)
   groupEffectNodes().delete(group)
