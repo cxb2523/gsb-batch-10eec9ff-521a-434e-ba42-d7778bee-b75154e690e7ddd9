@@ -30,7 +30,14 @@ const primalVel = vec3();
 export function tryPlayerMove(ctx: MovementContext, dt: number): void {
   let timeLeft = dt;
   let planeCount = 0;
-  let allFraction = 0;
+  // True once any sweep this tick reported a real, positive fraction. This is
+  // NOT the same as "the accumulated fraction is > 0": MINIMUM_MOVE_FRACTION
+  // deliberately zeroes near-zero fractions so they can't wreck the later
+  // time/distance maths. A wall-projected slide can legitimately leave only a
+  // sub-threshold fraction of the frame available, and that must not be read
+  // as "the mover was completely stuck". Only a tick where no sweep ever
+  // found room to advance zeroes the velocity.
+  let movedThisTick = false;
   copy(originalVel, ctx.velocity);
   copy(primalVel, ctx.velocity);
   ctx.surfing = false;
@@ -41,9 +48,14 @@ export function tryPlayerMove(ctx: MovementContext, dt: number): void {
     addScaled(ctx.moveEnd, ctx.origin, ctx.velocity, timeLeft);
     const tr = ctx.world.trace(ctx.origin, ctx.moveEnd, ctx.mins, ctx.maxs, ctx.traceResult);
 
+    // The true proportion of the move this sweep could complete. Kept before
+    // the MINIMUM_MOVE_FRACTION cleanup below so that (a) "did anything move
+    // at all this tick?" and (b) the contact log both see the real value.
+    const traceFraction = tr.fraction;
+    if (traceFraction > 0) movedThisTick = true;
+
     // Extremely tiny move fractions wreck the later distance maths.
     if (tr.fraction > 0 && tr.fraction < MINIMUM_MOVE_FRACTION) tr.fraction = 0;
-    allFraction += tr.fraction;
 
     if (tr.allSolid) {
       ctx.log('tryPlayerMove: allSolid — velocity zeroed');
@@ -59,7 +71,10 @@ export function tryPlayerMove(ctx: MovementContext, dt: number): void {
 
     const n = tr.normal;
     if (n === null) break;
-    ctx.contactsThisTick.push(n, tr.fraction);
+    // Log the plane and the proportion it actually covered — a wall contact
+    // that the distance maths rounds away is still a real contact worth
+    // surfacing to diagnostics.
+    ctx.contactsThisTick.push(n, traceFraction);
 
     timeLeft -= timeLeft * tr.fraction;
 
@@ -118,6 +133,6 @@ export function tryPlayerMove(ctx: MovementContext, dt: number): void {
     }
   }
 
-  // Never got anywhere this tick at all: nothing to carry.
-  if (allFraction === 0) set(ctx.velocity, 0, 0, 0);
+  // Nothing advanced the mover all tick: there is no slide to carry.
+  if (!movedThisTick) set(ctx.velocity, 0, 0, 0);
 }

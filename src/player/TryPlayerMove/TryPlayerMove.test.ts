@@ -10,6 +10,7 @@ import { vec3 } from '../../math/vec3';
 import { World } from '../../physics/World/World';
 import { brushFromAABB, brushFromOrientedBox } from '../../physics/Collision/Collision';
 import { PlayerController } from '../PlayerController';
+import { tryPlayerMove } from './TryPlayerMove';
 import { DEFAULT_SETTINGS } from '../../settings/Settings';
 import type { Settings } from '../../settings/Settings';
 
@@ -192,3 +193,149 @@ describe('wall contact (overbounce 1, allFraction)', () => {
   });
 });
 
+// A tick can bump several times. MINIMUM_MOVE_FRACTION zeroes a sweep that
+// covers almost none of the move so it can't wreck the distance maths — but
+// "that sweep was negligible" must not be mistaken for "the mover never moved
+// this tick". A wall-projected slide routinely leaves only a hair of the frame
+// available, and the old allFraction-sum test read that as a dead stop and
+// wiped the tangential speed. Only a tick where no sweep advanced at all is
+// allowed to zero the velocity.
+describe('airborne wall slide: deciding whether the tick moved at all', () => {
+  /** A tall vertical wall: solid for x >= 100, so the face is at x = 100. */
+  function wallWorld(): World {
+    const world = new World();
+    world.solids.push(brushFromAABB(vec3(100, -512, -4096), vec3(200, 4096, 4096)));
+    return world;
+  }
+
+  /** Open air, no geometry at all — nothing to hit, nothing to slide on. */
+  function emptyWorld(): World {
+    return new World();
+  }
+
+  it('keeps the tangential speed on an oblique airborne wall hit', () => {
+    // Start just short of the face at x=100 (hull half-width 16): one tick of
+    // 400 u/s covers 3.1u, enough to reach it.
+    const player = new PlayerController(wallWorld(), makeSettings(), vec3(82, 500, 0));
+    player.velocity.x = 400;
+    player.velocity.z = 300;
+    player.tick(DT);
+    // The into-wall component is removed; the along-wall one survives intact.
+    expect(player.velocity.z).toBeCloseTo(300, 6);
+    expect(player.velocity.x).toBeLessThanOrEqual(0.05);
+  });
+
+  it('keeps sliding along the wall across many frames of held input', () => {
+    const world = wallWorld();
+    const player = new PlayerController(world, makeSettings(), vec3(70, 500, -200));
+    player.yaw = -90; // strafe-right pushes +z, along the wall
+    player.input.right = true;
+    player.velocity.z = 300;
+
+    let previousZ = player.origin.z;
+    for (let i = 0; i < 192; i++) {
+      player.tick(DT);
+      // Every tick must still carry along-wall speed: never a dead stop.
+      expect(player.horizontalSpeed).toBeGreaterThan(250);
+      // ...and it must actually keep integrating down the wall.
+      if (i > 2) expect(player.origin.z).toBeGreaterThan(previousZ);
+      previousZ = player.origin.z;
+    }
+    expect(player.onGround).toBe(false);
+  });
+
+  it('records the wall contact with its real fraction (not the clamped 0)', () => {
+    // Resting a hair further out than the trace epsilon: the sweep into the
+    // wall completes a vanishingly small (but positive) share of the frame.
+    // That fraction is deliberately rounded away for the distance maths, yet
+    // the contact itself is real and must reach the per-tick log with its
+    // true fraction — movement diagnostics read it from there.
+    const world = wallWorld();
+    // Face is at x = 84 - DIST_EPSILON (hull-expanded); sit 1e-7 further out.
+    const player = new PlayerController(world, makeSettings(), vec3(84 - 0.03125 - 1e-7, 500, 0));
+    player.velocity.x = 600;
+    player.velocity.z = 300;
+
+    const fractions: number[] = [];
+    let loggedFraction = Number.NaN;
+    const origTrace = player.world.trace.bind(player.world);
+    (player.world as { trace: typeof origTrace }).trace = ((...args: Parameters<typeof origTrace>) => {
+      const tr = origTrace(...args);
+      if (tr.normal !== null && fractions.length === 0) {
+        fractions.push(tr.fraction);
+        // The contact is pushed right after this trace returns, so read what
+        // landed in the log on the very next sweep.
+      } else if (fractions.length === 1 && Number.isNaN(loggedFraction)) {
+        if (player.contactsThisTick.count > 0) loggedFraction = player.contactsThisTick.data[3];
+      }
+      return tr;
+    }) as typeof origTrace;
+    player.tick(DT);
+    (player.world as { trace: typeof origTrace }).trace = origTrace;
+
+    expect(fractions.length).toBeGreaterThan(0);
+    // A real, positive fraction well below MINIMUM_MOVE_FRACTION (1e-4).
+    expect(fractions[0]).toBeGreaterThan(0);
+    expect(fractions[0]).toBeLessThan(1e-4);
+    // The crash line: the contact carried its *real* fraction to the log
+    // instead of the clamped 0 the distance maths works with.
+    expect(loggedFraction).toBe(fractions[0]);
+    // ...and the slide kept its along-wall velocity.
+    expect(player.velocity.z).toBeCloseTo(300, 6);
+  });
+
+  it('still zeroes velocity when the tick genuinely moves nothing', () => {
+    // No geometry and no motion: every sweep returns fraction 1 over a
+    // zero-length move, so nothing advances — the velocity must be dropped.
+    const player = new PlayerController(emptyWorld(), makeSettings(), vec3(0, 500, 0));
+    player.velocity.x = 0;
+    player.velocity.y = 0;
+    player.velocity.z = 0;
+    // Give it a velocity whose swing is fully absorbed by the wall so that
+    // literally no position change is possible this tick.
+    const walled = new PlayerController(wallWorld(), makeSettings(), vec3(83.96875, 500, 0));
+    walled.velocity.x = 600;
+    walled.tick(DT);
+    expect(walled.horizontalSpeed).toBeLessThan(1);
+
+    player.tick(DT);
+    expect(player.horizontalSpeed).toBe(0);
+  });
+
+  it('keeps the tangential speed when every sweep is sub-threshold but real', () => {
+    // The exact shape of the bug, isolated from map geometry: a wall-projected
+    // slide whose *entire* remaining frame is below MINIMUM_MOVE_FRACTION.
+    // Those fractions are real movement (they are rounded away only so they
+    // can't wreck the distance maths), so the tick must not be treated as a
+    // dead stop. Driven through a stub trace so real brushes can't blur it.
+    const player = new PlayerController(emptyWorld(), makeSettings(), vec3(0, 500, 0));
+    player.velocity.x = 600;
+    player.velocity.z = 300;
+
+    const WALL = vec3(-1, 0, 0);
+    const tiny = 1e-6; // well under MINIMUM_MOVE_FRACTION (1e-4)
+    const stub = {
+      trace(start: { x: number; y: number; z: number }, end: { x: number; y: number; z: number }, _mins: unknown, _maxs: unknown, out: Record<string, unknown>) {
+        // Brush the wall: only a millionth of the requested move survives.
+        out.fraction = tiny;
+        (out.endPos as { x: number; y: number; z: number }).x = start.x + (end.x - start.x) * tiny;
+        (out.endPos as { x: number; y: number; z: number }).y = start.y + (end.y - start.y) * tiny;
+        (out.endPos as { x: number; y: number; z: number }).z = start.z + (end.z - start.z) * tiny;
+        out.normal = WALL;
+        out.startSolid = false;
+        out.allSolid = false;
+        return out;
+      },
+    };
+    (player as unknown as { world: typeof stub }).world = stub;
+
+    tryPlayerMove(player, DT);
+
+    // Along-wall speed survives; the into-wall component is gone.
+    expect(player.velocity.z).toBeCloseTo(300, 6);
+    expect(player.velocity.x).toBeLessThanOrEqual(0.05);
+    // The wall contact is still logged, with its real (sub-threshold) fraction.
+    expect(player.contactsThisTick.count).toBeGreaterThan(0);
+    expect(player.contactsThisTick.data[3]).toBe(tiny);
+  });
+});
