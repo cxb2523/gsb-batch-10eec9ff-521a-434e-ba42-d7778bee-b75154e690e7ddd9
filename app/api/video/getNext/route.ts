@@ -37,40 +37,57 @@ export async function GET(req: NextRequest) {
         .execute();
 
     let video: { id: string } | undefined;
-    let updated = false;
+
+    // Maximum number of claim attempts if a concurrently modified row
+    // cannot be updated. Each retry selects the next available video.
+    const maxClaimAttempts = 5;
 
     try {
         // Start a transaction
         await db.transaction().execute(async (trx) => {
-            // Select the first video with status UPLOADED
-            video = await trx.selectFrom('video')
-                .select(['id'])
-                .where('status', '=', 'UPLOADED')
-                .limit(1)
-                .executeTakeFirst();
+            for (let attempt = 0; attempt < maxClaimAttempts; attempt++) {
+                // Select the first video with status UPLOADED.
+                // FOR UPDATE ... SKIP LOCKED makes concurrent requests skip
+                // rows already locked by another transaction, so each request
+                // claims a different video instead of competing for the same one.
+                video = await trx.selectFrom('video')
+                    .select(['id'])
+                    .where('status', '=', 'UPLOADED')
+                    .orderBy('lastStatusUpdate', 'asc')
+                    .limit(1)
+                    .forUpdate()
+                    .skipLocked()
+                    .executeTakeFirst();
 
-            if (!video) {
-                // If no video is found, return early
-                return;
+                if (!video) {
+                    // If no video is found, return early
+                    return;
+                }
+
+                // Update the status of the selected video to PROCESSING.
+                // The row is locked by this transaction, so no other request
+                // can claim it in the meantime.
+                const result = await trx.updateTable('video')
+                    .set({
+                        status: 'PROCESSING',
+                        lastStatusUpdate: new Date()
+                    })
+                    .where('id', '=', video.id)
+                    .where('status', '=', 'UPLOADED')
+                    .executeTakeFirst();
+
+                // Check if any rows were affected
+                if ((result.numUpdatedRows ?? 0) > 0) {
+                    // Video claimed successfully
+                    return;
+                }
+
+                // The row was concurrently modified; retry with the next
+                // available video instead of aborting the whole request.
             }
 
-            // Update the status of the selected video to PROCESSING
-            const result = await trx.updateTable('video')
-                .set({
-                    status: 'PROCESSING',
-                    lastStatusUpdate: new Date()
-                })
-                .where('id', '=', video.id)
-                .where('status', '=', 'UPLOADED')
-                .executeTakeFirst();
-
-            // Check if any rows were affected
-            updated = (result.numUpdatedRows ?? 0) > 0;
-
-            // If no rows were updated, throw an error to rollback the transaction
-            if (!updated) {
-                throw new Error("Video transaction failed");
-            }
+            // Could not claim any video within the attempt limit
+            video = undefined;
         });
 
         if (!video) {
