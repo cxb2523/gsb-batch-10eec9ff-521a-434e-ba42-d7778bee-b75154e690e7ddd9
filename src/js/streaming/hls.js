@@ -16,6 +16,12 @@ class Hlsjs {
     this.networkErrorRetries = 0;
     this.mediaErrorRetries = 0;
 
+    // media clock captured when this source was set up. Until the media
+    // element reports another time, the value still belongs to the previous
+    // source.
+    this.initialTime = player.media.currentTime;
+    this.timeReady = false;
+
     this.url = player.config.hls.url;
 
     if (player.subtitles.enabled && !player.subtitles.config.timestampMap) {
@@ -34,6 +40,14 @@ class Hlsjs {
   };
 
   detach = () => {
+    // The subtitle state belongs to the stream being detached. Only the
+    // active, non-native controller may clear it: stale controllers must not
+    // touch the tracks already announced by a later source, and the native
+    // branch keeps its own native tracks.
+    if (!this.native && this.player.streaming.hlsController === this) {
+      this.player.subtitles.resetHlsTracks();
+    }
+
     const hls = this.hls;
     this.hls = null;
 
@@ -45,6 +59,27 @@ class Hlsjs {
     hls.detachMedia();
     hls.destroy();
     clearInterval(hls.bufferTimer);
+  };
+
+  // Current live trimming reference for the cues of this source.
+  // Returns null while the media clock cannot be trusted yet, so the time of
+  // the previous source is never used to trim the new one.
+  liveCutoff = () => {
+    const { currentTime } = this.player.media;
+
+    if (!is.number(currentTime)) {
+      return null;
+    }
+
+    if (!this.timeReady) {
+      if (currentTime === this.initialTime) {
+        return null;
+      }
+
+      this.timeReady = true;
+    }
+
+    return currentTime - LIVE_CUE_RETENTION_SECONDS;
   };
 
   useNative = () => {
@@ -187,6 +222,8 @@ class Hlsjs {
       // ocultar subtitulos de hls
       hls.subtitleDisplay = false;
 
+      const announced = [];
+
       for (const rawTrack of data.tracks) {
         let id = rawTrack._id;
         let forced = false;
@@ -200,7 +237,7 @@ class Hlsjs {
           lang = rawTrack.subtitleTrack.lang;
         }
 
-        const track = {
+        announced.push({
           id,
           type: 'hls',
           kind: rawTrack.kind,
@@ -209,10 +246,15 @@ class Hlsjs {
           srclang: lang,
           default: rawTrack.default,
           forced,
-        };
-
-        player.subtitles.addTrack(track);
+        });
       }
+
+      // hls.js emits one track at a time for in-stream captions (CEA-608/708)
+      // and the complete rendition list for the subtitle playlists of the
+      // manifest. Only that complete list can prune tracks that are gone.
+      const complete = data.tracks.every((rawTrack) => !is.nullOrUndefined(rawTrack.subtitleTrack));
+
+      player.subtitles.syncHlsTracks(announced, complete);
 
       player.subtitles.emulateTextTracks('external');
     });
@@ -233,14 +275,14 @@ class Hlsjs {
           id === data.track.replace(/subtitles/, '') ||
           (track.type === 'hls' && track.default && data.track === 'default')
         ) {
-          const liveCutoff = player.streaming.live.active
-            ? player.media.currentTime - LIVE_CUE_RETENTION_SECONDS
-            : -Infinity;
+          // Only live sources are trimmed, and only with the clock of the
+          // source that produced these cues.
+          const liveCutoff = player.streaming.live.active ? this.liveCutoff() : null;
 
           let cueCount = 0;
 
           for (const cue of track.cues) {
-            if (cue.endTime >= liveCutoff) {
+            if (liveCutoff === null || cue.endTime >= liveCutoff) {
               track.cues[cueCount++] = cue;
             }
           }
@@ -252,7 +294,7 @@ class Hlsjs {
               break;
             }
 
-            if (cue.endTime >= liveCutoff) {
+            if (liveCutoff === null || cue.endTime >= liveCutoff) {
               track.cues.push(cue);
             }
           }

@@ -278,6 +278,194 @@ class Subtitles {
     });
   };
 
+  isSameHlsTrack = (track, other) =>
+    track.type === 'hls' &&
+    other.type === 'hls' &&
+    track.id === other.id &&
+    track.kind === other.kind &&
+    track.label === other.label &&
+    track.srclang === other.srclang;
+
+  // The ids of the external tracks are positional (e-0, e-1, ...), so they
+  // have to be reassigned whenever a track leaves the list. The selection
+  // follows its track.
+  reindexHlsTracks = () => {
+    let index = 0;
+
+    for (const track of this.tracks) {
+      const meta = this.meta.get(track);
+
+      if (track.type !== 'hls' || !meta) {
+        continue;
+      }
+
+      const id = this.getSubtitleId('hls', index++);
+
+      if (this.currentTrack === meta.id) {
+        this.currentTrack = id;
+      }
+
+      meta.id = id;
+    }
+
+    this.externalTracks = index;
+
+    // keep the saved value meaningful, positional ids shift
+    if (String(this.currentTrack).startsWith('e-')) {
+      this.saveConfig(this.currentTrack);
+    }
+  };
+
+  // Register the subtitle tracks announced by the current HLS source.
+  // hls.js can announce the same list more than once, so an already
+  // registered track is refreshed instead of appended again.
+  // When the announced list is the complete one for its kind, tracks of that
+  // kind that are no longer announced are dropped together with their cues.
+  syncHlsTracks = (announced, complete = false) => {
+    if (!this.enabled) {
+      return;
+    }
+
+    if (complete) {
+      const kinds = new Set(announced.map((track) => track.kind));
+
+      const removed = this.tracks.filter(
+        (track) =>
+          track.type === 'hls' &&
+          kinds.has(track.kind) &&
+          !announced.some((item) => this.isSameHlsTrack(track, item)),
+      );
+
+      if (removed.length) {
+        this.tracks = this.tracks.filter((track) => !removed.includes(track));
+
+        // if the selected subtitle is gone, the menu goes back to "off"
+        const selected = removed.find((track) => this.meta.get(track)?.id === this.currentTrack);
+
+        if (selected) {
+          this.currentTrack = -1;
+          this.internalTrack = false;
+          this.active = false;
+
+          if (this.subtitles) {
+            emptyEl(this.subtitles);
+            toggleClass(this.subtitles, 'hide', true);
+          }
+
+          // positional ids are reassigned below, keeping the old one saved
+          // would silently select a different language
+          this.saveConfig('-1');
+        }
+
+        this.reindexHlsTracks();
+      }
+    }
+
+    for (const track of announced) {
+      const registered = this.tracks.find((item) => this.isSameHlsTrack(item, track));
+
+      if (registered) {
+        registered.src = track.src;
+        registered.default = track.default;
+        registered.forced = track.forced || false;
+
+        continue;
+      }
+
+      this.addTrack(track);
+    }
+  };
+
+  // Forget everything announced by the previous stream and return the menu to
+  // the "off" state. Tracks that do not belong to the stream, such as <track>
+  // elements, are kept.
+  //
+  // The selection is not saved here: the saved value is kept and re-applied
+  // by the usual rules once the new source announces its own tracks.
+  resetHlsTracks = () => {
+    // Native tracks live on the media element and follow the native HLS /
+    // <track> branch, which keeps its own lifecycle.
+    if (!this.enabled || this.native || this.destroyed) {
+      return;
+    }
+
+    this.tracks = this.tracks.filter((track) => track.type !== 'hls');
+
+    // the external ids are assigned sequentially, start over
+    this.externalTracks = 0;
+
+    // a subtitle coming from a <track> element does not belong to the stream
+    const keepSelection = String(this.currentTrack).startsWith('i-');
+
+    if (!keepSelection) {
+      // stop rendering the cues of the previous source
+      this.currentTrack = -1;
+      this.internalTrack = false;
+      this.active = false;
+
+      if (this.subtitles) {
+        emptyEl(this.subtitles);
+        toggleClass(this.subtitles, 'hide', true);
+      }
+    }
+
+    if (!this.page) {
+      return;
+    }
+
+    const { player } = this;
+    const items = new DocumentFragment();
+
+    this.height = this.defaultSize.height + player.menu.item.height;
+
+    // the menu is back to "off" unless a <track> element keeps the selection
+    items.appendChild(
+      createElement(
+        'li',
+        {
+          class: keepSelection ? null : 'cvp_active',
+          'data-track': -1,
+        },
+        player.config.captions.off,
+      ),
+    );
+
+    let label = player.config.captions.off;
+
+    // keep the options that do not belong to the stream
+    for (const track of this.tracks) {
+      const meta = this.meta.get(track);
+
+      if (track.forced || !meta) {
+        continue;
+      }
+
+      const active = meta.id === this.currentTrack;
+
+      if (active) {
+        label = track.label;
+      }
+
+      items.appendChild(
+        createElement(
+          'li',
+          {
+            class: active ? 'cvp_active' : null,
+            'data-track': meta.id,
+          },
+          track.label,
+        ),
+      );
+
+      this.height += player.menu.item.height;
+    }
+
+    emptyEl(this.page);
+    this.page.appendChild(items);
+
+    this.item.lastChild.textContent = label;
+  };
+
   downloadTrack = (url) => {
     this.request?.abort();
 

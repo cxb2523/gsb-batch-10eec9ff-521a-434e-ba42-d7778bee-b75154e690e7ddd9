@@ -77,6 +77,458 @@ test('HLS bounds subtitle cues and prunes expired live cues', async ({ page }) =
   expect(state).toEqual({ count: 20000, first: '0', last: '19999', hasExpired: false });
 });
 
+const hlsSubtitleFixture = async (page) => {
+  await loadPlayer(page, video('https://example.test/first.m3u8', 'application/x-mpegURL'));
+
+  await page.evaluate(() =>
+    window.fluidPlayer('player', {
+      hls: { url: '/static/mock-hls.js' },
+      layoutControls: { subtitles: { active: false }, menu: { subtitles: true } },
+      storage: { key: 'hls-subtitle-source-change' },
+    }),
+  );
+
+  await expect.poll(() => page.evaluate(() => window.mockHlsInstances?.length)).toBe(1);
+};
+
+test('HLS subtitle tracks, cues and menu are cleared when the source changes', async ({ page }) => {
+  await hlsSubtitleFixture(page);
+
+  const first = await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+    const hls = window.mockHlsInstances[0];
+
+    Object.defineProperty(player.media, 'currentTime', { configurable: true, value: 1000 });
+    hls.emit(window.Hls.Events.LEVEL_LOADED, { details: { live: true } });
+    hls.emit(window.Hls.Events.NON_NATIVE_TEXT_TRACKS_FOUND, {
+      tracks: [
+        {
+          kind: 'subtitles',
+          label: 'English',
+          default: false,
+          subtitleTrack: { id: 0, name: 'English', lang: 'en', url: 'https://example.test/en.vtt' },
+        },
+      ],
+    });
+    hls.emit(window.Hls.Events.CUES_PARSED, {
+      track: '0',
+      cues: [{ startTime: 990, endTime: 995, text: 'first source' }],
+    });
+
+    player.subtitles.set('e-0');
+
+    return {
+      selected: player.subtitles.currentTrack,
+      cueCount: player.subtitles.getTracks()[0].cues.length,
+      label: player.subtitles.item.lastChild.textContent,
+      options: Array.from(player.subtitles.page.querySelectorAll('li')).map((li) => li.textContent),
+    };
+  });
+
+  expect(first).toEqual({ selected: 'e-0', cueCount: 1, label: 'English', options: ['Off', 'English'] });
+
+  await page.evaluate(() =>
+    window.fluidPlayerDebug.at(-1).instance.src({ src: 'https://example.test/second.m3u8', type: 'application/x-mpegURL' }),
+  );
+  await expect.poll(() => page.evaluate(() => window.mockHlsInstances?.length)).toBe(2);
+
+  const second = await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+    const oldHls = window.mockHlsInstances[0];
+    const newHls = window.mockHlsInstances[1];
+
+    return {
+      oldDestroyed: oldHls.destroyed,
+      oldMediaDetached: oldHls.detachCalls > 0,
+      tracks: player.subtitles.tracks.length,
+      currentTrack: player.subtitles.currentTrack,
+      active: player.subtitles.active,
+      cueCount: player.subtitles.tracks.reduce((total, track) => total + track.cues.length, 0),
+      label: player.subtitles.item.lastChild.textContent,
+      options: Array.from(player.subtitles.page.querySelectorAll('li')).map((li) => li.textContent),
+      containerHidden: player.subtitles.subtitles.classList.contains('hide'),
+      newSource: newHls.source,
+      newSubtitleTrack: newHls.subtitleTrack,
+    };
+  });
+
+  expect(second).toEqual({
+    oldDestroyed: true,
+    oldMediaDetached: true,
+    tracks: 0,
+    currentTrack: -1,
+    active: false,
+    cueCount: 0,
+    label: 'Off',
+    options: ['Off'],
+    containerHidden: true,
+    newSource: 'https://example.test/second.m3u8',
+    newSubtitleTrack: undefined,
+  });
+});
+
+test('HLS rebuilds the subtitle menu once the new source announces its tracks', async ({ page }) => {
+  await hlsSubtitleFixture(page);
+
+  await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+    const hls = window.mockHlsInstances[0];
+
+    hls.emit(window.Hls.Events.NON_NATIVE_TEXT_TRACKS_FOUND, {
+      tracks: [
+        {
+          kind: 'subtitles',
+          label: 'English',
+          default: true,
+          subtitleTrack: { id: 0, name: 'English', lang: 'en', url: 'https://example.test/en.vtt' },
+        },
+        {
+          kind: 'subtitles',
+          label: 'Deutsch',
+          default: false,
+          subtitleTrack: { id: 1, name: 'Deutsch', lang: 'de', url: 'https://example.test/de.vtt' },
+        },
+      ],
+    });
+    // an existing saved selection must be applied again by the usual rules
+    player.subtitles.set('e-1');
+  });
+
+  await page.evaluate(() =>
+    window.fluidPlayerDebug.at(-1).instance.src({ src: 'https://example.test/second.m3u8', type: 'application/x-mpegURL' }),
+  );
+  await expect.poll(() => page.evaluate(() => window.mockHlsInstances?.length)).toBe(2);
+
+  const state = await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+    const newHls = window.mockHlsInstances[1];
+
+    newHls.emit(window.Hls.Events.NON_NATIVE_TEXT_TRACKS_FOUND, {
+      tracks: [
+        {
+          kind: 'subtitles',
+          label: 'Deutsch',
+          default: false,
+          subtitleTrack: { id: 2, name: 'Deutsch', lang: 'de', url: 'https://example.test/de2.vtt' },
+        },
+        {
+          kind: 'subtitles',
+          label: 'Français',
+          default: false,
+          subtitleTrack: { id: 3, name: 'Français', lang: 'fr', url: 'https://example.test/fr.vtt' },
+        },
+      ],
+    });
+
+    return {
+      options: Array.from(player.subtitles.page.querySelectorAll('li')).map((li) => li.textContent),
+      tracks: player.subtitles.tracks.map((track) => track.label),
+      selected: player.subtitles.currentTrack,
+      label: player.subtitles.item.lastChild.textContent,
+      // the saved value survives, the usual rules re-apply it per source
+      saved: player.storage.get('subtitles'),
+    };
+  });
+
+  expect(state).toEqual({
+    options: ['Off', 'Deutsch', 'Français'],
+    tracks: ['Deutsch', 'Français'],
+    selected: 'e-1',
+    label: 'Français',
+    saved: 'e-1',
+  });
+});
+
+test('HLS keeps the subtitle menu closed when the new source has no subtitles', async ({ page }) => {
+  await hlsSubtitleFixture(page);
+
+  await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+    const hls = window.mockHlsInstances[0];
+
+    hls.emit(window.Hls.Events.NON_NATIVE_TEXT_TRACKS_FOUND, {
+      tracks: [
+        {
+          kind: 'subtitles',
+          label: 'English',
+          default: true,
+          subtitleTrack: { id: 0, name: 'English', lang: 'en', url: 'https://example.test/en.vtt' },
+        },
+      ],
+    });
+    hls.emit(window.Hls.Events.CUES_PARSED, {
+      track: '0',
+      cues: [{ startTime: 0, endTime: 10, text: 'first source' }],
+    });
+
+    player.subtitles.set('e-0');
+  });
+
+  await page.evaluate(() =>
+    window.fluidPlayerDebug.at(-1).instance.src({ src: 'https://example.test/no-subtitles.m3u8', type: 'application/x-mpegURL' }),
+  );
+  await expect.poll(() => page.evaluate(() => window.mockHlsInstances?.length)).toBe(2);
+
+  const state = await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+
+    // the new manifest announces no subtitle rendition at all
+    window.mockHlsInstances[1].emit(window.Hls.Events.MANIFEST_PARSED, { levels: [] });
+
+    return {
+      tracks: player.subtitles.tracks.length,
+      options: Array.from(player.subtitles.page.querySelectorAll('li')).map((li) => li.textContent),
+      label: player.subtitles.item.lastChild.textContent,
+      currentTrack: player.subtitles.currentTrack,
+    };
+  });
+
+  expect(state).toEqual({ tracks: 0, options: ['Off'], label: 'Off', currentTrack: -1 });
+});
+
+test('HLS trims cues with the new source clock instead of the stale one', async ({ page }) => {
+  await hlsSubtitleFixture(page);
+
+  await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+    const hls = window.mockHlsInstances[0];
+
+    Object.defineProperty(player.media, 'currentTime', { configurable: true, value: 9000, writable: true });
+    hls.emit(window.Hls.Events.NON_NATIVE_TEXT_TRACKS_FOUND, {
+      tracks: [
+        {
+          kind: 'subtitles',
+          label: 'English',
+          default: true,
+          subtitleTrack: { id: 0, name: 'English', lang: 'en', url: 'https://example.test/en.vtt' },
+        },
+      ],
+    });
+  });
+
+  await page.evaluate(() =>
+    window.fluidPlayerDebug.at(-1).instance.src({ src: 'https://example.test/second.m3u8', type: 'application/x-mpegURL' }),
+  );
+  await expect.poll(() => page.evaluate(() => window.mockHlsInstances?.length)).toBe(2);
+
+  const state = await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+    const newHls = window.mockHlsInstances[1];
+
+    newHls.emit(window.Hls.Events.LEVEL_LOADED, { details: { live: true } });
+    newHls.emit(window.Hls.Events.NON_NATIVE_TEXT_TRACKS_FOUND, {
+      tracks: [
+        {
+          kind: 'subtitles',
+          label: 'English',
+          default: true,
+          subtitleTrack: { id: 0, name: 'English', lang: 'en', url: 'https://example.test/en.vtt' },
+        },
+      ],
+    });
+
+    // the media clock still reports the previous source time, so nothing is
+    // trimmed with it (the stale 9000 would have dropped the old cue already)
+    const cues = [
+      { startTime: 0, endTime: 100, text: 'stale' },
+      { startTime: 8800, endTime: 8900, text: 'ahead' },
+    ];
+    newHls.emit(window.Hls.Events.CUES_PARSED, { track: '0', cues });
+
+    const beforeClock = player.subtitles.getTracks()[0].cues.map((cue) => cue.text);
+
+    // once the clock belongs to the new source, the 300s window applies to it
+    player.media.currentTime = 5000;
+    newHls.emit(window.Hls.Events.CUES_PARSED, {
+      track: '0',
+      cues: [{ startTime: 5000, endTime: 5100, text: 'fresh' }],
+    });
+
+    return {
+      beforeClock,
+      afterClock: player.subtitles.getTracks()[0].cues.map((cue) => cue.text),
+    };
+  });
+
+  expect(state).toEqual({ beforeClock: ['stale', 'ahead'], afterClock: ['ahead', 'fresh'] });
+});
+
+test('repeated HLS text track announcements do not duplicate menu entries', async ({ page }) => {
+  await hlsSubtitleFixture(page);
+
+  const state = await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+    const hls = window.mockHlsInstances[0];
+    const tracks = [
+      {
+        kind: 'subtitles',
+        label: 'English',
+        default: false,
+        subtitleTrack: { id: 0, name: 'English', lang: 'en', url: 'https://example.test/en.vtt' },
+      },
+    ];
+
+    hls.emit(window.Hls.Events.NON_NATIVE_TEXT_TRACKS_FOUND, { tracks });
+    hls.emit(window.Hls.Events.NON_NATIVE_TEXT_TRACKS_FOUND, { tracks });
+
+    return {
+      tracks: player.subtitles.tracks.length,
+      options: Array.from(player.subtitles.page.querySelectorAll('li')).map((li) => li.textContent),
+    };
+  });
+
+  expect(state).toEqual({ tracks: 1, options: ['Off', 'English'] });
+});
+
+test('HLS drops a selected rendition that disappears from the new track list', async ({ page }) => {
+  await hlsSubtitleFixture(page);
+
+  const state = await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+    const hls = window.mockHlsInstances[0];
+    const rendition = (id, label, lang) => ({
+      kind: 'subtitles',
+      label,
+      default: false,
+      subtitleTrack: { id, name: label, lang, url: `https://example.test/${lang}.vtt` },
+    });
+
+    hls.emit(window.Hls.Events.NON_NATIVE_TEXT_TRACKS_FOUND, {
+      tracks: [rendition(0, 'English', 'en'), rendition(1, 'Deutsch', 'de')],
+    });
+    player.subtitles.set('e-1');
+
+    // the same source re-announces a shorter list without the selected track
+    hls.emit(window.Hls.Events.NON_NATIVE_TEXT_TRACKS_FOUND, {
+      tracks: [rendition(0, 'English', 'en')],
+    });
+
+    return {
+      tracks: player.subtitles.tracks.map((track) => track.label),
+      options: Array.from(player.subtitles.page.querySelectorAll('li')).map((li) => li.textContent),
+      selected: player.subtitles.currentTrack,
+      active: player.subtitles.active,
+      label: player.subtitles.item.lastChild.textContent,
+    };
+  });
+
+  expect(state).toEqual({
+    tracks: ['English'],
+    options: ['Off', 'English'],
+    // 'update' re-applies the saved "off" value, which is the string form
+    selected: '-1',
+    active: false,
+    label: 'Off',
+  });
+});
+
+test('HLS subtitle state is rebuilt when a quality switch reloads the stream', async ({ page }) => {
+  // starting from a native source enables the quality list for mixed types,
+  // and picking the stream rebuilds the HLS adapter through player.loadSource
+  await loadPlayer(page, video('/static/sample.webm', 'video/webm'));
+
+  await page.evaluate(() =>
+    window.fluidPlayer('player', {
+      hls: { url: '/static/mock-hls.js' },
+      layoutControls: { subtitles: { active: false }, menu: { subtitles: true, qualityLevels: true } },
+      storage: { key: 'hls-subtitle-quality-switch' },
+    }),
+  );
+
+  const before = await page.evaluate(() => {
+    const api = window.fluidPlayerDebug.at(-1).instance;
+    const player = window.fluidPlayerDebug.at(-1).internals;
+
+    api.src([
+      { src: '/static/sample.webm', type: 'video/webm' },
+      { src: 'https://example.test/stream.m3u8', type: 'application/x-mpegURL' },
+    ]);
+
+    return {
+      multipleSourceTypes: player.multipleSourceTypes,
+      quality: player.quality.sources.map((source) => source.src),
+    };
+  });
+
+  expect(before.multipleSourceTypes).toBe(true);
+  expect(before.quality).toHaveLength(2);
+
+  // the quality menu selects the stream and rebuilds the adapter
+  const index = before.quality.findIndex((source) => source.endsWith('.m3u8'));
+  await page.evaluate((value) => window.fluidPlayerDebug.at(-1).internals.quality.set(value), index);
+  await expect.poll(() => page.evaluate(() => window.mockHlsInstances?.length)).toBe(1);
+
+  const withTracks = await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+    const hls = window.mockHlsInstances[0];
+
+    hls.emit(window.Hls.Events.NON_NATIVE_TEXT_TRACKS_FOUND, {
+      tracks: [
+        {
+          kind: 'subtitles',
+          label: 'English',
+          default: false,
+          subtitleTrack: { id: 0, name: 'English', lang: 'en', url: 'https://example.test/en.vtt' },
+        },
+      ],
+    });
+    player.subtitles.set('e-0');
+
+    return {
+      source: player.currentSource.src,
+      tracks: player.subtitles.getTracks().map((track) => track.label),
+      selected: player.subtitles.currentTrack,
+    };
+  });
+
+  expect(withTracks).toMatchObject({ source: 'https://example.test/stream.m3u8', tracks: ['English'], selected: 'e-0' });
+
+  const nativeIndex = before.quality.findIndex((source) => !source.endsWith('.m3u8'));
+
+  // switching to the native entry detaches the HLS adapter
+  await page.evaluate((value) => window.fluidPlayerDebug.at(-1).internals.quality.set(value), nativeIndex);
+
+  const cleared = await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+
+    return {
+      source: player.currentSource.src,
+      tracks: player.subtitles.tracks.length,
+      label: player.subtitles.item.lastChild.textContent,
+      options: Array.from(player.subtitles.page.querySelectorAll('li')).map((li) => li.textContent),
+    };
+  });
+
+  expect(cleared).toMatchObject({ tracks: 0, label: 'Off', options: ['Off'] });
+  expect(cleared.source).toContain('/static/sample.webm');
+
+  // going back to the stream reloads it with a clean subtitle state
+  await page.evaluate((value) => window.fluidPlayerDebug.at(-1).internals.quality.set(value), index);
+  await expect.poll(() => page.evaluate(() => window.mockHlsInstances?.length)).toBe(2);
+
+  const after = await page.evaluate(() => {
+    const player = window.fluidPlayerDebug.at(-1).internals;
+
+    window.mockHlsInstances[1].emit(window.Hls.Events.NON_NATIVE_TEXT_TRACKS_FOUND, {
+      tracks: [
+        {
+          kind: 'subtitles',
+          label: 'Deutsch',
+          default: false,
+          subtitleTrack: { id: 0, name: 'Deutsch', lang: 'de', url: 'https://example.test/de.vtt' },
+        },
+      ],
+    });
+
+    return {
+      tracks: player.subtitles.getTracks().map((track) => track.label),
+      options: Array.from(player.subtitles.page.querySelectorAll('li')).map((li) => li.textContent),
+    };
+  });
+
+  expect(after).toEqual({ tracks: ['Deutsch'], options: ['Off', 'Deutsch'] });
+});
+
 test('DASH initializes local adapter and detaches cleanly', async ({ page }) => {
   await loadPlayer(page, video('https://example.test/media/dash', 'application/dash+xml'));
 

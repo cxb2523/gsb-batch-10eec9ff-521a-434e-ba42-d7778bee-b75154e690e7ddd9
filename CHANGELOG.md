@@ -5,6 +5,11 @@
 - Updated deployment setup for a LAN VM behind Cloudflare Tunnel with a loopback-only HTTP origin.
 - Removed the retired Docker deployment stack.
 
+### Fixed
+
+- Cleared the HLS subtitle tracks, cue cache and menu entries when the source changes, so the menu only lists the tracks of the current stream.
+- Trimmed live HLS subtitle cues with the clock of the source that produced them instead of a stale one.
+
 # 2.2.0 (2026-10-07)
 
 ### Added
