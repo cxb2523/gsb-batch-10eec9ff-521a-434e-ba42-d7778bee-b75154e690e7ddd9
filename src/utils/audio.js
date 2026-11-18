@@ -2,6 +2,8 @@ class AudioSynthesizer {
   constructor() {
     this.audioCtx = null;
     this.soundEnabled = true;
+    // Oscillators that are still sounding, so a reset can silence them.
+    this.activeOscillators = new Set();
   }
 
   init() {
@@ -14,6 +16,26 @@ class AudioSynthesizer {
     if (this.audioCtx && this.audioCtx.state === 'suspended') {
       this.audioCtx.resume();
     }
+  }
+
+  track(osc) {
+    this.activeOscillators.add(osc);
+    osc.onended = () => {
+      this.activeOscillators.delete(osc);
+    };
+  }
+
+  // Called on reset: cancels every pending/pending-scheduled tone.
+  stopAll() {
+    this.activeOscillators.forEach((osc) => {
+      try {
+        osc.stop();
+        osc.disconnect();
+      } catch {
+        // Already stopped or disconnected: nothing to clean up.
+      }
+    });
+    this.activeOscillators.clear();
   }
 
   toggleSound() {
@@ -38,6 +60,7 @@ class AudioSynthesizer {
 
       osc.connect(gain);
       gain.connect(this.audioCtx.destination);
+      this.track(osc);
       osc.start();
       osc.stop(this.audioCtx.currentTime + 0.2);
     } catch (e) {
@@ -65,6 +88,7 @@ class AudioSynthesizer {
 
       osc.connect(gain);
       gain.connect(this.audioCtx.destination);
+      this.track(osc);
       osc.start();
       osc.stop(this.audioCtx.currentTime + 0.35);
     } catch (e) {
@@ -91,6 +115,7 @@ class AudioSynthesizer {
 
         osc.connect(gain);
         gain.connect(this.audioCtx.destination);
+        this.track(osc);
         osc.start(this.audioCtx.currentTime + idx * 0.1);
         osc.stop(this.audioCtx.currentTime + idx * 0.1 + 0.85);
       });

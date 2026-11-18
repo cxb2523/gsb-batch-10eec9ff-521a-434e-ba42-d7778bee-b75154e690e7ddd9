@@ -34,9 +34,16 @@ function getSunflowerSprite() {
   return cachedSunflowerSprite;
 }
 
-export function ParticleCanvas({ triggerBurst }) {
+export function ParticleCanvas({ triggerBurst, resetKey = 0 }) {
   const canvasRef = useRef(null);
   const particlesRef = useRef([]);
+
+  // A reset (watering again after blooming) must purge any celebration
+  // particles still in flight so they cannot outlive the old state.
+  useEffect(() => {
+    if (resetKey === 0) return;
+    particlesRef.current = particlesRef.current.filter((p) => p.type !== 'sunflower');
+  }, [resetKey]);
 
   useEffect(() => {
     const canvas = canvasRef.current;

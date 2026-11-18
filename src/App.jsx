@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import './App.css';
 import { Header } from './components/Header';
 import { PlantSvg } from './components/PlantSvg';
@@ -71,6 +71,14 @@ const STAGES = [
   }
 ];
 
+// Timing of a single watering flow (one click = one cancellable sequence).
+const GROW_DELAY_MS = 350;      // stage/stem update, then the grow sound
+const MODAL_DELAY_MS = 400;     // blessing card popup
+const RIPPLE_DELAY_MS = 650;    // splash ripple under the pot
+// The flow is done once the stem transition (0.35s delay + 0.7s) and the
+// ripple (0.65s + 0.5s) have finished; until then extra clicks are ignored.
+const FLOW_DURATION_MS = 1150;
+
 export function App() {
   const [currentStage, setCurrentStage] = useState(0);
   const [showModal, setShowModal] = useState(false);
@@ -78,43 +86,110 @@ export function App() {
   const [dropsKey, setDropsKey] = useState(0);
   const [showRipple, setShowRipple] = useState(false);
   const [triggerBurst, setTriggerBurst] = useState(false);
+  const [particlesResetKey, setParticlesResetKey] = useState(0);
+
+  // Every delayed callback of the current watering flow is tracked here so a
+  // reset can cancel all of them before they mutate state.
+  const timersRef = useRef(new Set());
+  // True while a watering flow is in progress: repeated clicks are ignored.
+  const flowLockRef = useRef(false);
 
   const stage = STAGES[currentStage];
 
-  const handleWater = () => {
-    audioSynth.playWaterSound();
+  const clearTimers = () => {
+    timersRef.current.forEach((id) => clearTimeout(id));
+    timersRef.current.clear();
+  };
 
-    // Trigger water drop animation
-    const newKey = Date.now();
-    setDropsKey(newKey);
+  const schedule = (callback, delay) => {
+    const id = setTimeout(() => {
+      timersRef.current.delete(id);
+      callback();
+    }, delay);
+    timersRef.current.add(id);
+    return id;
+  };
+
+  // Unmount cleanup: never let a pending callback or tone outlive the page.
+  useEffect(() => () => {
+    timersRef.current.forEach((id) => clearTimeout(id));
+    timersRef.current.clear();
+    audioSynth.stopAll();
+  }, []);
+
+  const playWaterEffects = () => {
+    audioSynth.playWaterSound();
+    setDropsKey((key) => key + 1);
     setShowRipple(false);
-    setTimeout(() => setShowRipple(true), 650);
+    schedule(() => setShowRipple(true), RIPPLE_DELAY_MS);
+  };
+
+  // One watering = one locked, cancellable flow: startWatering() schedules the
+  // work and releases the input lock only once the visible effects are done.
+  const startFlow = () => {
+    flowLockRef.current = true;
+    playWaterEffects();
+    schedule(() => {
+      flowLockRef.current = false;
+    }, FLOW_DURATION_MS);
+  };
+
+  const resetExperience = () => {
+    // Cancel anything the previous flows left pending before touching state.
+    clearTimers();
+    flowLockRef.current = false;
+    audioSynth.stopAll();
+
+    setCurrentStage(0);
+    setShowModal(false);
+    setBloomSunflower(false);
+    setShowRipple(false);
+    setTriggerBurst(false);
+    setParticlesResetKey((key) => key + 1);
+  };
+
+  const handleWater = () => {
+    // A flow is already running: ignore extra clicks until it finishes.
+    if (flowLockRef.current) return;
+
+    // The blessing card is already on screen: the button must not advance.
+    if (showModal) return;
 
     if (bloomSunflower) {
-      setCurrentStage(0);
-      setBloomSunflower(false);
-      setShowModal(false);
-      setTriggerBurst(false);
+      // Bloomed flower: watering restarts the experience from stage 0.
+      resetExperience();
+      startFlow();
       return;
     }
 
     if (stage.triggersModal) {
-      setTimeout(() => {
-        setShowModal(true);
-      }, 400);
+      // The popup is scheduled exactly once per arrival at this stage.
+      startFlow();
+      schedule(() => setShowModal(true), MODAL_DELAY_MS);
       return;
     }
 
     if (currentStage < STAGES.length - 1) {
       const nextStage = currentStage + 1;
-      setTimeout(() => {
+      startFlow();
+      schedule(() => {
         setCurrentStage(nextStage);
         audioSynth.playGrowSound(nextStage);
-      }, 350);
+      }, GROW_DELAY_MS);
+      return;
     }
+
+    // Nothing to advance: still play the water effects, then release the lock.
+    startFlow();
   };
 
   const handleRevealFlower = () => {
+    // Only the visible card can bloom the flower, and only once.
+    if (!showModal || bloomSunflower) return;
+    // Any pending watering timers are irrelevant once the flower blooms.
+    clearTimers();
+    // Blooming is terminal: the next watering click restarts the experience.
+    flowLockRef.current = false;
     setShowModal(false);
     setBloomSunflower(true);
     setTriggerBurst(true);
@@ -127,7 +202,7 @@ export function App() {
         <div className="bg-sun-glow"></div>
       </div>
 
-      <ParticleCanvas triggerBurst={triggerBurst} />
+      <ParticleCanvas triggerBurst={triggerBurst} resetKey={particlesResetKey} />
 
       <main className="app-container">
         <Header
