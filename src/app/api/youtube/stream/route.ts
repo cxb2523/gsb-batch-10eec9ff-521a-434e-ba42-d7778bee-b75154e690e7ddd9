@@ -62,8 +62,11 @@ export async function GET(request: Request) {
     if (!usable(res)) {
       // Cached googlevideo URLs can be revoked before their TTL — drop the
       // stale entry and re-extract once so a dead URL doesn't keep 502ing (and
-      // silently demoting the track to the IFrame animation path).
-      invalidateStreamCache(videoId);
+      // silently demoting the track to the IFrame animation path). Concurrent
+      // range requests see the same dead URL: extraction is de-duplicated in
+      // `extractStreamUrl`, and passing the stale URL keeps a later request
+      // from deleting the freshly re-extracted entry.
+      invalidateStreamCache(videoId, target);
       target = (await extractStreamUrl(videoId)).url;
       res = await fetchUpstream(target);
     }

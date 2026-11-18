@@ -47,6 +47,9 @@ interface CacheEntry {
 const urlCache = new Map<string, CacheEntry>();
 const URL_CACHE_MAX = 1024;
 
+/** Extractions currently in progress, so concurrent requests share one. */
+const inFlightExtractions = new Map<string, Promise<ExtractedStream>>();
+
 /** Evict expired entries and, if still at capacity, the oldest ones (insertion
  * order). Keeps the cache bounded in long-running servers. */
 function sweepUrlCache(): void {
@@ -63,8 +66,18 @@ function sweepUrlCache(): void {
 }
 
 /** Drop a cached stream URL so the next request re-extracts (used when the
- * upstream proxy fetch fails — googlevideo URLs can be revoked before TTL). */
-export function invalidateStreamCache(videoId: string): void {
+ * upstream proxy fetch fails — googlevideo URLs can be revoked before TTL).
+ *
+ * Pass the `staleUrl` that failed when known: concurrent range requests all
+ * observe the same dead URL, and without this guard the later ones would delete
+ * the freshly re-extracted entry and trigger yet another extraction. */
+export function invalidateStreamCache(videoId: string, staleUrl?: string): void {
+  if (staleUrl !== undefined) {
+    const entry = urlCache.get(videoId);
+    // A different URL is already cached — a concurrent request re-extracted it,
+    // so leave the fresh entry alone.
+    if (entry && entry.url !== staleUrl) return;
+  }
   urlCache.delete(videoId);
 }
 
@@ -159,6 +172,14 @@ function extractWithYtDlp(videoId: string, timeoutMs = 30_000): Promise<Extracte
  * Returns a deciphered, playable audio stream URL for the video, trying each
  * youtube.js client in turn and falling back to yt-dlp. Results are cached
  * in memory for 30 minutes so seek/preload range requests don't re-extract.
+ *
+ * Extractions are de-duplicated per video: dragging a seek bar makes the
+ * browser fire several Range requests at once, and when the cached URL has
+ * been revoked they would otherwise all pay for their own extraction (burning
+ * API quota) and could each fail separately. Everyone arriving while an
+ * extraction is running awaits the same promise. A failed extraction is
+ * removed from the map, so the next caller retries instead of inheriting a
+ * permanently rejected promise.
  */
 export async function extractStreamUrl(videoId: string): Promise<ExtractedStream> {
   const cached = urlCache.get(videoId);
@@ -166,6 +187,20 @@ export async function extractStreamUrl(videoId: string): Promise<ExtractedStream
     return { url: cached.url, mimeType: cached.mimeType };
   }
 
+  const running = inFlightExtractions.get(videoId);
+  if (running) return running;
+
+  // Clear the slot as soon as the extraction settles (success or failure) so a
+  // later request can retry a failure. The identity check keeps a newer
+  // extraction's slot intact if one was started in the meantime.
+  const extraction = runExtraction(videoId).finally(() => {
+    if (inFlightExtractions.get(videoId) === extraction) inFlightExtractions.delete(videoId);
+  });
+  inFlightExtractions.set(videoId, extraction);
+  return extraction;
+}
+
+async function runExtraction(videoId: string): Promise<ExtractedStream> {
   let result: ExtractedStream | null = null;
   for (const clientType of [ClientType.ANDROID_VR, ClientType.MWEB, ClientType.WEB]) {
     try {

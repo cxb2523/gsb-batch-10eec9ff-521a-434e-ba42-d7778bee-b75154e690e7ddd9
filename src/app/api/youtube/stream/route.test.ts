@@ -106,8 +106,30 @@ describe("GET /api/youtube/stream", () => {
 
     const res = await GET(request(VALID));
     expect(res.status).toBe(502);
-    expect(mocks.invalidateStreamCache).toHaveBeenCalledWith(VALID);
+    expect(mocks.invalidateStreamCache).toHaveBeenCalledWith(VALID, "https://rr.googlevideo.com/videoplayback?x=1");
     expect(mocks.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries extraction on the next request after a failed re-extraction", async () => {
+    mocks.extractStreamUrl
+      .mockResolvedValueOnce({ url: "https://rr.googlevideo.com/stale?x=1" })
+      .mockRejectedValueOnce(new Error("extraction still failing"))
+      .mockResolvedValueOnce({ url: "https://rr.googlevideo.com/fresh?x=1" });
+    mocks.fetch
+      .mockResolvedValueOnce(new Response("revoked", { status: 403 }))
+      .mockResolvedValueOnce(new Response("audio-bytes", { status: 200 }));
+
+    // The re-extraction fails, so the request fails — but nothing is remembered
+    // as permanently broken.
+    expect((await GET(request(VALID))).status).toBe(502);
+    expect(mocks.extractStreamUrl).toHaveBeenCalledTimes(2);
+
+    // The next request asks for a stream again and recovers.
+    const res = await GET(request(VALID));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("audio-bytes");
+    expect(mocks.extractStreamUrl).toHaveBeenCalledTimes(3);
+    expect(mocks.extractStreamUrl).toHaveBeenLastCalledWith(VALID);
   });
 
   it("re-extracts and recovers when the cached stream URL went stale", async () => {
@@ -127,7 +149,7 @@ describe("GET /api/youtube/stream", () => {
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("audio-bytes");
-    expect(mocks.invalidateStreamCache).toHaveBeenCalledWith(VALID);
+    expect(mocks.invalidateStreamCache).toHaveBeenCalledWith(VALID, "https://rr.googlevideo.com/old?x=1");
     expect(mocks.extractStreamUrl).toHaveBeenCalledTimes(2);
     expect(mocks.fetch).toHaveBeenNthCalledWith(1, "https://rr.googlevideo.com/old?x=1", expect.anything());
     expect(mocks.fetch).toHaveBeenNthCalledWith(2, "https://rr.googlevideo.com/fresh?x=1", expect.anything());

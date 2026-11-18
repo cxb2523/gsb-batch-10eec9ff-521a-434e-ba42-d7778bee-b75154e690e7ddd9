@@ -108,7 +108,10 @@ reach the UI (errors are logged server-side only).
   Jamendo streams play via the `/api/audio` same-origin proxy; YouTube-sourced tracks play via the
   `/api/youtube/stream` proxy (`src/lib/youtube-stream.ts` extracts a deciphered audio URL with
   youtube.js — clients rotate ANDROID_VR → MWEB → WEB, with a yt-dlp `-g` fallback — then streams
-  the bytes back same-origin, forwarding Range requests so seeking works).
+  the bytes back same-origin, forwarding Range requests so seeking works). Extracted URLs are cached
+  for 30 minutes; if upstream rejects a cached URL (googlevideo URLs can be revoked early) the entry is
+  invalidated and re-extracted once. Concurrent requests for the same video share one in-flight
+  extraction, and failed extractions are not cached, so the next request retries.
 - A `<YouTubeEngine>` (200×200 IFrame Player, `src/components/player/youtube-engine.tsx`) is kept as a
   fallback only: if streaming fails, `PlayerProvider` flips into fallback mode and the video plays
   through the IFrame API instead. Its state/time is reported back into the same shared player state,
