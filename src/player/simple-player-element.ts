@@ -61,6 +61,7 @@ export class SimplePlayer extends HTMLElement {
   #optimisticPlaybackState: PlaybackState = null;
   #videoLoadAttempt = 0;
   #videoRetryTimer = 0;
+  #sourceVersion = 0;
   #controlsHideTimer = 0;
   #loadingStateTimer = 0;
   #initialProgressSettleTimer = 0;
@@ -1275,8 +1276,12 @@ export class SimplePlayer extends HTMLElement {
   #retryVideoLoad() {
     if (this.#videoLoadAttempt >= this.#maxVideoLoadAttempts || this.#videoRetryTimer) return;
 
+    const sourceVersion = this.#sourceVersion;
     this.#videoRetryTimer = window.setTimeout(() => {
       this.#videoRetryTimer = 0;
+      // A source switch invalidates retries scheduled for the previous source.
+      if (sourceVersion !== this.#sourceVersion || !this.src) return;
+
       this.#clearFirstFrameFallbackTimer();
       this.#videoSourceLoaded = false;
       this.#hasDecodedFirstFrame = false;
@@ -2830,6 +2835,10 @@ export class SimplePlayer extends HTMLElement {
   };
 
   #handleVideoError = () => {
+    // Errors arriving after a source switch (or for an empty source) belong to
+    // the previous source: the element is already back in the unloaded state.
+    if (!this.#videoSourceLoaded) return;
+
     this.#optimisticPlaybackState = null;
     this.#hasDecodedFirstFrame = false;
     this.#hasPresentedFirstFrame = false;
@@ -2860,10 +2869,12 @@ export class SimplePlayer extends HTMLElement {
 
   #resetSource() {
     if (!this.#video) return;
+    this.#sourceVersion += 1;
     this.#observer?.disconnect();
     this.#observer = null;
     this.#clearVideoRetryTimer();
     this.#clearInitialProgressSettleTimer();
+    this.#clearFirstFrameFallbackTimer();
     this.#videoSourceLoaded = false;
     this.#videoLoadAttempt = 0;
     this.#hasDecodedFirstFrame = false;
@@ -2872,7 +2883,9 @@ export class SimplePlayer extends HTMLElement {
     this.#firstFramePresentationPending = false;
     this.#firstFrameRequestToken += 1;
     this.#hasInitialProgressSettled = false;
+    this.#initialProgressEstimateUnlockAt = 0;
     this.#lastRenderedProgressTime = 0;
+    this.#syncVisualProgressClock(0);
     this.#clearPausedVisualProgress();
     this.#hasAudioTrack = false;
     this.#hasCheckedAudioTrack = false;
