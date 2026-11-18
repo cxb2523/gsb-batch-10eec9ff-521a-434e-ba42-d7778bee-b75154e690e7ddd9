@@ -344,8 +344,28 @@ addEventListener('pointermove', (e) => {
   mouse.x = nx; mouse.y = ny;
 }, { passive: true });
 
+// Render-loop governor: when no [data-gl] section is on screen, main.js calls
+// setActive(false) and the loop stops requesting frames entirely (no rAF, no clock
+// advance, no GPU work). setActive(true) resumes from the exact frozen state.
 let active = true;
-window.LUMEN = { S, setActive: (v) => { active = v; } };
+let rafPending = false;
+window.LUMEN = {
+  S,
+  setActive: (v) => {
+    v = !!v;
+    if (v === active) return;
+    active = v;
+    if (v) {
+      // Resume: discard the off-screen wall time so the first frame back gets a
+      // normal dt (no particle/core jump), and restart a fresh 1.5s adapt window
+      // so the pause itself is never sampled as a slow frame. Quality/bloom
+      // degradations already applied are kept.
+      clock.getDelta();
+      resetAdaptWindow();
+      if (!rafPending) { rafPending = true; requestAnimationFrame(frame); }
+    }
+  },
+};
 
 const lerp = (a, b, t) => a + (b - a) * t;
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
@@ -371,10 +391,20 @@ let t = 0;
 const cur = { x: 0, y: 0, s: 1, ry: 0, morph: 0, camY: 0, heat: 0 };
 
 function frame() {
+  rafPending = false;
+  // Paused: do NOT re-queue. The loop dies here until setActive(true) revives it.
+  if (!active) return;
+  rafPending = true;
   requestAnimationFrame(frame);
   const dt = Math.min(clock.getDelta(), 0.05);
-  if (!active) return;
   t += reduce ? dt * 0.15 : dt;
+
+  // Intro progresses in scene time, so it freezes with the loop and resumes
+  // exactly where it paused — never jumps, never replays.
+  if (introPlaying) {
+    S.intro = Math.min(1, S.intro + dt / 1.8);
+    if (S.intro >= 1) introPlaying = false;
+  }
 
   const mob = isMobile();
   mouse.sx = lerp(mouse.sx, mouse.x, 0.05);
@@ -448,6 +478,9 @@ function frame() {
  * If frame processing exceeds 20ms (>50fps drop), progressively reduces DPR before shedding bloom.
  */
 let acc = 0, frames = 0, settle = 0;
+// Fresh evaluation window: used on resume so paused off-screen time never
+// contaminates the frame-duration samples. Does not touch quality/useBloom.
+function resetAdaptWindow() { acc = 0; frames = 0; }
 function adapt(dt) {
   if (settle > 0) { settle -= dt; return; }
   acc += dt; frames++;
@@ -460,16 +493,18 @@ function adapt(dt) {
   }
 }
 
-// Intro: let the core grow in once the page is ready
+// Intro: let the core grow in once the page is ready.
+// Driven from frame() in scene time (see introPlaying tick above) so pausing the
+// loop also pauses the intro; wall-clock rAF here would keep running off-screen.
+let introPlaying = false;
 window.LUMEN.intro = () => {
   if (reduce) return;
-  const start = performance.now();
-  const step = (now) => {
-    S.intro = Math.min(1, (now - start) / 1800);
-    if (S.intro < 1) requestAnimationFrame(step);
-  };
-  requestAnimationFrame(step);
+  introPlaying = true;
 };
-frame();
+rafPending = true;
+requestAnimationFrame(frame);
+// Introspection snapshot (debugging/verification): is the loop alive, is scene
+// time advancing, and what quality tier is active.
+window.LUMEN.stats = () => ({ active, rafPending, t, quality, useBloom, intro: S.intro });
 document.documentElement.classList.add('gl-ready');
 window.dispatchEvent(new Event('lumen:ready'));
