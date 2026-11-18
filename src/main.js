@@ -34,7 +34,7 @@ import { UI } from './ui.js';
 import { FpsMeter, ShakeCamera } from './systems.js';
 import { SpatialHash } from './spatial-hash.js';
 import { Pool, resetFloatingText, resetParticle } from './pool.js';
-import { EffectLayer } from './effects.js';
+import { EffectLayer, BossCueTracker } from './effects.js';
 import { AchievementTracker } from './achievements.js';
 import {
     SeededRng,
@@ -169,6 +169,10 @@ export class Game {
         this._bossesSpawned = new Set();
         this._spawnAccumulator = 0;
         this._bossWarnedAt = new Set();
+        // Per-boss audio cue tokens (warn/spawn note sequences). The notes
+        // live on the effects layer's sim-time schedule queue, so they
+        // freeze with pause/tab-hide; this tracker cancels stale cues.
+        this._bossCues = new BossCueTracker();
         this._lastAnnouncedWave = null;
 
         // Active stage descriptor + per-stage waves/bosses snapshot. Keyed off
@@ -565,6 +569,7 @@ export class Game {
         this.mines = [];
         this._bossesSpawned.clear();
         this._bossWarnedAt.clear();
+        this._bossCues.cancelAll();
         this._spawnAccumulator = 0;
         this._lastAnnouncedWave = null;
         this._nextSplitIdx = 0;
@@ -1268,6 +1273,10 @@ export class Game {
         this.dropExp(e.x, e.y, e.expValue);
         if (e.boss) {
             this.shake(0.5);
+            // Cancel any in-flight warn/spawn cue for this boss so its
+            // remaining notes don't stack on top of the defeat explosion
+            // (e.g. a debug hook spawning + killing inside the warn window).
+            this._bossCues.cancel(e.id);
             this.audio.explosion();
             this.achievements.onBossDefeated(e.id);
             this._announce(`${e.id.replace('_', ' ')} defeated`);
@@ -1527,7 +1536,11 @@ export class Game {
             const warnAt = boss.spawnAt - 5;
             if (this.gameTime >= warnAt && !this._bossWarnedAt.has(boss.id)) {
                 this._bossWarnedAt.add(boss.id);
-                this.audio.bossWarn();
+                // Route the three-note warning through the sim-time schedule
+                // queue so it pauses/resumes with the game instead of
+                // drifting on wall-clock setTimeout.
+                const tokens = this.audio.bossWarn((t, fn) => this.effects.schedule(t, fn));
+                this._bossCues.track(boss.id, tokens);
             }
             if (this.gameTime >= boss.spawnAt && !this._bossesSpawned.has(boss.id)) {
                 this._bossesSpawned.add(boss.id);
@@ -1560,7 +1573,12 @@ export class Game {
         const y = this.player.y + Math.sin(angle) * d;
         this.enemies.push(new Enemy(x, y, bossDef, hpMult, dmgMult));
         this.ui.showBossBanner();
-        this.audio.bossSpawn();
+        // The boss arriving supersedes its own warning cue — cancel any
+        // leftover warn notes (a debug hook can spawn before the scheduled
+        // time, mid-warning) so they don't bleed into the spawn cue.
+        this._bossCues.cancel(bossDef.id);
+        const spawnTokens = this.audio.bossSpawn((t, fn) => this.effects.schedule(t, fn));
+        this._bossCues.track(bossDef.id, spawnTokens);
         this.effects.bossSpawn();
         // iter-15 polish: bump boss-spawn camera shake by +50% (0.8 → 1.2).
         // The reduced-motion gate inside `shake()` still applies so

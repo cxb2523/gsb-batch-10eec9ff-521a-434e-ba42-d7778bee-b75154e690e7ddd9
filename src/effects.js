@@ -8,6 +8,7 @@
  *
  * Exports:
  *   - class ScreenFlash, RingPulse, HitBursts
+ *   - class BossCueTracker  per-boss cancellable audio-cue token store
  *   - class EffectLayer  facade aggregating all three
  */
 
@@ -167,6 +168,37 @@ export class EmojiRain {
     }
 }
 
+/**
+ * Boss audio cue tracker. Boss SFX are multi-note sequences routed through
+ * `EffectLayer.schedule`, i.e. simulation time: they freeze while the game
+ * is paused or the tab is hidden and resume from the remaining delay —
+ * never a wall-clock catch-up burst. This tracker owns the per-boss token
+ * lists so a stale cue (e.g. the warning of a boss that got spawned or
+ * killed early via a debug hook) can be cancelled instead of overlapping
+ * the next cue.
+ */
+export class BossCueTracker {
+    constructor() {
+        this.cues = new Map(); // bossId → Array<schedule token>
+    }
+    /** Store `tokens` under `bossId`, cancelling anything already stored. */
+    track(bossId, tokens) {
+        this.cancel(bossId);
+        if (tokens && tokens.length) this.cues.set(bossId, tokens);
+    }
+    /** Cancel every pending note scheduled for `bossId`. */
+    cancel(bossId) {
+        const tokens = this.cues.get(bossId);
+        if (!tokens) return;
+        for (const tok of tokens) tok.cancelled = true;
+        this.cues.delete(bossId);
+    }
+    /** Cancel all in-flight cues (run reset / game over). */
+    cancelAll() {
+        for (const id of [...this.cues.keys()]) this.cancel(id);
+    }
+}
+
 // Aggregator: one object to thread through the game for all lightweight FX.
 //
 // Also owns a generic `delays` queue: callers can schedule a `fn` to run after
@@ -232,17 +264,22 @@ export class EffectLayer {
         // canvas h; we accept undefined to stay backwards-compat.
         this.emojiRain.update(dt, viewport && viewport.h);
         if (this.delays.length) {
+            for (const d of this.delays) d.t -= dt;
+            // Collect due entries and fire them in chronological order
+            // (most overdue first). Without the sort, a catch-up tick that
+            // drains several notes of one sequence would play them in
+            // reverse — e.g. the boss spawn sawtooth before its noise burst.
+            const due = [];
             for (let i = this.delays.length - 1; i >= 0; i--) {
-                const d = this.delays[i];
-                d.t -= dt;
-                if (d.t <= 0) {
-                    this.delays.splice(i, 1);
-                    if (!d.cancelled) {
-                        try {
-                            d.fn();
-                        } catch (err) {
-                            console.warn('[effects] scheduled fn threw', err);
-                        }
+                if (this.delays[i].t <= 0) due.push(this.delays.splice(i, 1)[0]);
+            }
+            due.sort((a, b) => a.t - b.t);
+            for (const d of due) {
+                if (!d.cancelled) {
+                    try {
+                        d.fn();
+                    } catch (err) {
+                        console.warn('[effects] scheduled fn threw', err);
                     }
                 }
             }

@@ -148,15 +148,46 @@ export class AudioEngine {
             200
         );
     }
-    bossSpawn() {
-        this.tone({ noise: true, dur: 0.4, volume: 0.3, release: 0.25 });
-        setTimeout(() => this.tone({ freq: 80, dur: 0.6, type: 'sawtooth', volume: 0.3 }), 100);
+    /**
+     * Play a short note sequence. Each entry is `[delaySec, toneParams]`.
+     * When `schedule(delaySec, fn)` is provided, every note is routed
+     * through it — the game passes the effects layer's simulation-time
+     * queue, so the sequence freezes while the game is paused or the tab
+     * is hidden and resumes from the remaining delay instead of firing a
+     * wall-clock catch-up burst. Returns the scheduler's tokens so the
+     * caller can cancel an in-flight sequence (e.g. a boss warning whose
+     * boss was defeated early). Without a scheduler the legacy wall-clock
+     * setTimeout path is used and an empty array is returned.
+     */
+    _playSequence(notes, schedule) {
+        if (typeof schedule === 'function') {
+            return notes.map(([delay, params]) => schedule(delay, () => this.tone(params)));
+        }
+        for (const [delay, params] of notes) {
+            if (delay <= 0) this.tone(params);
+            else setTimeout(() => this.tone(params), delay * 1000);
+        }
+        return [];
     }
-    bossWarn() {
+    bossSpawn(schedule) {
+        return this._playSequence(
+            [
+                [0, { noise: true, dur: 0.4, volume: 0.3, release: 0.25 }],
+                [0.1, { freq: 80, dur: 0.6, type: 'sawtooth', volume: 0.3 }]
+            ],
+            schedule
+        );
+    }
+    bossWarn(schedule) {
         // Three-note descending "alert" — used in the boss banner lead-in.
-        this.tone({ freq: 480, dur: 0.12, type: 'square', volume: 0.2 });
-        setTimeout(() => this.tone({ freq: 360, dur: 0.12, type: 'square', volume: 0.2 }), 140);
-        setTimeout(() => this.tone({ freq: 240, dur: 0.2, type: 'square', volume: 0.22 }), 280);
+        return this._playSequence(
+            [
+                [0, { freq: 480, dur: 0.12, type: 'square', volume: 0.2 }],
+                [0.14, { freq: 360, dur: 0.12, type: 'square', volume: 0.2 }],
+                [0.28, { freq: 240, dur: 0.2, type: 'square', volume: 0.22 }]
+            ],
+            schedule
+        );
     }
     achievement() {
         this.tone({ freq: 880, dur: 0.08, type: 'triangle', volume: 0.18 });
