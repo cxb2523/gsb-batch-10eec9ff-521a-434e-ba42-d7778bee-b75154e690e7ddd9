@@ -33,11 +33,14 @@
     "scripts": {
         "build": "webpack --env=prod",
         "start": "npx webpack-dev-server --open",
-        "devServer": "npx webpack-dev-server"
+        "devServer": "npx webpack-dev-server",
+        "build:test": "tsc -p test/tsconfig.test.json",
+        "test": "npm run build:test && node --test \".test-build/test/**/*.test.js\""
     },
     "devDependencies": {
         "@babylonjs/core": "^9.0.0",
         "@babylonjs/inspector": "^9.0.0",
+        "@types/node": "^26.6.6",
         "ts-loader": "^9.2.6",
         "typescript": "^5.5.0",
         "webpack": "^5.105.4",

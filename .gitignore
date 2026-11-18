@@ -23,3 +23,5 @@ node_modules/*
 # Local dist
 dist/*
 www/scripts/*
+# Test build output
+.test-build/

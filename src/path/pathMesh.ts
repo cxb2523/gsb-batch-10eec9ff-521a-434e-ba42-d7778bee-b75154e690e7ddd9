@@ -1,6 +1,7 @@
 // Import our Shader Config
 import { Mesh } from "@babylonjs/core/Meshes/mesh";
 import { Scene } from "@babylonjs/core/scene";
+import { Color3 } from "@babylonjs/core/Maths/math.color";
 import { VertexBuffer } from "@babylonjs/core/Buffers/buffer";
 import { DataBuffer } from "@babylonjs/core/Buffers/dataBuffer";
 import { Observer } from "@babylonjs/core/Misc/observable";
@@ -10,9 +11,43 @@ import "../engineExtensions/engine.bufferSubData";
 
 import { PathBufferData, PathBufferDataOptions, PathBufferDataChanges } from "./pathBufferData";
 
+/**
+ * The various brush modes available while inking
+ */
+export const enum BrushMode {
+    /**
+     * Normal pen mode (monochrome)
+     */
+    pen = 0,
+    /**
+     * Rainbow mode (color cycling along the stroke)
+     */
+    rainbow = 1,
+}
 
 /**
- * A path mesh is representing a line of a certain thickness that can be 
+ * The immutable style of a brush at the moment a path is created.
+ * It is captured once on pointer down so that switching the brush
+ * afterwards never affects strokes already laid down.
+ */
+export interface BrushStyle {
+    /**
+     * Defines the brush mode (pen or rainbow) used to create the path
+     */
+    mode: BrushMode;
+    /**
+     * Defines the radius of the path at creation time
+     */
+    size: number;
+    /**
+     * Defines the color of the path at creation time (pen mode only,
+     * but always captured to fully restore the stroke on redo)
+     */
+    color: Color3;
+}
+
+/**
+ * A path mesh is representing a line of a certain thickness that can be
  * constructed gradually.
  */
 export class PathMesh extends Mesh {
@@ -20,6 +55,10 @@ export class PathMesh extends Mesh {
     private readonly _pathData: PathBufferData;
     private readonly _currentChanges: PathBufferDataChanges;
     private readonly _engine: ThinEngine;
+
+    private readonly _brushMode: BrushMode;
+    private readonly _brushSize: number;
+    private readonly _brushColor: Color3;
 
     private _currentPositionsBufferLength: number;
 
@@ -34,11 +73,28 @@ export class PathMesh extends Mesh {
      * @param startPointX Defines where does the path starts horizontally.
      * @param startPointY Defines where does the path starts vertically.
      * @param options Defines the path mesh construction options.
+     * @param style Defines the immutable brush style captured at creation time
+     * (mode, size and color). Later brush changes never alter this value.
      */
-    constructor(name: string, scene: Scene, startPointX: number, startPointY: number, options?: Partial<PathBufferDataOptions>) {
+    constructor(name: string, scene: Scene, startPointX: number, startPointY: number, options?: Partial<PathBufferDataOptions>, style?: BrushStyle) {
         super(name, scene);
 
         this._engine = scene.getEngine() as unknown as ThinEngine;
+
+        // Capture the brush style once and for all. The stroke keeps its
+        // original mode, size and color even if the user switches brush
+        // settings while or after drawing it.
+        if (style) {
+            this._brushMode = style.mode;
+            this._brushSize = style.size;
+            this._brushColor = style.color.clone();
+        }
+        else {
+            // Backward friendly default when no style is provided.
+            this._brushMode = BrushMode.pen;
+            this._brushSize = options?.radius ?? 5;
+            this._brushColor = Color3.White();
+        }
 
         this._currentChanges = {
             indexStart: 0,
@@ -61,11 +117,47 @@ export class PathMesh extends Mesh {
     }
 
     /**
-     * Gets the total length of the path by summing all the 
+     * Gets the total length of the path by summing all the
      * distance between the points that have been added to the path
      */
     public get totalLength(): number {
         return this._pathData.totalLength;
+    }
+
+    /**
+     * Gets the brush mode (pen or rainbow) captured when the path was created.
+     * Switching the current brush never changes this value.
+     */
+    public get brushMode(): BrushMode {
+        return this._brushMode;
+    }
+
+    /**
+     * Gets the brush size captured when the path was created.
+     * Switching the current brush size never changes this value.
+     */
+    public get brushSize(): number {
+        return this._brushSize;
+    }
+
+    /**
+     * Gets the brush color captured when the path was created.
+     * Switching the current brush color never changes this value.
+     */
+    public get brushColor(): Color3 {
+        return this._brushColor;
+    }
+
+    /**
+     * Gets the full immutable brush style (mode, size and color) captured
+     * when the path was created.
+     */
+    public get brushStyle(): BrushStyle {
+        return {
+            mode: this._brushMode,
+            size: this._brushSize,
+            color: this._brushColor,
+        };
     }
 
     /**

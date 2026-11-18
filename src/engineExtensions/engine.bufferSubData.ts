@@ -24,6 +24,13 @@ declare module "@babylonjs/core/Engines/thinEngine" {
 }
 
 ThinEngine.prototype.indexBufferSubData = function(this: ThinEngine, indexBuffer: DataBuffer, dstByteOffset: number, data: Uint32Array, srcOffset: number, srcLength: number): void {
+    // Headless engines (eg. NullEngine used for unit testing) have no GL
+    // context: the data only needs to stay in CPU memory, so there is
+    // nothing to upload.
+    if (!this._gl) {
+        return;
+    }
+
     // Force cache update
     this._currentBoundBuffer[this._gl.ELEMENT_ARRAY_BUFFER] = null;
     this.bindIndexBuffer(indexBuffer);
@@ -40,6 +47,11 @@ ThinEngine.prototype.indexBufferSubData = function(this: ThinEngine, indexBuffer
 }
 
 ThinEngine.prototype.vertexBufferSubData = function(this: ThinEngine, vertexBuffer: DataBuffer, dstByteOffset: number, data: Float32Array, srcOffset: number, srcLength: number): void {
+    // See indexBufferSubData: nothing to upload without a GL context.
+    if (!this._gl) {
+        return;
+    }
+
     this.bindArrayBuffer(vertexBuffer);
 
     if (this.webGLVersion === 2) {

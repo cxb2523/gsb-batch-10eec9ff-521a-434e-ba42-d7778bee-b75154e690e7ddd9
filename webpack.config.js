@@ -27,6 +27,7 @@ var DEV_DIR = path.resolve(__dirname, "./.temp");
             rules: [{
                 test: /\.tsx?$/,
                 loader: "ts-loader",
+                exclude: /node_modules|test|\.test-build/,
             },
             {
                 test: /\.css$/,

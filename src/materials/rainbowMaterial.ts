@@ -6,6 +6,7 @@ import { Constants } from "@babylonjs/core/Engines/constants";
 import { Vector2 } from "@babylonjs/core/Maths/math.vector";
 import { Color4 } from "@babylonjs/core/Maths/math.color";
 import { Scalar } from "@babylonjs/core/Maths/math.scalar";
+import { Observer } from "@babylonjs/core/Misc/observable";
 
 import { RainbowShaderConfiguration } from "./rainbowShader";
 
@@ -83,13 +84,19 @@ export function createRainbowMaterial(name: string, scene: Scene): ShaderMateria
     // On every 6 frames... because it looks ok, update our offset to provide
     // a glittery look
     let debounceShimmerValue = 0;
-    scene.onBeforeRenderObservable.add(() => {
+    const shimmerObserver = scene.onBeforeRenderObservable.add(() => {
         debounceShimmerValue++;
         debounceShimmerValue = debounceShimmerValue % 6;
         if (debounceShimmerValue === 0) {
             const time = PrecisionDate.Now / 10000 % 400;
             shaderMaterial.setFloat("offset", time);
         }
+    });
+
+    // Detach the shimmer update as soon as the material is released so that
+    // clearing or disposing a path does not leave dead observers on the scene.
+    shaderMaterial.onDisposeObservable.addOnce(() => {
+        scene.onBeforeRenderObservable.remove(shimmerObserver as Observer<Scene>);
     });
 
     return shaderMaterial;
