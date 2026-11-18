@@ -99,6 +99,8 @@ export class Player {
 
 	pause() {
 		this.action.paused = true;
+		// silence immediately rather than waiting for the next frame's sync
+		this.audio.restart();
 		this.save();
 	}
 
@@ -109,12 +111,13 @@ export class Player {
 		this.save();
 	}
 
-	// jump to an absolute clip time without touching the play/pause state; a scrub
-	// or arrow-key seek exceeds the drift window, so audio re-homes on its own next
-	// frame (a frame-step seek is smaller, but pauses, so it falls silent anyway)
+	// jump to an absolute clip time without touching the play/pause state. A seek is
+	// a discontinuity, so drop the running source and its projection; the next sync
+	// starts a fresh source exactly at the new clock position (small seeks included).
 	seekTo(time: number) {
 		this.action.time = THREE.MathUtils.clamp(time, 0, this.clip.duration);
 		this.mixer.update(0);
+		this.audio.restart();
 		this.save();
 	}
 
@@ -144,6 +147,10 @@ export class Player {
 	setReverse(reverse: boolean) {
 		this.playback.reverse = reverse;
 		this.applyTimeScale();
+		// the running source plays whichever buffer matches the old direction; drop it
+		// so the next sync starts fresh from the mirrored position instead of letting
+		// the other buffer finish out its stale tail
+		this.audio.restart();
 	}
 
 	setLoop(loop: boolean) {
@@ -192,6 +199,9 @@ export class Player {
 
 	toggleMute() {
 		this.audio.enabled = !this.audio.enabled;
+		// muting must fall silent immediately (not on the next frame); unmuting will
+		// re-home to the clock on the next sync because restart() cleared the projection
+		if (!this.audio.enabled) this.audio.restart();
 		this.save();
 	}
 

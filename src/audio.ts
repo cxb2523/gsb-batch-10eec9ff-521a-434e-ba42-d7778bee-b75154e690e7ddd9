@@ -39,14 +39,20 @@ export class AudioEngine {
 	private gainNode: GainNode;
 	// state describing the source currently scheduled (if any)
 	private source: AudioBufferSourceNode | null = null;
+	// which track the scheduled source was created from: a track switch must
+	// never be mistaken for a continuing source just because the direction matches
+	private sourceTrack: string | null = null;
 	private dir = 1; // +1 forward, -1 reverse — which buffer is playing
 	private rate = 1; // playbackRate the source is currently running at
 	private baseCtx = 0; // ctx.currentTime when the projection was last rebased
 	private baseClip = 0; // clip-time the source represents at baseCtx
-	// previous sync's projected file position; lets us spot the upward crossing out of
-	// the silent head (a negative offset keeps target < 0 there) so a fresh start at the
-	// head can begin at the file's first sample instead of the frame-overshot offset
-	private prevTarget = 0;
+	// previous in-range sync's target; lets us spot the continuous upward crossing
+	// out of the silent head (a negative offset keeps target < 0 there) so a fresh
+	// start at the head can begin at the file's first sample instead of the
+	// frame-overshot offset. null means "no usable history": every discontinuity
+	// (start, seek, loop wrap, track change, direction flip, resume) clears it, so
+	// the next start lands exactly on the clock instead of re-running onset logic.
+	private prevTarget: number | null = null;
 
 	constructor(
 		private ctx: AudioContext,
@@ -72,10 +78,15 @@ export class AudioEngine {
 		this.gainNode.gain.value = value;
 	}
 
-	// drop the running source whenever the clock jumps discontinuously; the next
-	// sync rebuilds it from wherever the animation clock now points.
+	// drop the running source and forget its projection whenever the clock jumps
+	// discontinuously — play from pause, a scrub, a loop wrap, a track switch, a
+	// direction flip or a mute. Clearing prevTarget is what stops a seek out of the
+	// silent head from being mistaken for the natural onset crossing (which would
+	// otherwise start the file at sample 0 instead of the clock's position). The
+	// next sync rebuilds the source at the animation clock's new position.
 	restart() {
 		this.stop();
+		this.prevTarget = null;
 	}
 
 	private stop() {
@@ -86,6 +97,7 @@ export class AudioEngine {
 		} catch {}
 		this.source.disconnect();
 		this.source = null;
+		this.sourceTrack = null;
 	}
 
 	private duration() {
@@ -111,13 +123,15 @@ export class AudioEngine {
 		source.playbackRate.value = rate;
 		source.connect(this.gainNode);
 		// in the reversed buffer the sample for clip-time `clip` sits at the mirrored
-		// offset; in the forward buffer it sits at `clip` itself
+		// offset; in the forward buffer it sits at `clip` itself. The offset already
+		// includes the track's head offset, so it converts the same way either way.
 		const offset = dir < 0 ? buffer.duration - clip : clip;
 		source.start(this.ctx.currentTime, THREE.MathUtils.clamp(offset, 0, buffer.duration));
 		source.onended = () => {
 			if (source === this.source) this.stop();
 		};
 		this.source = source;
+		this.sourceTrack = this.track;
 		this.dir = dir;
 		this.rate = rate;
 		this.baseCtx = this.ctx.currentTime;
@@ -133,35 +147,50 @@ export class AudioEngine {
 		const duration = this.duration();
 		const dir = reverse ? -1 : 1;
 		const rate = THREE.MathUtils.clamp(speed, minRate, maxRate);
-		// silent when muted, paused, frozen, or the clock sits outside the track —
-		// a negative offset delays the sound at the head, and the clip may outrun the
-		// shorter audio at the tail
-		const shouldPlay = this.enabled && !paused && speed > 0 && target >= 0 && target <= duration;
-		// did this sync just step forward out of the silent head? frames advance in
-		// discrete steps, so the clock never lands exactly on the head boundary — it
-		// overshoots, and starting the file at that overshot offset would clip the
-		// soundtrack's onset. Detected here, consumed when we (re)start below.
-		const enteringHead = dir > 0 && this.prevTarget < 0 && target >= 0;
-		this.prevTarget = target;
 
-		if (!shouldPlay) {
+		// transport stopped: muted, paused or frozen. Silence now and drop the
+		// projection along with the source, so the next resume re-homes to the clock
+		// rather than extrapolating from where the old buffer left off.
+		if (!this.enabled || paused || speed <= 0) {
 			this.stop();
+			this.prevTarget = null;
 			return;
 		}
-		// nothing playing, or the direction flipped to the other buffer. On a fresh start
-		// right out of the head, begin at the file's first sample rather than the overshot
-		// offset — the sub-frame visual desync is imperceptible, a clipped onset is not.
-		if (!this.source || dir !== this.dir) {
+		// outside the track: a negative offset delays the sound at the head and the
+		// clip may outrun the shorter audio at the tail. Keep recording the target
+		// while silent in the head so a continuous crossing into it is still noticed.
+		if (target < 0 || target > duration) {
+			this.stop();
+			this.prevTarget = target;
+			return;
+		}
+
+		// did this sync just step continuously forward out of the silent head? frames
+		// advance in discrete steps, so the clock never lands exactly on the head
+		// boundary — it overshoots, and starting the file at that overshot offset
+		// would clip the soundtrack's onset. Only trust it when prevTarget is a real
+		// observation from the previous frame: restart() nulls it on any jump.
+		const enteringHead = dir > 0 && this.prevTarget !== null && this.prevTarget < 0;
+		this.prevTarget = target;
+
+		// nothing scheduled, or the running source no longer matches the requested
+		// track/direction. Every such case (re)starts at the current target — the old
+		// source is stopped first, so a leftover buffer from another track or the
+		// opposite direction can never bleed through. On a genuine onset crossing,
+		// begin at the file's first sample instead of the frame-overshot offset.
+		if (!this.source || dir !== this.dir || this.sourceTrack !== this.track) {
 			this.start(enteringHead && !this.source ? 0 : target, dir, rate);
 			return;
 		}
-		// speed change: ride it live on the AudioParam and rebase the projection
+		// speed change: ride it live on the AudioParam and rebase the projection, so
+		// changing tempo never restarts the source (and therefore never stutters)
 		if (rate !== this.rate) {
 			this.baseClip = this.position();
 			this.baseCtx = this.ctx.currentTime;
 			this.source.playbackRate.value = rate;
 			this.rate = rate;
 		}
+		// accumulated drift (e.g. after a long frame): re-home to the clock
 		if (Math.abs(this.position() - target) > audioDrift) {
 			this.start(target, dir, rate);
 		}
