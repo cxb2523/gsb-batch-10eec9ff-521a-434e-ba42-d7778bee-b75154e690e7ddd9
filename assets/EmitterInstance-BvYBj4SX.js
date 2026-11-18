@@ -45,6 +45,7 @@ var EmitterInstance = class {
 	#duration;
 	#emitDelay;
 	#firstSpawn;
+	#frozen = false;
 	#immortal;
 	#initialPosition;
 	#lifeCount;
@@ -144,8 +145,8 @@ var EmitterInstance = class {
 		context.restore();
 	}
 	externalPause() {
-		this.#paused = true;
 		this.pause();
+		this.#paused = true;
 	}
 	externalPlay() {
 		this.#paused = false;
@@ -156,10 +157,14 @@ var EmitterInstance = class {
 	}
 	pause() {
 		if (this.#paused) return;
-		this.#emitDelay = void 0;
+		this.#frozen = true;
 	}
 	play() {
 		if (this.#paused) return;
+		if (this.#frozen) {
+			this.#frozen = false;
+			if (!this.#firstSpawn) return;
+		}
 		if (!((this.#lifeCount > minLifeCount || this.#immortal || !this.options.life.count) && (this.#firstSpawn || this.#currentSpawnDelay >= (this.#spawnDelay ?? defaultSpawnDelay)))) return;
 		const container = this.#container;
 		if (this.#emitDelay === void 0) {
@@ -190,7 +195,7 @@ var EmitterInstance = class {
 		this.#shape?.resize(this.position, this.size);
 	}
 	update(delta) {
-		if (this.#paused) return;
+		if (this.#paused || this.#frozen) return;
 		const container = this.#container;
 		if (this.#firstSpawn) {
 			this.#firstSpawn = false;
@@ -204,7 +209,7 @@ var EmitterInstance = class {
 		if (this.#duration !== void 0) {
 			this.#currentDuration += delta.value;
 			if (this.#currentDuration >= this.#duration) {
-				this.pause();
+				this.#emitDelay = void 0;
 				if (this.#spawnDelay !== void 0) this.#spawnDelay = void 0;
 				if (!this.#immortal) this.#lifeCount--;
 				if (this.#lifeCount > minLifeCount || this.#immortal) {
