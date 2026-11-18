@@ -7,7 +7,7 @@
  */
 
 export { minifyShader as minify } from './loadShader.js';
-import loadShader from './loadShader.js';
+import loadShader, { getWatchFiles } from './loadShader.js';
 import { emitWarning } from 'process';
 import * as Vite from 'vite';
 
@@ -88,7 +88,7 @@ export default async function ({
       async handler (source, shader) {
         if (filter && !filter(shader)) return;
 
-        const { dependentChunks, outputShader } = await loadShader(source, shader, {
+        const { outputShader } = await loadShader(source, shader, {
           removeDuplicatedImports,
           warnDuplicatedImports,
           defaultExtension,
@@ -98,8 +98,8 @@ export default async function ({
           root
         });
 
-        watch && !prod && Array.from(dependentChunks.values())
-          .flat().forEach(chunk => this.addWatchFile(chunk));
+        watch && !prod && getWatchFiles()
+          .forEach(chunk => this.addWatchFile(chunk));
 
         return await (oxc
           ? Vite.transformWithOxc(`export default ${JSON.stringify(outputShader)};`, shader, { sourcemap })
