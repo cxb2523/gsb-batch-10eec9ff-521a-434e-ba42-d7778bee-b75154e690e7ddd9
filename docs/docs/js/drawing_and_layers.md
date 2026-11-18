@@ -715,7 +715,7 @@ engine.clearStaticCache();
 
 ### Cache Keys
 
-The cache key (second parameter) identifies each pre-rendered cache **and** acts as the registration id: calling a static draw method again with the same key replaces the previous registration and invalidates its cache, so the new items are pre-rendered from scratch. Different keys create independent caches.
+The cache key (second parameter) identifies each pre-rendered cache **and** acts as the registration id: calling a static draw method again with the same key replaces the previous registration and invalidates its cache, so the new items are pre-rendered from scratch. The earlier draw callback stops painting entirely — you do not need to `removeDrawHandle` it first, and a reused key never leaves the replaced bitmap on screen. A replacement that cannot be cached (oversized, or no offscreen surface) takes over the key the same way with its dynamic drawing. Different keys create independent caches.
 
 ```typescript
 // These use separate caches

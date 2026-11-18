@@ -483,7 +483,8 @@ debounced `onZoom`.
 | Content that changes (moving units, selection) | No | Every change re-renders the whole cache; no `styleOf`. |
 
 - The cache does NOT observe item mutations. Re-calling `drawStatic*` with
-  the same key replaces the registration AND rebuilds the cache - after
+  the same key replaces the registration AND rebuilds the cache, and the
+  earlier layer stops drawing, so no `removeDrawHandle` is needed - after
   editing the dataset, re-register and `render()`. Removing the registration
   (`removeDrawHandle`/`clearLayer`/`clearAll`) drops the cache;
   `clearStaticCache(key)` only drops the stored reference (a registered

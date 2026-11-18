@@ -96,14 +96,17 @@ const MAX_STATIC_CANVAS_AREA = 16_777_216;
 // camera scale, and pixel ratio it was rendered at, which the blit needs to
 // map it to screen. The bitmap holds `scale * pixelRatio` pixels per world unit.
 // `requestedRatio` is the renderer's ratio at recording time (`pixelRatio` may
-// be lower when the caps forced it down); `rerecord` renders the same items
-// again, without storing the result under the cache key.
+// be lower when the caps forced it down); `failedRatios` remembers ratios whose
+// re-record failed, so the retained old bitmap is not retried at them on every
+// frame. `rerecord` renders the same items again, without storing the result
+// under the cache key.
 interface StaticCache<TCanvas> {
     canvas: TCanvas;
     worldBounds: { minX: number; minY: number; maxX: number; maxY: number };
     scale: number;
     pixelRatio: number;
     requestedRatio: number;
+    failedRatios: Set<number>;
     rerecord: () => StaticCache<TCanvas> | null;
 }
 
@@ -137,6 +140,15 @@ export class CanvasDraw<
         screenToWorld: (x, y) => this.transformer.screenToWorld(x, y),
     };
     private staticCaches = new Map<string, StaticCache<TCanvas>>();
+    /**
+     * The registration that currently owns each `cacheKey`. Deliberately kept
+     * apart from {@link staticCaches}, which `clearStaticCache` empties: a
+     * layer must stop blitting its captured bitmap when the key is registered
+     * again, but `clearStaticCache` must leave the registered layer drawing.
+     * The map holds one token per key; a layer exits once the token it captured
+     * is no longer current. It never holds bitmaps, so it cannot pin one.
+     */
+    private staticOwners = new Map<string, object>();
     private warnedStaticCacheDisabled = false;
     private textBounds = new CanvasTextBounds();
 
@@ -891,6 +903,27 @@ export class CanvasDraw<
     }
 
     /**
+     * Take ownership of `cacheKey` for a new `drawStatic*` registration and
+     * return the token that registration's layer uses to check it still owns
+     * the key.
+     *
+     * Called at the start of every `drawStatic*`, before any cache is built, so
+     * it also covers the fallback paths that end up registering a dynamic
+     * layer: whichever way the new registration draws, the previous layer must
+     * stop drawing the bitmap it captured. The replaced cache entry is dropped
+     * too, so a fallback cannot leave the old bitmap reachable under the key.
+     *
+     * `clearStaticCache` does not call this, by design: it drops stored
+     * references without disowning a registration that is still drawing.
+     */
+    private beginStaticRegistration(cacheKey: string): object {
+        const token = {};
+        this.staticOwners.set(cacheKey, token);
+        this.staticCaches.delete(cacheKey);
+        return token;
+    }
+
+    /**
      * Render `items` into a new offscreen canvas for a `drawStatic*`
      * registration and store it under `cacheKey`, replacing any earlier entry.
      *
@@ -1034,6 +1067,7 @@ export class CanvasDraw<
             scale: renderScale,
             pixelRatio,
             requestedRatio,
+            failedRatios: new Set(),
             rerecord: () => this.createStaticCache(items, cacheKey, boundsOf, renderFn, resetPass, false),
         };
         if (store) {
@@ -1050,25 +1084,44 @@ export class CanvasDraw<
 
     /**
      * Helper to add a layer callback that blits from a static cache.
+     *
+     * The callback checks `token` against the key's current owner on every
+     * frame: a later registration of the same `cacheKey` replaces the token,
+     * and the earlier layer then drops its bitmap and draws nothing rather
+     * than keep blitting content the new registration has replaced.
      */
     private addStaticCacheLayer(
         cache: StaticCache<TCanvas> | null,
         layer: number,
         options: RendererClipOptions | undefined,
         cacheKey: string,
+        token: object,
     ): DrawHandle | null {
         if (!cache) {
             return null;
         }
-        let current = cache;
+        let current: StaticCache<TCanvas> | null = cache;
 
         return this.register(layer, options, ({ ctx, config, topLeft }) => {
+            // A later registration owns this cache's key now: drop the captured
+            // bitmap (so it can be collected) and stop drawing. This is what
+            // keeps a reused cacheKey from leaving the replaced bitmap on
+            // screen.
+            if (this.staticOwners.get(cacheKey) !== token) {
+                current = null;
+                return;
+            }
+            if (!current) {
+                return;
+            }
             // A pixel-ratio change (browser zoom, another monitor) re-backs the
             // visible canvas, so re-record once at the new ratio (and the
             // current scale) to stay 1:1 with it. A failed re-record keeps the
-            // old bitmap and is not retried until the ratio changes again.
+            // old bitmap and is not retried at that ratio: `failedRatios`
+            // remembers it, so a ratio that cannot be recorded is attempted at
+            // most once instead of every frame.
             const ratio = this.currentPixelRatio();
-            if (ratio !== current.requestedRatio) {
+            if (ratio !== current.requestedRatio && !current.failedRatios.has(ratio)) {
                 const next = current.rerecord();
                 if (next) {
                     if (this.staticCaches.get(cacheKey) === current) {
@@ -1076,7 +1129,7 @@ export class CanvasDraw<
                     }
                     current = next;
                 } else {
-                    current.requestedRatio = ratio;
+                    current.failedRatios.add(ratio);
                 }
             }
             const cachedCanvas = current.canvas;
@@ -1172,6 +1225,10 @@ export class CanvasDraw<
      * @param layer Layer order
      */
     drawStaticRect(items: Array<Rect>, cacheKey: string, layer: number = 1, options?: RendererClipOptions): DrawHandle {
+        // Supersede the previous registration under this key before anything
+        // else, so its layer goes inert even if this call falls back to
+        // dynamic drawing below.
+        const token = this.beginStaticRegistration(cacheKey);
         let lastFillStyle: string | CanvasGradientLike | undefined;
         let lastStrokeStyle: string | undefined;
         // The cache is built in one pass, so this memo spans that whole pass.
@@ -1256,7 +1313,7 @@ export class CanvasDraw<
             );
         }
 
-        return this.addStaticCacheLayer(cache, layer, options, cacheKey)!;
+        return this.addStaticCacheLayer(cache, layer, options, cacheKey, token)!;
     }
 
     /**
@@ -1273,6 +1330,7 @@ export class CanvasDraw<
         layer: number = 1,
         options?: RendererClipOptions,
     ): DrawHandle {
+        const token = this.beginStaticRegistration(cacheKey);
         const cache = this.createStaticCache(
             items,
             cacheKey,
@@ -1330,7 +1388,7 @@ export class CanvasDraw<
             );
         }
 
-        return this.addStaticCacheLayer(cache, layer, options, cacheKey)!;
+        return this.addStaticCacheLayer(cache, layer, options, cacheKey, token)!;
     }
 
     /**
@@ -1347,6 +1405,7 @@ export class CanvasDraw<
         layer: number = 1,
         options?: RendererClipOptions,
     ): DrawHandle {
+        const token = this.beginStaticRegistration(cacheKey);
         let lastFillStyle: string | CanvasGradientLike | undefined;
         let lastStrokeStyle: string | undefined;
         const gradients = new Map<string, CanvasGradientLike>();
@@ -1400,7 +1459,7 @@ export class CanvasDraw<
             );
         }
 
-        return this.addStaticCacheLayer(cache, layer, options, cacheKey)!;
+        return this.addStaticCacheLayer(cache, layer, options, cacheKey, token)!;
     }
 
     /**
@@ -1469,6 +1528,7 @@ export class CanvasDraw<
         this.drawChanges.clear();
         this.textBounds.clear();
         this.staticCaches.clear();
+        this.staticOwners.clear();
         this.layers.clear();
     }
 }
