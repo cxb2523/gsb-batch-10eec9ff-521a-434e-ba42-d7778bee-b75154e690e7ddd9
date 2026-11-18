@@ -22,6 +22,12 @@ var worker = null;
 var essentiaInstance = null;
 var essentiaLoaded = false;
 
+// Each file dropped/selected gets a fresh task id. Any async work (decode,
+// worker messages, deferred rendering) for a task that is no longer current is
+// ignored, and its worker is terminated when it is superseded or reset.
+var taskCounter = 0;
+var currentTaskId = 0;
+
 /* ═══════════════════════════════════════════════════════════════════════════
    ESSENTIA.JS LOADING (async, non-blocking)
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -100,19 +106,107 @@ function initDropZone() {
     dz.addEventListener('dragover', function(e) { e.preventDefault(); dz.classList.add('drag-over'); });
     dz.addEventListener('dragleave', function() { dz.classList.remove('drag-over'); });
     dz.addEventListener('drop', function(e) {
-        e.preventDefault(); dz.classList.remove('drag-over');
+        e.preventDefault(); e.stopPropagation(); dz.classList.remove('drag-over');
         if (e.dataTransfer.files.length) processFile(e.dataTransfer.files[0]);
+    });
+
+    // During decoding/analysis the loading overlay covers the page, so route
+    // drops that land on it to the same file-processing entry point. This is
+    // what lets a new file supersede the one currently being analyzed.
+    document.addEventListener('dragover', function(e) {
+        if (isLoadingVisible() && e.dataTransfer && hasFiles(e.dataTransfer)) e.preventDefault();
+    });
+    document.addEventListener('drop', function(e) {
+        if (!isLoadingVisible()) return;
+        e.preventDefault();
+        if (e.dataTransfer && e.dataTransfer.files.length) processFile(e.dataTransfer.files[0]);
     });
 
     document.getElementById('azNewBtn').addEventListener('click', resetUI);
 }
 
-function resetUI() {
-    stopPlayback();
-    document.getElementById('azDropZone').classList.remove('az-hidden');
-    document.getElementById('azResults').classList.add('az-hidden');
+function isLoadingVisible() {
+    var overlay = document.getElementById('azLoading');
+    return !!overlay && !overlay.classList.contains('az-hidden');
+}
+
+function hasFiles(dataTransfer) {
+    var types = dataTransfer.types;
+    if (!types) return false;
+    for (var i = 0; i < types.length; i++) {
+        if (types[i] === 'Files') return true;
+    }
+    return false;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   TASK LIFECYCLE
+   Every dropped/selected file is a task. Starting a new task invalidates the
+   previous one: its worker is terminated and any late progress/result/error
+   messages or deferred renders are ignored.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function invalidateTask() {
+    taskCounter++;
+    currentTaskId = taskCounter;
+    terminateWorker();
+    return currentTaskId;
+}
+
+function isCurrentTask(taskId) {
+    return taskId === currentTaskId;
+}
+
+function terminateWorker() {
+    var w = worker;
+    worker = null;
+    if (!w) return;
+    try { w.onmessage = null; } catch (e) {}
+    try { w.onerror = null; } catch (e) {}
+    try { w.terminate(); } catch (e) {}
+}
+
+function releaseWorker(w) {
+    if (worker === w) worker = null;
+    try { w.terminate(); } catch (e) {}
+}
+
+// Clear everything tied to the task that was just superseded/reset.
+function clearResults() {
     audioBuffer = null;
     analysisData = null;
+    pauseOffset = 0;
+    isPlaying = false;
+    var btn = document.getElementById('azPlayBtn');
+    if (btn) btn.textContent = 'Play';
+    var cur = document.getElementById('azCurTime');
+    if (cur) cur.textContent = '0:00';
+}
+
+function showDropZone() {
+    document.getElementById('azDropZone').classList.remove('az-hidden');
+    document.getElementById('azResults').classList.add('az-hidden');
+}
+
+// Return to the re-droppable state without leaving a loading overlay or stale
+// results behind. Only applies if the failing task is still the current one.
+function failTask(taskId, message) {
+    if (!isCurrentTask(taskId)) return;
+    invalidateTask();
+    stopPlayback();
+    clearResults();
+    hideLoading();
+    showDropZone();
+    alert(message);
+}
+
+function resetUI() {
+    invalidateTask();
+    stopPlayback();
+    clearResults();
+    hideLoading();
+    showDropZone();
+    var fi = document.getElementById('azFileInput');
+    if (fi) fi.value = '';
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -124,20 +218,34 @@ async function processFile(file) {
         alert('File too large (' + sizeMB.toFixed(0) + ' MB). Maximum is 500 MB to avoid browser crashes.');
         return;
     }
+
+    // New task: immediately supersede any previous file/worker and hide its UI.
+    var taskId = invalidateTask();
+    stopPlayback();
+    clearResults();
+    showDropZone();
+    var fi = document.getElementById('azFileInput');
+    if (fi) fi.value = '';
+
     if (sizeMB > 200) {
         showLoading('Loading large file (' + sizeMB.toFixed(0) + ' MB) — this may take a moment...');
     } else {
         showLoading('Decoding audio...');
     }
+
+    var buffer;
     try {
         var arrayBuf = await file.arrayBuffer();
+        if (!isCurrentTask(taskId)) return;
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        audioBuffer = await audioCtx.decodeAudioData(arrayBuf);
+        buffer = await audioCtx.decodeAudioData(arrayBuf);
     } catch (e) {
-        hideLoading();
-        alert('Could not decode this file. Make sure it is a valid audio file.');
+        failTask(taskId, 'Could not decode this file. Make sure it is a valid audio file.');
         return;
     }
+    if (!isCurrentTask(taskId)) return;
+
+    audioBuffer = buffer;
 
     // Update file info
     document.getElementById('azFileName').textContent = file.name;
@@ -148,41 +256,48 @@ async function processFile(file) {
 
     // Run analysis
     showLoading('Analyzing...');
-    runAnalysis(audioBuffer);
+    runAnalysis(taskId, buffer);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    WORKER ANALYSIS
    ═══════════════════════════════════════════════════════════════════════════ */
-function runAnalysis(buffer) {
+function runAnalysis(taskId, buffer) {
     // Prepare channel data
     var channels = [];
     for (var c = 0; c < buffer.numberOfChannels; c++) {
         channels.push(new Float32Array(buffer.getChannelData(c)));
     }
 
+    if (!isCurrentTask(taskId)) return;
+
     // Create worker from separate file (requires HTTP server, not file://)
-    if (worker) worker.terminate();
+    terminateWorker();
+    var w;
     try {
-        worker = new Worker('js/worker.js');
+        w = new Worker('js/worker.js');
     } catch (e) {
-        hideLoading();
-        alert('Web Workers require an HTTP server.\n\nRun: python3 -m http.server\nThen open: http://localhost:8000');
+        failTask(taskId, 'Web Workers require an HTTP server.\n\nRun: python3 -m http.server\nThen open: http://localhost:8000');
         return;
     }
+    worker = w;
 
-    worker.onmessage = function(e) {
+    w.onmessage = function(e) {
+        // Ignore anything from a superseded worker.
+        if (!isCurrentTask(taskId) || worker !== w) return;
+
         if (e.data.type === 'progress') {
             var msg = document.getElementById('azProgressMsg');
             if (msg) msg.textContent = e.data.msg;
         } else if (e.data.type === 'result') {
-            analysisData = e.data.data;
+            var resultData = e.data.data;
 
             // Try essentia.js for better Key/BPM
             var essentiaResult = essentiaAnalyze(buffer);
+            if (!isCurrentTask(taskId) || worker !== w) return;
             if (essentiaResult) {
                 if (essentiaResult.key && essentiaResult.key.key) {
-                    analysisData.key = {
+                    resultData.key = {
                         key: essentiaResult.key.key,
                         scale: essentiaResult.key.scale === 'minor' ? 'Minor' : 'Major',
                         strength: Math.round((essentiaResult.key.strength || 0) * 100)
@@ -192,9 +307,12 @@ function runAnalysis(buffer) {
                     var bpm = essentiaResult.bpm.bpm;
                     while (bpm < 60) bpm *= 2;
                     while (bpm > 180) bpm /= 2;
-                    analysisData.bpm = Math.round(bpm * 10) / 10;
+                    resultData.bpm = Math.round(bpm * 10) / 10;
                 }
             }
+
+            analysisData = resultData;
+            releaseWorker(w);
 
             // Show results container BEFORE rendering canvases (they need dimensions)
             document.getElementById('azDropZone').classList.add('az-hidden');
@@ -202,28 +320,21 @@ function runAnalysis(buffer) {
             hideLoading();
             // Small delay to let layout settle before canvas rendering
             setTimeout(function() {
-                displayResults(analysisData, buffer);
+                if (!isCurrentTask(taskId)) return;
+                displayResults(resultData, buffer);
             }, 50);
-            worker.terminate();
-            worker = null;
         } else if (e.data.type === 'error') {
-            hideLoading();
-            alert('Analysis error: ' + e.data.msg);
-            worker.terminate();
-            worker = null;
+            failTask(taskId, 'Analysis error: ' + e.data.msg);
         }
     };
 
-    worker.onerror = function(e) {
-        hideLoading();
-        alert('Worker error: ' + (e.message || 'Unknown error'));
-        worker.terminate();
-        worker = null;
+    w.onerror = function(e) {
+        failTask(taskId, 'Worker error: ' + (e.message || 'Unknown error'));
     };
 
     // Transfer channel data to worker
     var transferable = channels.map(function(ch) { return ch.buffer; });
-    worker.postMessage({ channels: channels, sampleRate: buffer.sampleRate }, transferable);
+    w.postMessage({ channels: channels, sampleRate: buffer.sampleRate }, transferable);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
