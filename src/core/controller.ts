@@ -1575,14 +1575,24 @@ export class ImageEditorController {
 		this.notifyObjectChanged({ commit });
 	}
 
+	/** area of the exported image in scene units: the crop rectangle, or the whole scene without a crop */
+	private getExportArea(): { left: number; top: number; width: number; height: number } {
+		const clipPath = this.canvas?.clipPath;
+		if (clipPath) {
+			return {
+				left: clipPath.left,
+				top: clipPath.top,
+				width: clipPath.width * clipPath.scaleX,
+				height: clipPath.height * clipPath.scaleY,
+			};
+		}
+		return { left: 0, top: 0, width: this.sceneSize.width, height: this.sceneSize.height };
+	}
+
 	/** pixel size of the exported image at the original resolution (crop and rotation included) */
 	getNaturalSize(): { width: number; height: number } {
-		const canvas = this.canvas;
-		const clipPath = canvas?.clipPath;
-		const area = clipPath
-			? { width: clipPath.width * clipPath.scaleX, height: clipPath.height * clipPath.scaleY }
-			: this.sceneSize;
-		const scale = canvas?.backgroundImage?.scaleX || 1;
+		const area = this.getExportArea();
+		const scale = this.canvas?.backgroundImage?.scaleX || 1;
 		return { width: Math.round(area.width / scale), height: Math.round(area.height / scale) };
 	}
 
@@ -1884,52 +1894,75 @@ export class ImageEditorController {
 			multiplier: customMultiplier,
 			maxPixels = DEFAULT_MAX_EXPORT_PIXELS,
 		} = { ...this.options.exportOptions, ...options };
-		const clipPath = canvas.clipPath;
-		const area = clipPath
-			? {
-					left: clipPath.left,
-					top: clipPath.top,
-					width: clipPath.width * clipPath.scaleX,
-					height: clipPath.height * clipPath.scaleY,
-				}
-			: { left: 0, top: 0, ...this.sceneSize };
-
-		const backgroundScale = canvas.backgroundImage?.scaleX;
-		const baseMultiplier = backgroundScale ? 1 / backgroundScale : Math.max(1, window.devicePixelRatio || 1);
-		// the output size (Resize menu) applies unless an explicit multiplier is passed
-		const outputScale = customMultiplier !== undefined ? { x: 1, y: 1 } : this.getOutputScale();
-		let multiplierX = (customMultiplier ?? baseMultiplier) * outputScale.x;
-		let multiplierY = (customMultiplier ?? baseMultiplier) * outputScale.y;
-		const exportPixels = area.width * area.height * multiplierX * multiplierY;
-		if (exportPixels > maxPixels) {
-			const reduction = Math.sqrt(maxPixels / exportPixels);
-			multiplierX *= reduction;
-			multiplierY *= reduction;
+		const area = this.getExportArea();
+		const { width: areaWidth, height: areaHeight } = area;
+		if (!(areaWidth > 0) || !(areaHeight > 0)) {
+			throw new Error('fabri-pix: unable to export the image');
 		}
 
-		canvas.discardActiveObject();
+		// the requested pixel size: an explicit multiplier scales the exported area (the Resize menu output
+		// scale is ignored then, as before), otherwise the output size of the editor is used
+		let pixelWidth: number;
+		let pixelHeight: number;
+		if (customMultiplier !== undefined) {
+			pixelWidth = areaWidth * customMultiplier;
+			pixelHeight = areaHeight * customMultiplier;
+		} else {
+			// getNaturalSize() is rounded like getOutputSize(), so a resize which fits into the budget
+			// exports exactly the size shown in the Resize menu
+			const natural = this.getNaturalSize();
+			const outputScale = this.getOutputScale();
+			pixelWidth = natural.width * outputScale.x;
+			pixelHeight = natural.height * outputScale.y;
+		}
+		pixelWidth = Math.max(1, pixelWidth);
+		pixelHeight = Math.max(1, pixelHeight);
+
+		// the same reduction for both axes keeps the aspect ratio and a non-proportional stretch
+		const targetPixels = pixelWidth * pixelHeight;
+		if (targetPixels > maxPixels) {
+			const reduction = Math.sqrt(maxPixels / targetPixels);
+			pixelWidth *= reduction;
+			pixelHeight *= reduction;
+		}
+		let targetWidth = Math.max(1, Math.round(pixelWidth));
+		let targetHeight = Math.max(1, Math.round(pixelHeight));
+		// rounding both sides up can end slightly above the limit, floor them back into the budget
+		if (targetWidth * targetHeight > maxPixels) {
+			const reduction = Math.sqrt(maxPixels / (targetWidth * targetHeight));
+			targetWidth = Math.max(1, Math.floor(targetWidth * reduction));
+			targetHeight = Math.max(1, Math.floor(targetHeight * reduction));
+		}
+
+		// render at the largest scale the non-uniform output needs, but never let the intermediate canvas
+		// exceed the pixel budget either (it would fail / run out of memory for a strong stretch)
+		const requiredScale = Math.max(targetWidth / areaWidth, targetHeight / areaHeight);
+		const budgetScale = Math.sqrt(maxPixels / (areaWidth * areaHeight));
+		const renderScale = Math.max(1e-6, Math.min(requiredScale, budgetScale));
+
 		const filter = (object: any) => !this.isTransientType(object.shapeType);
 		const viewportTransform = [...canvas.viewportTransform] as TMat2D;
-		canvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
-		let blobPromise: Promise<Blob | null>;
+		let rendered: HTMLCanvasElement;
 		try {
-			// rendering is synchronous, only the encoding is async, so the view is restored right away
-			if (multiplierX === multiplierY) {
-				blobPromise = canvas.toBlob({ format, quality, multiplier: multiplierX, ...area, filter });
-			} else {
-				// a resize without keeping the aspect ratio: render at the larger scale and stretch it
-				const rendered = canvas.toCanvasElement(Math.max(multiplierX, multiplierY), { ...area, filter });
-				const stretched = document.createElement('canvas');
-				stretched.width = Math.max(1, Math.round(area.width * multiplierX));
-				stretched.height = Math.max(1, Math.round(area.height * multiplierY));
-				stretched.getContext('2d')?.drawImage(rendered, 0, 0, stretched.width, stretched.height);
-				blobPromise = new Promise((resolve) => stretched.toBlob(resolve, `image/${format}`, quality));
-			}
+			// exporting must not depend on the current pan / zoom; the view is restored right away
+			canvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
+			rendered = canvas.toCanvasElement(renderScale, { ...area, filter });
 		} finally {
 			canvas.setViewportTransform(viewportTransform);
 		}
 
-		const blob = await blobPromise;
+		let output = rendered;
+		if (rendered.width !== targetWidth || rendered.height !== targetHeight) {
+			// a non-proportional resize: stretch the uniformly rendered scene to the requested x / y
+			output = document.createElement('canvas');
+			output.width = targetWidth;
+			output.height = targetHeight;
+			output.getContext('2d')?.drawImage(rendered, 0, 0, targetWidth, targetHeight);
+		}
+
+		const blob = await new Promise<Blob | null>((resolve) =>
+			output.toBlob(resolve, `image/${format}`, quality),
+		);
 		if (!blob) {
 			throw new Error('fabri-pix: unable to export the image');
 		}
