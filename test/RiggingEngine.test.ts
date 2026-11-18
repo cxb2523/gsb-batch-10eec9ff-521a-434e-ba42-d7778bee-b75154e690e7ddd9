@@ -19,14 +19,17 @@ class MockWorker {
               type: 'RIG_DONE',
               msgId: data.msgId,
               payload: {
-                rig: { 
+                rig: {
                   joints: {
                     [JointType.Hips]: { type: JointType.Hips, position: { x: 0, y: 0, z: 0 }, confidence: 1 }
-                  }, 
+                  },
                   hierarchy: {
                     [JointType.Hips]: []
-                  } 
-                }
+                  }
+                },
+                // Transferable mode: echo this request's own buffers back
+                indicesBuffer: data.payload.indicesBuffer,
+                weightsBuffer: data.payload.weightsBuffer
               }
             }
           });
