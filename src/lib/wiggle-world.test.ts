@@ -8,7 +8,16 @@ import {
   SUPER_DURATION,
   superState,
 } from './wiggle-rules';
-import { createSnake, radiusFor, START_MASS } from './wiggle-snake';
+import { DROP_LIFETIME, dropAt, pelletAt } from './wiggle-food';
+import {
+  BOOST_SECONDS,
+  BOOST_SPEED,
+  canBoost,
+  createSnake,
+  radiusFor,
+  START_MASS,
+  STAMINA_MAX,
+} from './wiggle-snake';
 import {
   BOT_COUNT,
   createWorld,
@@ -167,6 +176,80 @@ describe('stepWorld', () => {
     for (let i = 0; i < 30; i++) stepWorld(world, 1 / 60);
     expect(player.mass).toBeLessThan(100);
     expect(world.foods.some((f) => Math.abs(f.value - 0.72) < 1e-9)).toBe(true);
+  });
+
+  it('drains stamina over about two seconds of boost, then stops boosting on its own', () => {
+    const world = emptyWorld();
+    world.arenaRadius = 100_000;
+    const player = snake(1000, 0, 0, 0, true);
+    player.boosting = true;
+    world.snakes = [player];
+    world.player = player;
+
+    const step = 1 / 60;
+    for (let i = 0; i < Math.round(BOOST_SECONDS * 60) - 1; i++) stepWorld(world, step);
+    expect(canBoost(player)).toBe(true);
+    expect(player.stamina).toBeLessThan(STAMINA_MAX / 10);
+
+    for (let i = 0; i < 3; i++) stepWorld(world, step);
+    // still holding the boost key, but the tank ran dry and the boost latched off
+    expect(player.boosting).toBe(true);
+    expect(player.boostLocked).toBe(true);
+    expect(canBoost(player)).toBe(false);
+
+    const head = player.body[0];
+    const before = head.x;
+    stepWorld(world, step);
+    expect(head.x - before).toBeLessThan(BOOST_SPEED * step);
+    expect(head.x - before).toBeGreaterThan(0);
+  });
+
+  it('refills the tank after letting go, then allows a fresh boost', () => {
+    const world = emptyWorld();
+    world.arenaRadius = 100_000;
+    const player = snake(1000, 0, 0, 0, true);
+    player.boosting = true;
+    player.stamina = 0.001;
+    world.snakes = [player];
+    world.player = player;
+    stepWorld(world, 1 / 60);
+    expect(player.boostLocked).toBe(true);
+
+    player.boosting = false;
+    let guard = 0;
+    while (player.boostLocked && guard++ < 600) stepWorld(world, 1 / 60);
+    expect(player.boostLocked).toBe(false);
+    expect(player.stamina).toBeGreaterThan(0);
+  });
+
+  it('sweeps timed drops away after their lifetime without touching plain food refills', () => {
+    const world = emptyWorld();
+    for (let i = 0; i < FOOD_TARGET; i++) world.foods.push(pelletAt(world.rand, i % 100, 0, 1));
+    for (let i = 0; i < 10; i++) world.foods.push(dropAt(world.rand, 0, i, 4, world.time));
+    expect(world.foods).toHaveLength(FOOD_TARGET + 10);
+
+    for (let t = 0; t < DROP_LIFETIME - 0.5; t += 0.5) stepWorld(world, 0.5);
+    expect(world.foods.filter((f) => f.expiresAt !== undefined)).toHaveLength(10);
+
+    for (let t = 0; t < 1.5; t += 0.5) stepWorld(world, 0.5);
+    expect(world.foods.filter((f) => f.expiresAt !== undefined)).toHaveLength(0);
+    // plain food is not swept; the floor is still stocked to the target
+    expect(world.foods).toHaveLength(FOOD_TARGET);
+  });
+
+  it('times out the glowing dots left by a gobbled snake', () => {
+    const world = emptyWorld();
+    const eater = snake(300, 0, 500);
+    const victim = snake(100, 0, 0);
+    world.snakes = [eater, victim];
+    gobble(world, eater, victim);
+    const drops = world.foods.length;
+    expect(drops).toBeGreaterThan(0);
+    expect(world.foods.every((f) => f.expiresAt === world.time + DROP_LIFETIME)).toBe(true);
+
+    world.time += DROP_LIFETIME;
+    stepWorld(world, 0.01);
+    expect(world.foods).toHaveLength(FOOD_TARGET);
   });
 
   it('runs a whole minute of play without breaking', () => {

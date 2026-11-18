@@ -75,4 +75,16 @@ test('wiggle snakes starts and the super button fires', async ({ page }) => {
   await expect(page.getByText('SUPER!')).toBeVisible();
   await page.getByRole('button', { name: 'Super power' }).click();
   await expect(page.getByText('SUPER!')).toBeHidden();
+
+  // The boost tank starts full, visibly drains while the key is held, then refills.
+  const stamina = page.getByRole('meter', { name: 'Boost energy' });
+  await expect(stamina).toBeVisible();
+  const read = async () => Number(await stamina.getAttribute('aria-valuenow'));
+  const full = await read();
+  expect(full).toBeGreaterThan(0.9);
+
+  await page.keyboard.down('Space');
+  await expect.poll(read, { timeout: 5000 }).toBeLessThan(full - 0.1);
+  await page.keyboard.up('Space');
+  await expect.poll(read, { timeout: 5000 }).toBeCloseTo(full, 1);
 });

@@ -3,6 +3,7 @@
 import { useRef, type PointerEvent } from 'react';
 
 import { SKINS } from '@/lib/wiggle-skins';
+import { BOOST_RESTART_AT, STAMINA_MAX } from '@/lib/wiggle-snake';
 import type { Standing } from '@/lib/wiggle-world';
 
 const stopSteer = (e: PointerEvent) => e.stopPropagation();
@@ -100,7 +101,13 @@ export function LengthBadge({
 }
 
 /** Hold to go fast; pointer capture keeps it pressed even if the finger slides off. */
-export function BoostButton({ onBoost }: { onBoost: (on: boolean) => void }) {
+export function BoostButton({
+  onBoost,
+  exhausted = false,
+}: {
+  onBoost: (on: boolean) => void;
+  exhausted?: boolean;
+}) {
   const held = useRef(false);
   const set = (on: boolean) => {
     if (held.current === on) return;
@@ -111,7 +118,11 @@ export function BoostButton({ onBoost }: { onBoost: (on: boolean) => void }) {
     <button
       type="button"
       aria-label="Go fast"
-      className="absolute right-5 bottom-5 flex h-20 w-20 touch-none items-center justify-center rounded-full border-2 border-sky-300/60 bg-sky-400/25 text-4xl select-none active:scale-95 active:bg-sky-400/50"
+      className={`absolute right-5 bottom-5 flex h-20 w-20 touch-none items-center justify-center rounded-full border-2 text-4xl select-none active:scale-95 ${
+        exhausted
+          ? 'border-white/25 bg-white/10 opacity-50'
+          : 'border-sky-300/60 bg-sky-400/25 active:bg-sky-400/50'
+      }`}
       onPointerDown={(e) => {
         e.stopPropagation();
         e.currentTarget.setPointerCapture(e.pointerId);
@@ -123,6 +134,47 @@ export function BoostButton({ onBoost }: { onBoost: (on: boolean) => void }) {
     >
       🚀
     </button>
+  );
+}
+
+/** The player's boost tank: drains while zooming, refills when let go, dims when locked out. */
+export function StaminaBar({ stamina, locked }: { stamina: number; locked: boolean }) {
+  const fraction = Math.max(0, Math.min(1, stamina / STAMINA_MAX));
+  const empty = locked || stamina <= 0;
+  const low = !empty && fraction <= BOOST_RESTART_AT;
+  const fill = empty
+    ? 'bg-neutral-500'
+    : low
+      ? 'bg-gradient-to-r from-rose-500 to-orange-400'
+      : 'bg-gradient-to-r from-sky-400 to-emerald-300';
+  return (
+    <div
+      className="pointer-events-none absolute bottom-6 left-1/2 flex w-32 -translate-x-1/2 flex-col items-center gap-1 sm:w-40"
+      role="meter"
+      aria-label="Boost energy"
+      aria-valuemin={0}
+      aria-valuemax={STAMINA_MAX}
+      aria-valuenow={Number(fraction.toFixed(2))}
+      aria-valuetext={empty ? 'empty, recharging' : `${Math.round(fraction * 100)}%`}
+    >
+      <div
+        className={`h-2.5 w-full overflow-hidden rounded-full border bg-black/50 ${
+          empty ? 'border-rose-400/60' : 'border-white/25'
+        }`}
+      >
+        <div
+          className={`h-full rounded-full transition-[width] duration-150 ${fill}`}
+          style={{ width: `${fraction * 100}%` }}
+        />
+      </div>
+      <span
+        className={`text-[11px] font-bold tracking-wide drop-shadow ${
+          empty ? 'animate-pulse text-rose-300' : low ? 'text-orange-300' : 'text-sky-200'
+        }`}
+      >
+        {empty ? 'recharging…' : 'boost'}
+      </span>
+    </div>
   );
 }
 

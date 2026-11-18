@@ -11,7 +11,7 @@ import { createAssets, drawFrame, type Camera, type Screen } from './render';
 export type ArenaInput = { angle: number; boosting: boolean; steerId: number | null };
 type Callbacks = { onHud: (world: World) => void; onEvent: (event: WorldEvent) => void };
 
-const HUD_EVERY_MS = 200;
+const HUD_EVERY_MS = 100;
 
 /** Owns the world and the animation loop; React only hears about it a few times a second. */
 export function useArena(canvasRef: RefObject<HTMLCanvasElement | null>, callbacks: Callbacks) {

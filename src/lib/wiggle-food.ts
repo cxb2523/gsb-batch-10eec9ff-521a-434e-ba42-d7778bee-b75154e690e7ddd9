@@ -1,6 +1,18 @@
 import { radiusFor, type Snake } from './wiggle-snake';
 
-export type Food = { x: number; y: number; r: number; value: number; color: number; phase: number };
+export type Food = {
+  x: number;
+  y: number;
+  r: number;
+  value: number;
+  color: number;
+  phase: number;
+  /** Boost trails and gobbled-snake bursts fade after DROP_LIFETIME; plain food never expires. */
+  expiresAt?: number;
+};
+
+/** How long a dropped glow dot stays on the floor before the world sweeps it away. */
+export const DROP_LIFETIME = 12;
 
 export const FOOD_COLORS = [
   '#f472b6',
@@ -34,6 +46,21 @@ export function randomFood(rand: () => number, arenaRadius: number): Food {
   const dist = Math.sqrt(rand()) * (arenaRadius - 30);
   const angle = rand() * Math.PI * 2;
   return pelletAt(rand, Math.cos(angle) * dist, Math.sin(angle) * dist, rand() < 0.15 ? 3 : 1);
+}
+
+/** A temporary glow dot - boost trail or gobbled-snake burst - that times out on its own. */
+export function dropAt(rand: () => number, x: number, y: number, value: number, now: number): Food {
+  return { ...pelletAt(rand, x, y, value), expiresAt: now + DROP_LIFETIME };
+}
+
+/** Sweep timed drops that are past their expiry; plain food has no expiry and is left alone. */
+export function removeExpiredFoods(foods: Food[], now: number) {
+  for (let i = foods.length - 1; i >= 0; i--) {
+    const expiresAt = foods[i].expiresAt;
+    if (expiresAt === undefined || expiresAt > now) continue;
+    foods[i] = foods[foods.length - 1];
+    foods.pop();
+  }
 }
 
 /** Pull nearby dots into the mouth and swallow the ones that arrive; returns mass gained. */

@@ -1,7 +1,15 @@
 import { BOT_NAMES, thinkBot } from './wiggle-bots';
-import { eatFood, pelletAt, randomFood, type Food } from './wiggle-food';
+import { eatFood, dropAt, randomFood, removeExpiredFoods, type Food } from './wiggle-food';
 import { isSuper, resolveContacts } from './wiggle-rules';
-import { canBoost, createSnake, moveSnake, START_MASS, type Snake, type Vec } from './wiggle-snake';
+import {
+  canBoost,
+  createSnake,
+  moveSnake,
+  START_MASS,
+  tickStamina,
+  type Snake,
+  type Vec,
+} from './wiggle-snake';
 
 export const ARENA_RADIUS = 3000;
 export const FOOD_TARGET = 900;
@@ -113,10 +121,13 @@ export function stepWorld(world: World, dt: number) {
     if (!snake.isPlayer) thinkBot(snake, surroundings, dt);
     moveSnake(snake, dt, world.arenaRadius);
     dropBoostTrail(world, snake, dt);
+    // drain after moving so the tank empties exactly when the boost frames end
+    tickStamina(snake, dt);
     const value = eatFood(snake, world.foods, dt);
     if (value > 0) world.events.push({ type: 'munch', snake, value });
   }
   resolveContacts(world);
+  removeExpiredFoods(world.foods, world.time);
   refill(world);
 }
 
@@ -130,7 +141,7 @@ function dropBoostTrail(world: World, snake: Snake, dt: number) {
   if (snake.dropTimer < DROP_EVERY) return;
   snake.dropTimer -= DROP_EVERY;
   const tail = snake.body[snake.body.length - 1];
-  world.foods.push(pelletAt(world.rand, tail.x, tail.y, BOOST_COST * DROP_EVERY * 0.75));
+  world.foods.push(dropAt(world.rand, tail.x, tail.y, BOOST_COST * DROP_EVERY * 0.75, world.time));
 }
 
 function refill(world: World) {

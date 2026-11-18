@@ -21,12 +21,18 @@ import {
   type WorldEvent,
 } from '@/lib/wiggle-world';
 
-import { BoostButton, LengthBadge, Leaderboard, SuperButton } from './hud';
+import { BoostButton, LengthBadge, Leaderboard, StaminaBar, SuperButton } from './hud';
 import { GameOverPanel, MenuPanel, type Ending } from './overlays';
 import { useArena } from './use-arena';
 
 type Phase = 'menu' | 'play' | 'over';
-type Hud = { board: Standing[]; player?: Standing; total: number } & ReturnType<typeof superState>;
+type Hud = {
+  board: Standing[];
+  player?: Standing;
+  total: number;
+  stamina: number;
+  exhausted: boolean;
+} & ReturnType<typeof superState>;
 
 const GAME = { game: 'wiggle-snakes' };
 const noSubscribe = () => () => {};
@@ -34,10 +40,13 @@ const isTouch = () => window.matchMedia('(pointer: coarse)').matches;
 
 function readHud(world: World): Hud {
   const board = standings(world);
+  const { player } = world;
   return {
     board,
     player: board.find((s) => s.isPlayer),
     total: board.length,
+    stamina: player?.stamina ?? 1,
+    exhausted: player !== null && (player.boostLocked || player.stamina <= 0),
     ...superState(world),
   };
 }
@@ -169,8 +178,10 @@ export function WiggleSnakesGame() {
             rank={hud.player?.rank ?? 0}
             total={hud.total}
           />
+          <StaminaBar stamina={hud.stamina} locked={hud.exhausted} />
           {touch && (
             <BoostButton
+              exhausted={hud.exhausted}
               onBoost={(on) => {
                 inputRef.current.boosting = on;
               }}

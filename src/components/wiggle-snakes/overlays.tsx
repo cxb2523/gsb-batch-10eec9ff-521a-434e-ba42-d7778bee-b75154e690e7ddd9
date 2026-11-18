@@ -41,8 +41,8 @@ export function MenuPanel({ skin, best, onSkin, onPlay }: MenuProps) {
       <SkinPicker skin={skin} onChange={onSkin} />
       <PlayButton label="Play" onPlay={onPlay} />
       <span className="max-w-xs px-6 text-sm text-neutral-400">
-        steer with your finger or mouse &middot; hold 🚀 or the mouse button to go fast &middot; tap
-        ⚡ on top to gobble everyone
+        steer with your finger or mouse &middot; hold 🚀 or the mouse button to go fast until the
+        boost bar runs out &middot; tap ⚡ on top to gobble everyone
       </span>
       <span className="h-5 text-sm text-amber-200/80">{best > 0 ? `Your best: ${best}` : ''}</span>
     </Overlay>

@@ -11,6 +11,10 @@ export type Snake = {
   targetAngle: number;
   mass: number;
   boosting: boolean;
+  /** Boost energy: 0 (empty) to STAMINA_MAX (full). */
+  stamina: number;
+  /** Latched when the tank runs dry; clears once stamina recovers to BOOST_RESTART_AT. */
+  boostLocked: boolean;
   alive: boolean;
   dropTimer: number;
   /** Bots only: seconds until the next decision, and the drifting wander heading. */
@@ -24,6 +28,15 @@ export const MIN_BOOST_MASS = 15;
 export const SEGMENT_SPACING = 6;
 export const BASE_SPEED = 190;
 export const BOOST_SPEED = 380;
+
+/** A full stamina bar lasts this many seconds of boosting. */
+export const BOOST_SECONDS = 2;
+export const STAMINA_MAX = 1;
+export const STAMINA_DRAIN = STAMINA_MAX / BOOST_SECONDS;
+/** Letting go refills the tank faster than boosting drains it. */
+export const STAMINA_RECOVER = STAMINA_DRAIN * 1.5;
+/** After running dry, boost stays locked until the tank is back to this much. */
+export const BOOST_RESTART_AT = STAMINA_MAX * 0.3;
 
 export const radiusFor = (mass: number) => Math.min(40, 10 + Math.sqrt(mass) * 0.9);
 export const segmentsFor = (mass: number) => Math.min(500, Math.round(10 + mass * 0.35));
@@ -47,6 +60,8 @@ export function createSnake({ x, y, angle, mass, ...rest }: SnakeInit): Snake {
     targetAngle: angle,
     mass,
     boosting: false,
+    stamina: STAMINA_MAX,
+    boostLocked: false,
     alive: true,
     dropTimer: 0,
     thinkIn: 0,
@@ -63,8 +78,28 @@ export function angleDelta(from: number, to: number) {
   return d;
 }
 
+/** Boosting needs both a press and enough mass and stamina. */
 export function canBoost(snake: Snake) {
-  return snake.boosting && snake.mass > MIN_BOOST_MASS;
+  return snake.boosting && snake.mass > MIN_BOOST_MASS && !snake.boostLocked && snake.stamina > 0;
+}
+
+/**
+ * Spend or refill boost energy for this frame. Running dry latches the boost off;
+ * the latch only clears once the tank has recovered past BOOST_RESTART_AT, so
+ * holding the key at zero does not stutter on and off.
+ */
+export function tickStamina(snake: Snake, dt: number) {
+  if (canBoost(snake)) {
+    snake.stamina = Math.max(0, snake.stamina - STAMINA_DRAIN * dt);
+    // floating-point dust would otherwise keep "empty" boosting for one extra frame
+    if (snake.stamina < 1e-9) {
+      snake.stamina = 0;
+      snake.boostLocked = true;
+    }
+    return;
+  }
+  snake.stamina = Math.min(STAMINA_MAX, snake.stamina + STAMINA_RECOVER * dt);
+  if (snake.stamina >= BOOST_RESTART_AT) snake.boostLocked = false;
 }
 
 /** Turn toward the target, slide the head forward, and lay trail samples behind it. */

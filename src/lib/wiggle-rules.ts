@@ -1,4 +1,4 @@
-import { pelletAt } from './wiggle-food';
+import { dropAt } from './wiggle-food';
 import { radiusFor, SEGMENT_SPACING, type Snake, type Vec } from './wiggle-snake';
 import type { World } from './wiggle-world';
 
@@ -67,7 +67,9 @@ export function gobble(world: World, eater: Snake, victim: Snake) {
   const value = (victim.mass * 0.8 + 4) / count;
   for (let k = 0; k < count; k++) {
     const p = victim.body[Math.floor((k * victim.body.length) / count)];
-    world.foods.push(pelletAt(rand, p.x + (rand() - 0.5) * r, p.y + (rand() - 0.5) * r, value));
+    world.foods.push(
+      dropAt(rand, p.x + (rand() - 0.5) * r, p.y + (rand() - 0.5) * r, value, world.time)
+    );
   }
   world.events.push({ type: 'gobble', eater, victim });
   if (!victim.isPlayer) world.respawnAt.push(world.time + RESPAWN_DELAY);

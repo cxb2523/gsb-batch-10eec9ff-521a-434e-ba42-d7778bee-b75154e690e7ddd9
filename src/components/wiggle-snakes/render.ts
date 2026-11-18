@@ -102,9 +102,16 @@ function drawFood(ctx: CanvasRenderingContext2D, world: World, view: View, asset
   for (const food of world.foods) {
     if (food.x < view.left - 40 || food.x > view.right + 40) continue;
     if (food.y < view.top - 40 || food.y > view.bottom + 40) continue;
-    const size = food.r * 5 * (1 + 0.14 * Math.sin(world.time * 4 + food.phase));
+    // timed drops shrink and fade just before the world sweeps them away
+    const left = food.expiresAt === undefined ? Infinity : food.expiresAt - world.time;
+    const fade = Math.max(0, Math.min(1, left / 1.5));
+    if (fade === 0) continue;
+    const size =
+      food.r * 5 * (1 + 0.14 * Math.sin(world.time * 4 + food.phase)) * (0.6 + 0.4 * fade);
+    ctx.globalAlpha = fade;
     ctx.drawImage(assets.dots[food.color], food.x - size / 2, food.y - size / 2, size, size);
   }
+  ctx.globalAlpha = 1;
 }
 
 function onScreen(snake: Snake, view: View) {
