@@ -4,6 +4,28 @@ import { getSegments } from "./segments"
 
 
 
+// A spike ( zero main angle ) is kept as EPSILON internally, because the arc
+// center is calculated through "radius / sin( main / 2 )". For main -> 0 that
+// expression tends to the offset, which is exactly what a spike needs.
+// getAngles snaps every real angle to 0 or PI, so EPSILON can never be a real
+// angle, and it is exposed back as an exact 0 in the output.
+const SPIKE_MAIN = Number.EPSILON
+
+// raw ( not rounded ) length, in/out points are placed with it, so a length
+// rounded up can never push them outside their side
+const getDistance = (
+  A: Point, B: Point,
+) => Math.sqrt((B.x - A.x) * (B.x - A.x) + (B.y - A.y) * (B.y - A.y))
+
+// value / divisor, but a zero divisor ( a straight point takes no side space )
+// is not a restriction, while an empty ( zero ) side is.
+// Keeps NaN ( 0 / 0 ) out of every radius calculation.
+const safeDiv = (value: number, divisor: number) => (
+  divisor > 0 ? value / divisor : value > 0 ? Infinity : 0
+)
+
+
+
 const roundPolygon = (
   points: InitPoint[],
   radius: number = 0,
@@ -13,7 +35,6 @@ const roundPolygon = (
     len = points.length,
     preRoundedPoints: PreRoundedPoint[] = [],
     limPoints: PreRoundedPoint[] = [],
-    noLimPoints: PreRoundedPoint[] = [],
     zeroLimPoints: PreRoundedPoint[] = []
 
   // prepare points, calc angles
@@ -22,17 +43,18 @@ const roundPolygon = (
     const
       prev = points[(id - 1 + len) % len],
       next = points[(id + 1) % len],
-      prevlen = getLength(prev, curr),
-      nextlen = getLength(curr, next),
-      angle = getAngles(prev, curr, next, prevlen, nextlen)
+      // raw lengths place in/out points, rounded ones detect overlapped points
+      prevlen = getDistance(prev, curr),
+      nextlen = getDistance(curr, next),
+      angle = getAngles(prev, curr, next, getLength(prev, curr), getLength(curr, next))
 
     if (angle.main === 0) {
-      angle.main = Number.EPSILON
+      angle.main = SPIKE_MAIN
       angle.vel = Number.MAX_SAFE_INTEGER
     }
     else if (angle.main === PI) angle.vel = 0
 
-    const preRoundedPoint = {
+    const preRoundedPoint: PreRoundedPoint = {
       x: curr.x,
       y: curr.y,
       angle,
@@ -57,13 +79,12 @@ const roundPolygon = (
       angle.bis = angle.prev || angle.next // :)
       zeroLimPoints.push(preRoundedPoint)
     }
-    // spread points into either limited, zero-limited or none-limited lists
+    // spread points into either limited or zero-limited lists
     // ( is limited if point has own radius to round )
     else if (typeof curr.r === "number") {
       if (curr.r === 0) zeroLimPoints.push(preRoundedPoint)
       else limPoints.push(preRoundedPoint)
     }
-    else noLimPoints.push(preRoundedPoint)
 
     preRoundedPoints.push(preRoundedPoint)
   })
@@ -79,14 +100,12 @@ const roundPolygon = (
 
   // calc collision radius for each point
   preRoundedPoints.forEach((p) => {
-    p.arc.hit = min(
-      p.out.rest / (p.angle.vel + p.next.angle.vel),
-      p.in.rest  / (p.angle.vel + p.prev.angle.vel),
-    )
+    p.arc.hit = getHit(p)
   })
 
 
-  // calc limit radius and its offsets
+  // points with an own "r" take the space first, so a common radius can never
+  // squeeze them, then the common radius only uses what is left
   let minHitPoint = getMinHit(limPoints)
   while (minHitPoint) {
     calcLimitRadius(minHitPoint)
@@ -112,7 +131,8 @@ const roundPolygon = (
       x: p.x,
       y: p.y,
       angle: {
-        main: p.angle.main,
+        // a spike is exposed as an exact 0 ( it is kept as SPIKE_MAIN )
+        main: p.angle.main === SPIKE_MAIN ? 0 : p.angle.main,
         prev: p.angle.prev,
         next: p.angle.next,
         bis: p.angle.bis,
@@ -124,15 +144,17 @@ const roundPolygon = (
         x: p.x + (cos(p.angle.bis) * bislen || 0),
         y: p.y + (sin(p.angle.bis) * bislen || 0),
       },
+      // in/out are placed along the side itself, so they always stay on the
+      // segment, even for a rounded side length
       in: {
         length: p.in.length,
-        x: p.x + cos(p.angle.prev) * p.offset,
-        y: p.y + sin(p.angle.prev) * p.offset,
+        x: p.in.length ? p.x + (p.prev.x - p.x) * (p.offset / p.in.length) : p.x,
+        y: p.in.length ? p.y + (p.prev.y - p.y) * (p.offset / p.in.length) : p.y,
       },
       out: {
         length: p.out.length,
-        x: p.x + cos(p.angle.next) * p.offset,
-        y: p.y + sin(p.angle.next) * p.offset,
+        x: p.out.length ? p.x + (p.next.x - p.x) * (p.offset / p.out.length) : p.x,
+        y: p.out.length ? p.y + (p.next.y - p.y) * (p.offset / p.out.length) : p.y,
       },
       get prev() { return roundedPoints[(p.id - 1 + len) % len] },
       get next() { return roundedPoints[(p.id + 1) % len] },
@@ -144,14 +166,27 @@ const roundPolygon = (
 
 
 
+// the radius that makes two neighbor offsets exactly fill a shared side
+const getHit = (
+  curr: PreRoundedPoint,
+) => (
+  min(
+    safeDiv(curr.out.rest, curr.angle.vel + curr.next.angle.vel),
+    safeDiv(curr.in.rest,  curr.angle.vel + curr.prev.angle.vel),
+  )
+)
+
+
+
 const calcLimitRadius = (
   curr: PreRoundedPoint,
 ) => {
 
   const { prev, next } = curr
 
-  // straight angle has zero offset, so any radius fits ( avoids rest / 0 = NaN )
-  if (curr.angle.vel === 0) curr.arc.radius = curr.arc.lim
+  // straight angle has zero offset, so the radius only has to fit the free
+  // length of the sides ( avoids rest / 0 = NaN )
+  if (curr.angle.vel === 0) curr.arc.radius = max(min(curr.arc.lim, curr.arc.hit), 0)
 
   // if prev locked
   else if (prev.locked && !next.locked) curr.arc.radius = min(
@@ -193,8 +228,9 @@ const calcLimitRadius = (
     curr.arc.lim,
   )
 
-  // rest may already be exhausted ( <= 0 ) by a locked neighbor
-  curr.arc.radius = max(curr.arc.radius, 0)
+  // a shared side may already be exhausted ( rest <= 0 ) by a locked neighbor:
+  // the radius then converges to 0 instead of becoming negative or NaN
+  curr.arc.radius = clampRadius(curr, curr.arc.radius)
 
   lockPoint(curr)
 }
@@ -209,29 +245,59 @@ const calcCommonRadius = (
   if (radius > curr.arc.hit) {
     const { prev, next } = curr
 
+    // safeDiv keeps a straight point's zero offset factor from producing
+    // Infinity / NaN here
     // max(..., 0) cased by somehow getting rest = -2.71e-15 from calcLimit
     if (prev.locked && !next.locked) curr.arc.radius = max(min(
-      curr.in.rest / curr.angle.vel,
-      curr.out.length / (curr.angle.vel + next.angle.vel),
+      safeDiv(curr.in.rest, curr.angle.vel),
+      safeDiv(curr.out.length, curr.angle.vel + next.angle.vel),
       curr.arc.radius,
     ), 0)
 
     else if (next.locked && !prev.locked) curr.arc.radius = max(min(
-      curr.out.rest / curr.angle.vel,
-      curr.in.length / (curr.angle.vel + prev.angle.vel),
+      safeDiv(curr.out.rest, curr.angle.vel),
+      safeDiv(curr.in.length, curr.angle.vel + prev.angle.vel),
       curr.arc.radius,
     ), 0)
 
     else if (next.locked && prev.locked) curr.arc.radius = max(min(
-      curr.in.rest / curr.angle.vel,
-      curr.out.rest / curr.angle.vel,
+      safeDiv(curr.in.rest,  curr.angle.vel),
+      safeDiv(curr.out.rest, curr.angle.vel),
       curr.arc.radius,
     ), 0)
 
     else curr.arc.radius = curr.arc.hit
   }
 
+  // a shared side might be fully consumed by a locked neighbor: the radius
+  // then converges to 0 instead of becoming negative or NaN
+  curr.arc.radius = clampRadius(curr, curr.arc.radius)
+
   lockPoint(curr)
+}
+
+
+
+// make a radius respect the remaining side length, never go negative or NaN,
+// and converge to 0 when a neighbor has already consumed the shared side
+const clampRadius = (
+  curr: PreRoundedPoint,
+  value: number,
+) => {
+  // negative, zero and NaN ( 0 / 0 ) all converge to 0
+  if (!(value > 0)) return 0
+
+  // a straight point is tangent at the vertex, so it takes no side space and
+  // its radius only matters as long as the sides are not exhausted
+  if (curr.angle.vel === 0) return max(min(value, curr.arc.hit), 0)
+
+  // offset = radius * vel, so this keeps both offsets inside the free space
+  // ( a fully consumed side gives rest <= 0, hence the radius converges to 0 )
+  return max(min(
+    value,
+    safeDiv(curr.in.rest,  curr.angle.vel),
+    safeDiv(curr.out.rest, curr.angle.vel),
+  ), 0)
 }
 
 
@@ -239,7 +305,12 @@ const calcCommonRadius = (
 const lockPoint = (curr: PreRoundedPoint) => {
   const { prev, next } = curr
 
-  curr.offset = curr.arc.radius * curr.angle.vel
+  // a radius must always be a finite non-negative number
+  if (!Number.isFinite(curr.arc.radius) || curr.arc.radius < 0) curr.arc.radius = 0
+
+  // offset = radius * vel, and clampRadius guarantees it fits the free length
+  // of both sides; a straight point ( vel = 0 ) is tangent at the vertex
+  curr.offset = curr.angle.vel === 0 ? 0 : curr.arc.radius * curr.angle.vel
 
   prev.out.rest -= curr.offset
   curr.in.rest  -= curr.offset
@@ -249,15 +320,16 @@ const lockPoint = (curr: PreRoundedPoint) => {
   curr.locked = true
 
   // to get right getMinHit then
+  // ( safeDiv keeps a straight neighbor's zero offset factor from making NaN )
   prev.arc.hit = min(
-    prev.in.length / (prev.angle.vel + prev.prev.angle.vel),
-    prev.in.rest / prev.angle.vel,
-    prev.out.rest / prev.angle.vel,
+    safeDiv(prev.in.length, prev.angle.vel + prev.prev.angle.vel),
+    safeDiv(prev.in.rest, prev.angle.vel),
+    safeDiv(prev.out.rest, prev.angle.vel),
   )
   next.arc.hit = min(
-    next.out.length / (next.angle.vel + next.next.angle.vel),
-    next.out.rest / next.angle.vel,
-    next.in.rest / next.angle.vel,
+    safeDiv(next.out.length, next.angle.vel + next.next.angle.vel),
+    safeDiv(next.out.rest, next.angle.vel),
+    safeDiv(next.in.rest, next.angle.vel),
   )
 }
 
@@ -269,7 +341,6 @@ const getMinHit = (
   arr.reduce((min: PreRoundedPoint | null, p) =>
     p.locked ? min : !min ? p : p.arc.hit < min.arc.hit ? p : min,
   null))
-
 
 
 export {

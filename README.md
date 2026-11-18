@@ -152,6 +152,15 @@ segments.forEach((p) => {
 
 ## Changelog
 
+### v0.8.0
+- fix: neighbor roundings could overlap on a shared side ( a very large "r" next to a close point made the offsets sum exceed the side length ). A radius is now always clamped by the remaining ( free ) length of both adjacent sides
+- fix: `offset` and `arc.radius` could become negative or `NaN` when one end of a side was fully consumed by the other end's rounding, they now converge to `0`
+- fix: common-radius points could take space needed by points with their own "r"; points with an own "r" are allocated first and the common radius only uses what is left
+- fix: `in` / `out` coordinates are now placed along the side itself, so they always stay within the segment
+- fix: `angle.main` is exposed as an exact `0` for a spike and an exact `Math.PI` for a collinear point
+- fix: `getSegments` returns only the vertex for a point whose radius is pressed to `0`, without any `NaN`
+- no changes to public types or the default call signature
+
 ### v0.7.0
 - fix: `NaN` offset and coordinates for a straight-angle (PI) point with its own "r" when a neighbor consumes their shared edge, which also left the next point unclamped at the full common radius ([#2](https://github.com/upo11o/round-polygon/issues/2))
 - fix: negative radius when a point's own "r" meets an edge already consumed by a neighbor

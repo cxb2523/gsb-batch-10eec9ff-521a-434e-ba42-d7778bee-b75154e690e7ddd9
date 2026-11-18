@@ -18,7 +18,13 @@ export const getSegments = (
       unitangle = angle / amount,
       vertices: Point[] = []
 
-    if (!amount || !unitangle) return segmented.concat({ x, y })
+    // a point whose radius was pressed to 0 ( or any invalid one ) has no arc,
+    // so it is represented by its vertex only, never by NaN coordinates
+    if (!(radius > 0) || !Number.isFinite(radius)) return segmented.concat({ x, y })
+
+    // straight points ( angle === 0 ), AMOUNT = 0 and non-positive or infinite
+    // amounts don't produce an arc either
+    if (!Number.isFinite(amount) || amount <= 0 || !unitangle) return segmented.concat({ x, y })
 
     for (let i = 0; i <= amount; i++) {
       vertices.push({
