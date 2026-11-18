@@ -49,16 +49,23 @@ class MoogWorklet extends AudioWorkletProcessor {
 
     if (event.type === "init-module") {
       const { cutoff = 0.065, resonance = 3.5 } = event.data;
+      this.cutoff = cutoff;
+      this.resonance = resonance;
       this.worklet = MoogModule.new(cutoff, resonance);
     }
 
-    // Setters for internal properties (since we can't mutate this directly)
+    // Setters for internal properties (since we can't mutate this directly).
+    // Forward each change to the underlying WASM module so the next process()
+    // block uses the new parameter. The Rust setters only touch the parameter
+    // fields and keep the in1..in4 / out1..out4 filter state intact, so audio
+    // keeps playing without clicks or discontinuities.
     if (event.type === "set-cutoff") {
       this.cutoff = event.data;
-      // @TODO: Update the underylinng module
+      this.worklet?.set_cutoff(event.data);
     }
     if (event.type === "set-resonance") {
       this.resonance = event.data;
+      this.worklet?.set_resonance(event.data);
     }
   };
 
