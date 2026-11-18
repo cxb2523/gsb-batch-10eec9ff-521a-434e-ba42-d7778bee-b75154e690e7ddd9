@@ -121,8 +121,7 @@ export function useOffscreenWebGL(canvas: HTMLCanvasElement | null, options: Use
 				await proxy.setFrameRateAsync(refreshRate);
 				if (cancelled) return;
 
-				await proxy.updateUniformAsync('u_resolution', size);
-				if (cancelled) return;
+				// resize() keeps u_resolution and the drawing buffer in sync atomically.
 				await proxy.resizeAsync(size[0], size[1]);
 				if (cancelled) return;
 				setState((prev) => ({
@@ -197,9 +196,14 @@ export function useOffscreenWebGL(canvas: HTMLCanvasElement | null, options: Use
 				const pixelWidth = Math.max(1, Math.round(width * window.devicePixelRatio));
 				const pixelHeight = Math.max(1, Math.round(height * window.devicePixelRatio));
 				if (sizeRef.current[0] === pixelWidth && sizeRef.current[1] === pixelHeight) return;
-				sizeRef.current = [pixelWidth, pixelHeight];
-				proxy.updateUniform('u_resolution', [pixelWidth, pixelHeight]);
-				proxy.resizeAsync(pixelWidth, pixelHeight).catch(setError);
+				// resize() updates u_resolution together with the canvas size, so the next
+				// frame can never sample the new resolution while the canvas is still old.
+				proxy
+					.resizeAsync(pixelWidth, pixelHeight)
+					.then(() => {
+						sizeRef.current = [pixelWidth, pixelHeight];
+					})
+					.catch(setError);
 			});
 
 			observer.observe(canvas);

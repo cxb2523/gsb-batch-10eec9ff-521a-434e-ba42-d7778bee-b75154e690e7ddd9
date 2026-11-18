@@ -8,6 +8,28 @@ export type RunOnWorkerContextFnName = `f_${string}`;
 
 export type RunOnWorkerContextFn<T = any> = (manager: WebGLManager, frame: number, timeElapsed: number) => T;
 
+/**
+ * The rectangle of the shared drawing buffer that holds this manager's frame.
+ * Coordinates use the canvas top-left origin (the same space `drawImage` uses).
+ */
+export interface PaintRegion {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+}
+
+type CanvasSize = { width: number; height: number };
+
+/** Normalises a requested size to whole pixels, or returns null when it cannot be rendered. */
+function normalizeSize(width: number, height: number): CanvasSize | null {
+	if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+	const w = Math.floor(width);
+	const h = Math.floor(height);
+	if (w < 1 || h < 1) return null;
+	return { width: w, height: h };
+}
+
 export class WebGLManager {
 	public static readonly DEFAULT_FRAME_RATE = 30;
 	private frame: number = 0;
@@ -18,7 +40,7 @@ export class WebGLManager {
 	private gl: WebGLRenderingContext;
 	private width: number;
 	private height: number;
-	private onPaint?: (width: number, height: number) => void;
+	private onPaint?: (width: number, height: number, region: PaintRegion) => void;
 	private quadBuffers = new Map<WebGLProgram, WebGLBuffer>();
 	private program: WebGLProgram | null = null;
 	private vertexShader: WebGLShader | null = null;
@@ -43,11 +65,12 @@ export class WebGLManager {
 		canvas: HTMLCanvasElement,
 		width = canvas.width,
 		height = canvas.height,
-		onPaint?: (width: number, height: number) => void
+		onPaint?: (width: number, height: number, region: PaintRegion) => void
 	) {
 		this.canvas = canvas;
-		this.width = width;
-		this.height = height;
+		const initialSize = normalizeSize(width, height) ?? normalizeSize(canvas.width, canvas.height) ?? { width: 1, height: 1 };
+		this.width = initialSize.width;
+		this.height = initialSize.height;
 		this.onPaint = onPaint;
 		this.gl = this.canvas.getContext('webgl')! as WebGLRenderingContext;
 
@@ -75,7 +98,7 @@ export class WebGLManager {
 		canvas: HTMLCanvasElement,
 		width = canvas.width,
 		height = canvas.height,
-		onPaint?: (width: number, height: number) => void
+		onPaint?: (width: number, height: number, region: PaintRegion) => void
 	): Result<WebGLManager> {
 		try {
 			return ok(new WebGLManager(canvas, width, height, onPaint));
@@ -274,13 +297,41 @@ export class WebGLManager {
 			});
 	}
 
+	/**
+	 * Grows the shared drawing buffer when this instance needs more room.
+	 * The buffer is never shrunk: another instance may rely on the space it
+	 * already occupies, and a smaller request must not disturb it.
+	 */
+	private ensureDrawingBufferSize(): void {
+		const canvas = this.canvas;
+		const targetWidth = Math.max(canvas.width, this.width);
+		const targetHeight = Math.max(canvas.height, this.height);
+		if (canvas.width !== targetWidth) canvas.width = targetWidth;
+		if (canvas.height !== targetHeight) canvas.height = targetHeight;
+	}
+
+	/** The region of the shared drawing buffer that holds this instance's frame (top-left origin). */
+	private getPaintRegion(): PaintRegion {
+		return {
+			x: 0,
+			y: this.canvas.height - this.height,
+			width: this.width,
+			height: this.height,
+		};
+	}
+
 	public paintCanvas(): Result<WebGLManager> {
 		if (this.shaderPrograms && this.fragmentShaderGroups) {
-			if (this.canvas.width < this.width) this.canvas.width = this.width;
-			if (this.canvas.height < this.height) this.canvas.height = this.height;
+			if (!Number.isFinite(this.width) || !Number.isFinite(this.height) || this.width < 1 || this.height < 1) {
+				return err(new Error(`[OffscreenCanvas @ GLManager] Invalid canvas size: ${this.width}x${this.height}`));
+			}
+			// Never assume the shared canvas is currently our size; grow it to fit
+			// and copy exactly our own region afterwards.
+			this.ensureDrawingBufferSize();
 			const result = this.renderWithFragmentShaderGroups();
-			if (!result.error) this.onPaint?.(this.width, this.height);
-			return result;
+			if (result.error) return result;
+			this.onPaint?.(this.width, this.height, this.getPaintRegion());
+			return ok(this);
 		}
 
 		return ok(this);
@@ -368,10 +419,17 @@ export class WebGLManager {
 	}
 
 	public resize(width: number, height: number): Result<WebGLManager> {
-		this.width = width;
-		this.height = height;
+		const size = normalizeSize(width, height);
+		if (!size) {
+			return err(new Error(`[OffscreenCanvas @ GLManager] Invalid canvas size: ${width}x${height}`));
+		}
+		this.width = size.width;
+		this.height = size.height;
+		// Keep u_resolution in lockstep with the drawing buffer so a frame can never
+		// sample the new size while the canvas still has the old one.
+		this.updateUniform('u_resolution', [this.width, this.height]);
 		if (this.usesPingPongGroups) {
-			const result = this.setupPingPongBuffers(width, height);
+			const result = this.setupPingPongBuffers(this.width, this.height);
 			if (result.error) return result;
 		}
 		return this.paintCanvas();

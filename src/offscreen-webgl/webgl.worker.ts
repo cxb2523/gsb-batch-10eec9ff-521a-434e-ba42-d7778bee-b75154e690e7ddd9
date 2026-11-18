@@ -1,5 +1,5 @@
 import { uuidv4 } from '../utils/uuid';
-import { WebGLManager } from './gl-manager';
+import { PaintRegion, WebGLManager } from './gl-manager';
 
 export const WORKER_ID = `OffscreenWebGLWorker-${uuidv4()}`;
 
@@ -32,16 +32,23 @@ const queues = new Map<string, Promise<void>>();
 let sharedCanvas: OffscreenCanvas | undefined;
 const outputs = new Map<string, OffscreenCanvasRenderingContext2D>();
 
-function present(canvasId: string, source: OffscreenCanvas, width: number, height: number): void {
+/**
+ * Copies this instance's region out of the shared drawing buffer into its own
+ * output canvas. `region` is supplied by the manager, so presenting never
+ * depends on the shared buffer happening to be exactly this instance's size.
+ */
+function present(canvasId: string, source: OffscreenCanvas, region: PaintRegion): void {
 	const output = outputs.get(canvasId);
 	if (!output) return;
 	const canvas = output.canvas;
+	const { x, y, width, height } = region;
+	if (width < 1 || height < 1) return;
 	if (canvas.width !== width || canvas.height !== height) {
 		canvas.width = width;
 		canvas.height = height;
 		output.globalCompositeOperation = 'copy';
 	}
-	output.drawImage(source, 0, source.height - height, width, height, 0, 0, width, height);
+	output.drawImage(source, x, y, width, height, 0, 0, width, height);
 }
 
 async function handle(data: Request): Promise<void> {
@@ -59,7 +66,7 @@ async function handle(data: Request): Promise<void> {
 				canvas as unknown as HTMLCanvasElement,
 				data.width,
 				data.height,
-				(width, height) => present(data.canvasId, canvas, width, height)
+				(_width, _height, region) => present(data.canvasId, canvas, region)
 			);
 			if (result.error) throw result.error;
 			managers.set(data.proxyId, result.data);
