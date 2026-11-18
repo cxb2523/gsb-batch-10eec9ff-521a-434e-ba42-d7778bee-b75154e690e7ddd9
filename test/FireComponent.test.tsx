@@ -1,8 +1,9 @@
 import React from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render } from '@testing-library/react'
-import { FireComponent, useFire, type FireRef } from '../src/FireComponent'
-import { Texture } from 'three'
+import { FireComponent, useFire, useFirePropSync, type FireRef } from '../src/FireComponent'
+import { Fire as FireMesh, type FireProps as FireMeshProps } from '../src/Fire'
+import { Texture, LinearFilter, ClampToEdgeWrapping } from 'three'
 
 // Mock React Three Fiber Canvas context
 const MockCanvas: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -249,5 +250,108 @@ describe('FireComponent integration', () => {
     rerender(<TestComponent magnitude={2.0} />)
 
     expect(true).toBe(true) // Test that no errors were thrown
+  })
+})
+
+describe('useFirePropSync', () => {
+  type HarnessProps = Omit<FireMeshProps, 'fireTex'> & {
+    texture: Texture
+    fireRef: React.RefObject<FireMesh | null>
+  }
+
+  // Harness that mirrors how FireComponent's leaf renderers wire the sync hook
+  function SyncHarness({ fireRef, texture, ...meshProps }: HarnessProps) {
+    useFirePropSync(fireRef, texture, meshProps)
+    return null
+  }
+
+  let fire: FireMesh
+  let fireRef: React.RefObject<FireMesh | null>
+  let initialProps: HarnessProps
+
+  beforeEach(() => {
+    fire = new FireMesh({ fireTex: new Texture() })
+    fireRef = { current: fire }
+    initialProps = {
+      fireRef,
+      texture: fire.fireTex as Texture,
+      iterations: fire.iterations,
+      octaves: fire.octaves,
+      magnitude: fire.magnitude,
+      lacunarity: fire.lacunarity,
+      gain: fire.gain,
+    }
+  })
+
+  it('syncs changed props onto the mounted instance after commit', () => {
+    const newTexture = new Texture()
+    const { rerender } = render(<SyncHarness {...initialProps} />)
+
+    rerender(
+      <SyncHarness
+        {...initialProps}
+        texture={newTexture}
+        iterations={30}
+        octaves={5}
+        magnitude={2.5}
+        lacunarity={3.0}
+        gain={0.8}
+      />,
+    )
+
+    expect(fire.fireTex).toBe(newTexture)
+    expect(fire.material.uniforms.fireTex.value).toBe(newTexture)
+    expect(newTexture.magFilter).toBe(LinearFilter)
+    expect(newTexture.wrapS).toBe(ClampToEdgeWrapping)
+    expect(fire.iterations).toBe(30)
+    expect(fire.octaves).toBe(5)
+    expect(fire.material.defines?.ITERATIONS).toBe('30')
+    expect(fire.material.defines?.OCTAVES).toBe('5')
+    expect(fire.magnitude).toBe(2.5)
+    expect(fire.material.uniforms.magnitude.value).toBe(2.5)
+    expect(fire.lacunarity).toBe(3.0)
+    expect(fire.gain).toBe(0.8)
+  })
+
+  it('does not re-sync when props are unchanged', () => {
+    const { rerender } = render(<SyncHarness {...initialProps} />)
+    const version = fire.material.version
+    const iterationsSet = vi.spyOn(fire, 'iterations', 'set')
+    const octavesSet = vi.spyOn(fire, 'octaves', 'set')
+    const magnitudeSet = vi.spyOn(fire, 'magnitude', 'set')
+    const fireTexSet = vi.spyOn(fire, 'fireTex', 'set')
+
+    // Rerender with identical values (fresh object identities, same primitives)
+    rerender(<SyncHarness {...initialProps} />)
+
+    expect(iterationsSet).not.toHaveBeenCalled()
+    expect(octavesSet).not.toHaveBeenCalled()
+    expect(magnitudeSet).not.toHaveBeenCalled()
+    expect(fireTexSet).not.toHaveBeenCalled()
+    expect(fire.material.version).toBe(version)
+  })
+
+  it('keeps material and old texture alive when props change', () => {
+    const oldTexture = fire.fireTex as Texture
+    const material = fire.material
+    const materialDispose = vi.spyOn(material, 'dispose')
+    const textureDispose = vi.spyOn(oldTexture, 'dispose')
+    const { rerender } = render(<SyncHarness {...initialProps} />)
+
+    rerender(
+      <SyncHarness
+        {...initialProps}
+        texture={new Texture()}
+        iterations={30}
+        octaves={5}
+        magnitude={2.5}
+        lacunarity={3.0}
+        gain={0.8}
+      />,
+    )
+
+    expect(fire.material).toBe(material)
+    expect(materialDispose).not.toHaveBeenCalled()
+    expect(textureDispose).not.toHaveBeenCalled()
   })
 })

@@ -59,6 +59,9 @@ export interface FireProps {
  * ```
  */
 export class Fire extends AbstractFire<ShaderMaterial & { uniforms: FireShaderUniforms }> {
+  private _iterations: number
+  private _octaves: number
+
   /**
    * Creates a new Fire instance
    *
@@ -102,12 +105,86 @@ export class Fire extends AbstractFire<ShaderMaterial & { uniforms: FireShaderUn
 
     super(geometry, material)
 
+    this._iterations = iterations
+    this._octaves = octaves
+
     // Configure texture
-    fireTex.magFilter = fireTex.minFilter = LinearFilter
-    fireTex.wrapS = fireTex.wrapT = ClampToEdgeWrapping
+    Fire.configureTexture(fireTex)
+  }
+
+  /**
+   * Applies the filtering and wrapping rules the fire shader expects.
+   * Shared by the constructor and the {@link fireTex} setter.
+   */
+  private static configureTexture(texture: Texture): void {
+    texture.magFilter = texture.minFilter = LinearFilter
+    texture.wrapS = texture.wrapT = ClampToEdgeWrapping
   }
 
   protected getUniforms(): FireShaderUniforms {
     return this.material.uniforms
+  }
+
+  /**
+   * Fire texture (grayscale mask defining fire shape).
+   *
+   * Assigning a new texture updates the `fireTex` uniform and re-applies the
+   * required filter/wrap settings. The texture is **not** disposed — its
+   * lifecycle is owned by the caller. Assigning the texture that is already
+   * bound is a no-op.
+   */
+  public get fireTex(): Texture | null {
+    return this.material.uniforms.fireTex.value
+  }
+
+  public set fireTex(texture: Texture) {
+    if (texture === this.material.uniforms.fireTex.value) return
+    Fire.configureTexture(texture)
+    this.material.uniforms.fireTex.value = texture
+  }
+
+  /**
+   * Ray marching iterations - higher = better quality, lower performance.
+   *
+   * Changing this updates the `ITERATIONS` shader define and flags the
+   * material for recompilation. Assigning the current value is a no-op, so
+   * no recompile is triggered.
+   */
+  public get iterations(): number {
+    return this._iterations
+  }
+
+  public set iterations(value: number) {
+    if (value === this._iterations) return
+    this._iterations = value
+    this.getDefines().ITERATIONS = value.toString()
+    this.material.needsUpdate = true
+  }
+
+  /**
+   * Noise octaves for turbulence.
+   *
+   * Changing this updates the `OCTAVES` shader define and flags the material
+   * for recompilation. Assigning the current value is a no-op, so no
+   * recompile is triggered.
+   */
+  public get octaves(): number {
+    return this._octaves
+  }
+
+  public set octaves(value: number) {
+    if (value === this._octaves) return
+    this._octaves = value
+    this.getDefines().OCTAVES = value.toString()
+    this.material.needsUpdate = true
+  }
+
+  /** Returns the material's defines map, creating it if absent. */
+  private getDefines(): Record<string, unknown> {
+    const material = this.material
+    if (!material.defines) {
+      material.defines = {}
+    }
+    return material.defines
   }
 }

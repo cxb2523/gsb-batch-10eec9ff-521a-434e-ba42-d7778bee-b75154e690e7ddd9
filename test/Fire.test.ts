@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { Fire } from '../src/Fire'
-import { Color, Texture, LinearFilter, ClampToEdgeWrapping } from 'three'
+import { Color, Texture, LinearFilter, NearestFilter, ClampToEdgeWrapping } from 'three'
 
 describe('Fire class', () => {
   let mockTexture: Texture
@@ -222,6 +222,108 @@ describe('Fire class', () => {
       fire.gain = 0.75
       expect(fire.gain).toBe(0.75)
       expect(fire.material.uniforms.gain.value).toBe(0.75)
+    })
+  })
+
+  describe('fireTex property', () => {
+    let fire: Fire
+
+    beforeEach(() => {
+      fire = new Fire({ fireTex: mockTexture })
+    })
+
+    it('gets the current texture', () => {
+      expect(fire.fireTex).toBe(mockTexture)
+    })
+
+    it('updates the uniform and reconfigures filters/wrapping on change', () => {
+      const newTexture = new Texture()
+      newTexture.magFilter = NearestFilter
+
+      fire.fireTex = newTexture
+
+      expect(fire.fireTex).toBe(newTexture)
+      expect(fire.material.uniforms.fireTex.value).toBe(newTexture)
+      expect(newTexture.magFilter).toBe(LinearFilter)
+      expect(newTexture.minFilter).toBe(LinearFilter)
+      expect(newTexture.wrapS).toBe(ClampToEdgeWrapping)
+      expect(newTexture.wrapT).toBe(ClampToEdgeWrapping)
+    })
+
+    it('does not dispose the replaced texture (caller owns its lifecycle)', () => {
+      const newTexture = new Texture()
+      const disposeSpy = vi.spyOn(mockTexture, 'dispose')
+
+      fire.fireTex = newTexture
+
+      expect(disposeSpy).not.toHaveBeenCalled()
+    })
+
+    it('is a no-op when assigning the texture already bound', () => {
+      // Simulate the caller mutating the texture after construction
+      mockTexture.magFilter = NearestFilter
+
+      fire.fireTex = mockTexture
+
+      // Untouched: no reconfiguration happened
+      expect(mockTexture.magFilter).toBe(NearestFilter)
+      expect(fire.material.uniforms.fireTex.value).toBe(mockTexture)
+    })
+  })
+
+  describe('iterations property', () => {
+    it('gets the initial iterations', () => {
+      expect(new Fire({ fireTex: mockTexture }).iterations).toBe(20)
+      expect(new Fire({ fireTex: mockTexture, iterations: 30 }).iterations).toBe(30)
+    })
+
+    it('updates defines and flags the material for recompile on change', () => {
+      const fire = new Fire({ fireTex: mockTexture })
+      const version = fire.material.version
+
+      fire.iterations = 42
+
+      expect(fire.iterations).toBe(42)
+      expect(fire.material.defines?.ITERATIONS).toBe('42')
+      expect(fire.material.version).toBeGreaterThan(version)
+    })
+
+    it('does not touch defines or needsUpdate when the value is unchanged', () => {
+      const fire = new Fire({ fireTex: mockTexture, iterations: 25 })
+      const version = fire.material.version
+
+      fire.iterations = 25
+
+      expect(fire.material.defines?.ITERATIONS).toBe('25')
+      expect(fire.material.version).toBe(version)
+    })
+  })
+
+  describe('octaves property', () => {
+    it('gets the initial octaves', () => {
+      expect(new Fire({ fireTex: mockTexture }).octaves).toBe(3)
+      expect(new Fire({ fireTex: mockTexture, octaves: 5 }).octaves).toBe(5)
+    })
+
+    it('updates defines and flags the material for recompile on change', () => {
+      const fire = new Fire({ fireTex: mockTexture })
+      const version = fire.material.version
+
+      fire.octaves = 7
+
+      expect(fire.octaves).toBe(7)
+      expect(fire.material.defines?.OCTAVES).toBe('7')
+      expect(fire.material.version).toBeGreaterThan(version)
+    })
+
+    it('does not touch defines or needsUpdate when the value is unchanged', () => {
+      const fire = new Fire({ fireTex: mockTexture, octaves: 4 })
+      const version = fire.material.version
+
+      fire.octaves = 4
+
+      expect(fire.material.defines?.OCTAVES).toBe('4')
+      expect(fire.material.version).toBe(version)
     })
   })
 

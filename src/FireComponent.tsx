@@ -1,5 +1,5 @@
 import type React from 'react'
-import { useRef, useMemo, forwardRef } from 'react'
+import { useRef, useMemo, useState, useLayoutEffect, forwardRef, type RefObject } from 'react'
 import { extend, useLoader } from '@react-three/fiber'
 import { Fire as FireMesh, type FireProps as FireMeshProps } from './Fire'
 import { Color, TextureLoader, type Texture } from 'three'
@@ -53,9 +53,45 @@ export interface FireRef {
 
 type LeafProps = {
   meshProps: Omit<FireMeshProps, 'fireTex'>
-  fireRef: React.Ref<FireMesh>
+  fireRef: RefObject<FireMesh | null>
   forwarded: Record<string, unknown>
   children?: React.ReactNode
+}
+
+/**
+ * Syncs fire props onto the already-mounted Fire instance.
+ *
+ * Runs in a layout effect, so updates are applied after React commits but
+ * before the next frame is drawn — the user never sees a frame rendered with
+ * stale parameters. The effect only re-runs when one of the synced values
+ * actually changes, and the Fire setters themselves are no-ops for unchanged
+ * values (no shader recompile, no texture reconfiguration, no disposal).
+ */
+export function useFirePropSync(
+  fireRef: RefObject<FireMesh | null>,
+  texture: Texture,
+  meshProps: Omit<FireMeshProps, 'fireTex'>,
+): void {
+  const { iterations = 20, octaves = 3, magnitude = 1.3, lacunarity = 2.0, gain = 0.5 } = meshProps
+  useLayoutEffect(() => {
+    const fire = fireRef.current
+    if (!fire) return
+    fire.fireTex = texture
+    fire.iterations = iterations
+    fire.octaves = octaves
+    fire.magnitude = magnitude
+    fire.lacunarity = lacunarity
+    fire.gain = gain
+  }, [fireRef, texture, iterations, octaves, magnitude, lacunarity, gain])
+}
+
+/**
+ * Captures the constructor args once. Later prop changes are synced onto the
+ * mounted instance via {@link useFirePropSync} instead of rebuilding the mesh
+ * through new `args` (which would dispose a material that is still in use).
+ */
+function useStableArgs(meshProps: Omit<FireMeshProps, 'fireTex'>, texture: Texture) {
+  return useState<[FireMeshProps]>(() => [{ ...meshProps, fireTex: texture }])[0]
 }
 
 function FireFromUrl({
@@ -66,10 +102,8 @@ function FireFromUrl({
   children,
 }: LeafProps & { url: string }) {
   const texture = useLoader(TextureLoader, url)
-  const args = useMemo<[FireMeshProps]>(
-    () => [{ ...meshProps, fireTex: texture }],
-    [meshProps, texture],
-  )
+  const args = useStableArgs(meshProps, texture)
+  useFirePropSync(fireRef, texture, meshProps)
   return (
     <fire ref={fireRef} args={args} {...forwarded}>
       {children}
@@ -87,10 +121,8 @@ function FireFromTexture({
   forwarded,
   children,
 }: LeafProps & { texture: Texture }) {
-  const args = useMemo<[FireMeshProps]>(
-    () => [{ ...meshProps, fireTex: texture }],
-    [meshProps, texture],
-  )
+  const args = useStableArgs(meshProps, texture)
+  useFirePropSync(fireRef, texture, meshProps)
   return (
     <fire ref={fireRef} args={args} {...forwarded}>
       {children}
@@ -132,6 +164,10 @@ function FireFromTexture({
  * The underlying mesh disposes its geometry and material automatically when the
  * component unmounts (R3F calls `dispose()`). The texture you pass in is **not**
  * disposed — you own its lifecycle.
+ *
+ * Changing `texture`, `iterations`, `octaves`, `magnitude`, `lacunarity`, or
+ * `gain` updates the already-mounted fire in place (synced after render commit,
+ * before the next frame) instead of rebuilding the mesh.
  */
 export const FireComponent = forwardRef<FireRef, FireProps>(
   (
