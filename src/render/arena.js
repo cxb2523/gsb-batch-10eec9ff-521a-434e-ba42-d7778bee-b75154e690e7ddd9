@@ -302,6 +302,7 @@ export class Arena {
     key.shadow.normalBias = 0.035;
     key.shadow.radius = 2.5;
     scene.add(key, key.target);
+    renderer.addShadowLight(key);
     const warmRim = new THREE.DirectionalLight(WARM, 3.0);
     warmRim.position.copy(SUN_DIR).multiplyScalar(40).setY(9);
     const coolRim = new THREE.DirectionalLight(COOL, 2.3);

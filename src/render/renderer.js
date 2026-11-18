@@ -11,6 +11,27 @@ export const QUALITY = {
   film: { scale: 1, msaa: 4, refl: 0.75, reflFx: true, fxScale: 1, shadow: 4096, bloom: 7 },
 };
 
+// Output size in device pixels from the CSS canvas size and DPR. Always at least 2px.
+export function outputSize(cssW, cssH, dpr = 1) {
+  return {
+    outW: Math.max(2, Math.round(cssW * dpr)),
+    outH: Math.max(2, Math.round(cssH * dpr)),
+  };
+}
+
+// Internal render size for a quality tier: output size * quality scale, rounded to even pixels so
+// every half/quarter-resolution target below stays integral. Pure function so the sizing rules can
+// be unit-tested without a GL context.
+export function internalSize(cssW, cssH, dpr, quality) {
+  const { outW, outH } = outputSize(cssW, cssH, dpr);
+  return {
+    outW,
+    outH,
+    w: Math.max(2, Math.round((outW * quality.scale) / 2) * 2),
+    h: Math.max(2, Math.round((outH * quality.scale) / 2) * 2),
+  };
+}
+
 // Uniforms shared (by reference) with every FX material.
 export const fxGlobals = {
   uDepthTex: { value: null },
@@ -441,6 +462,7 @@ export class Renderer {
       uReflOn: { value: 0 },
     };
     this.reflHide = []; // objects hidden while rendering the planar reflection (floor, underside)
+    this.shadowLights = []; // lights whose shadow maps must track the active quality tier
     this.frame = 0;
 
     // Look controls driven by the camera director / gameplay events.
@@ -485,7 +507,18 @@ export class Renderer {
     this.rtAdapt = [tiny(1, 1), tiny(1, 1)];
     this.adaptIdx = 0;
     fxGlobals.uNoise.value = this.noiseTex = this._makeNoise();
+    this.cssW = 0; this.cssH = 0; this.dpr = 1;
     this.w = this.h = 0;
+    // Slots for every size-dependent target; populated by _rebuildTargets() on the first setSize.
+    for (const k of ['rtScene', 'rtFx', 'rtDistort', 'rtHDR', 'rtAccum', 'rtReflScene', 'rtReflFx', 'rtRefl', 'rtStreakA', 'rtStreakB']) {
+      this[k] = null;
+    }
+    this.bloom = [];
+  }
+
+  // Arena registers its shadow-casting lights here so quality changes can resize their shadow maps.
+  addShadowLight(light) {
+    if (light && light.shadow && !this.shadowLights.includes(light)) this.shadowLights.push(light);
   }
 
   _makeNoise() {
@@ -505,21 +538,52 @@ export class Renderer {
     if (!QUALITY[name] || name === this.qualityName) return;
     this.qualityName = name;
     this.q = { ...QUALITY[name] };
-    const { cssW, cssH } = this;
-    this.w = 0;
-    this.setSize(cssW, cssH, this.dpr);
+    // A tier change always rebuilds: even when the internal pixel size happens to be identical,
+    // MSAA sample counts, reflection presence, FX scale, shadow size and bloom layer count differ.
+    this.setSize(this.cssW, this.cssH, this.dpr, true);
   }
 
   // cssW/cssH: canvas size in CSS pixels. Internal resolution = css * dpr * quality scale.
-  setSize(cssW, cssH, dpr = 1) {
+  // force rebuilds every size-dependent target even when the internal size is unchanged.
+  setSize(cssW, cssH, dpr = 1, force = false) {
     this.cssW = cssW; this.cssH = cssH; this.dpr = dpr;
-    const outW = Math.max(2, Math.round(cssW * dpr));
-    const outH = Math.max(2, Math.round(cssH * dpr));
-    const w = Math.max(2, Math.round((outW * this.q.scale) / 2) * 2);
-    const h = Math.max(2, Math.round((outH * this.q.scale) / 2) * 2);
+    const { outW, outH, w, h } = internalSize(cssW, cssH, dpr, this.q);
     this.gl.setSize(outW, outH, false);
-    if (w === this.w && h === this.h) return;
+    // Pure CSS/DPR changes that do not move the internal pixel size need no GL target churn.
+    if (!force && w === this.w && h === this.h) return;
     this.w = w; this.h = h;
+    this._rebuildTargets(w, h);
+  }
+
+  // Tear down every size-dependent target and detach every uniform that referenced one, so a
+  // disposed texture can never stay bound on a material between this call and _rebuildTargets().
+  _dispose() {
+    for (const k of ['rtScene', 'rtFx', 'rtDistort', 'rtHDR', 'rtAccum', 'rtReflScene', 'rtReflFx', 'rtRefl', 'rtStreakA', 'rtStreakB']) {
+      if (this[k]) { this[k].depthTexture?.dispose(); this[k].dispose(); this[k] = null; }
+    }
+    for (const b of this.bloom) b.dispose();
+    this.bloom = [];
+    // Reflection samplers: no target exists until the rebuild decides whether this tier has one.
+    this.reflUniforms.uReflTex.value = null;
+    this.reflUniforms.uReflOn.value = 0;
+    this.mats.combineRefl.uniforms.tScene.value = null;
+    this.mats.combineRefl.uniforms.tFx.value = null;
+    // Full-screen pass samplers; all are reassigned when the rebuilt targets are rendered.
+    const M = this.mats;
+    for (const m of [M.composite, M.copy, M.accum, M.pre, M.down, M.up, M.streak, M.luma, M.final]) {
+      for (const u of Object.values(m.uniforms)) {
+        if (u && u.value && u.value.isTexture) u.value = null;
+      }
+    }
+    M.adapt.uniforms.tLum.value = null;
+    // The FX depth sampler is shared by every FX material via fxGlobals.
+    fxGlobals.uDepthTex.value = null;
+  }
+
+  // (Re)create the complete set of render targets for the active quality tier at (w, h) and point
+  // every material uniform at the new textures. Nothing keeps a reference to a previous target
+  // after this returns, so tier switches and resizes can never mix two buffer generations.
+  _rebuildTargets(w, h) {
     this._dispose();
     const HF = THREE.HalfFloatType;
     const mk = (W, H, o = {}) => new THREE.WebGLRenderTarget(Math.max(2, Math.round(W)), Math.max(2, Math.round(H)), {
@@ -544,6 +608,9 @@ export class Renderer {
       this.reflUniforms.uReflTex.value = this.rtRefl.texture;
       this.reflUniforms.uReflOn.value = 1;
     } else {
+      // Low tier: floor shader must skip the reflection branch and must never sample a released
+      // texture (uReflTex stays null until a tier with reflections is rebuilt).
+      this.reflUniforms.uReflTex.value = null;
       this.reflUniforms.uReflOn.value = 0;
     }
     this.bloom = [];
@@ -554,14 +621,36 @@ export class Renderer {
     }
     this.rtStreakA = mk(w / 4, h / 4);
     this.rtStreakB = mk(w / 4, h / 4);
-    this.gl.shadowMap.needsUpdate = true;
-  }
 
-  _dispose() {
-    for (const k of ['rtScene', 'rtFx', 'rtDistort', 'rtHDR', 'rtAccum', 'rtReflScene', 'rtReflFx', 'rtRefl', 'rtStreakA', 'rtStreakB']) {
-      if (this[k]) { this[k].depthTexture?.dispose(); this[k].dispose(); this[k] = null; }
+    // Rewire the persistent full-screen material uniforms onto this generation of targets.
+    const M = this.mats;
+    M.composite.uniforms.tScene.value = this.rtScene.texture;
+    M.composite.uniforms.tFx.value = this.rtFx.texture;
+    M.composite.uniforms.tDistort.value = this.rtDistort.texture;
+    M.composite.uniforms.tDepth.value = this.rtScene.depthTexture;
+    M.composite.uniforms.uPx.value.set(1 / w, 1 / h);
+    M.copy.uniforms.tSrc.value = this.rtHDR.texture;
+    M.accum.uniforms.tSrc.value = this.rtHDR.texture;
+    M.final.uniforms.tHDR.value = this.rtHDR.texture;
+    M.final.uniforms.tBloom.value = this.bloom[0].texture;
+    M.final.uniforms.tStreak.value = this.rtStreakA.texture;
+    M.final.uniforms.uRes.value.set(w, h);
+    M.luma.uniforms.tSrc.value = this.rtHDR.texture;
+    if (q.refl > 0) {
+      M.combineRefl.uniforms.tScene.value = this.rtReflScene.texture;
+      M.combineRefl.uniforms.tFx.value = this.rtReflFx.texture;
     }
-    if (this.bloom) for (const b of this.bloom) b.dispose();
+    // FX materials read scene depth through this shared global; bind this generation's depth.
+    fxGlobals.uDepthTex.value = this.rtScene.depthTexture;
+    fxGlobals.uInvRes.value.set(1 / this.rtFx.width, 1 / this.rtFx.height);
+
+    // Shadow maps belong to the quality tier (resolution changes even when the internal size does
+    // not); drop the allocated maps so the renderer re-creates them at the new size.
+    for (const light of this.shadowLights) {
+      light.shadow.mapSize.set(q.shadow, q.shadow);
+      if (light.shadow.map) { light.shadow.map.dispose(); light.shadow.map = null; }
+    }
+    this.gl.shadowMap.needsUpdate = true;
   }
 
   _setFxDepth(rt, target) {
@@ -570,7 +659,12 @@ export class Renderer {
   }
 
   _renderReflection(scene, camera) {
+    // Reflection targets only exist on tiers with q.refl > 0; never touch released textures.
+    if (!this.rtRefl || !this.rtReflScene || !this.rtReflFx) return;
     const gl = this.gl, vc = this.reflCam;
+    // Match the main camera's projection (drawWorld has just fixed its aspect to the internal size)
+    // so the reflection matrix maps world positions into the reflection target's own aspect.
+    vc.aspect = camera.aspect;
     const m = _m.extractRotation(camera.matrixWorld);
     camera.getWorldPosition(_a);
     _b.set(0, 0, -1).applyMatrix4(m).add(_a);

@@ -17,6 +17,8 @@
     "film": "node tools/render-video.mjs --scene showcase --out out/film/merge-conflict.mp4 --png --s 8",
     "frame": "node tools/frame.mjs",
     "simtest": "node tools/simtest.mjs",
+    "sizetest": "node tools/sizetest.mjs",
+    "qualitytest": "node tools/qualitytest.mjs",
     "playtest": "node tools/playtest.mjs",
     "perf": "node tools/perf.mjs"
   },
