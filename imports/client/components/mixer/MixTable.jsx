@@ -1,61 +1,121 @@
-import Tone from 'tone';
 import React from 'react';
-
-import { each, isNumber, find} from 'lodash';
 import styled from 'styled-components';
 
-import { Meteor } from 'meteor/meteor'
-import esprima from 'esprima'
+import { Tracker } from 'meteor/tracker'
 
 import Knob from './knob/Knob';
-import { updateParamsInCode } from '../code/updateParamsInCode';
+import {
+  flushParamsSave,
+  scheduleParamsSave,
+  applyParamValue
+} from '../code/updateParamsInCode';
+import {
+  getParamName,
+  getParamValue,
+  isNumeric
+} from '../code/params';
+import { clearParamsError, getAllParamsErrors } from '../code/paramsFeedback';
 
+//
+// One mixer strip per generated tone.
+//
+// Moving a knob does the whole loop:
+//  1. the live tone played by Tone.Transport changes immediately
+//  2. the value is written back in the sound code (debounced, so a continuous
+//     drag only produces one write)
+//  3. the Tones document is updated with the final value (debounced as well)
+//  4. the "save" entry point flushes anything still pending, keeping its
+//     historical semantics
+//
+// When the code cannot be rewritten the original code is left untouched, the
+// knob keeps displaying its current value and an error is shown on screen.
+//
 export default class MixTable extends React.Component {
-  constructor(props){
+  constructor(props) {
     super(props)
+
+    this.state = {
+      errors: {}
+    }
   }
 
-  changeValue = (tone, i, value) => {
-
-    let nameProp = tone.options.vars[i][0]
-    if (isNumber(tone.options.vars[i][1].persistedValue)) tone.options.vars[i][1].persistedValue = value
-    else tone.options.vars[i][1][nameProp] = value
-
-    if (!tone.options.vars[i][1].amithesame) tone.options.vars[i][1].amithesame = 0
-    tone.options.vars[i][1].amithesame = tone.options.vars[i][1].amithesame + 1
-
-    Meteor.call('tones.update', tone)
+  componentDidMount() {
+    // the debounced write can fail outside of a React event: follow the
+    // reactive error store so the error stays visible.
+    this.errorComputation = Tracker.autorun(() => {
+      if (this.unmounted) return
+      this.setState({ errors: getAllParamsErrors() })
+    })
   }
 
-  componentWillUpdate (nextProps, nextState) {
-    // console.log('MIXTABLE componentWillUpdate', nextProps, nextState)
-    // nextState.variable = nextProps.variable
+  componentWillUnmount() {
+    this.unmounted = true
+    this.errorComputation && this.errorComputation.stop()
   }
 
+  // Move a knob: apply to memory now, write back to the code / database
+  // shortly after, so a continuous drag is coalesced into a final value.
+  changeValue = (tone, name, value) => {
+    // never modify a param that is not a number (strings, booleans...)
+    if (!name || !isNumeric(value)) return
+
+    // 1. the sound playing in memory changes right away
+    applyParamValue(tone.soundId, name, value)
+
+    // 2. persist the value + write it back in the code (debounced)
+    scheduleParamsSave(tone.soundId, tone._id, { [name]: value })
+  }
+
+  // Historical "save" entry point: same behaviour (write the tone params back
+  // in the code) but it flushes pending knob values first.
   saveParamsTone = tone => {
-    updateParamsInCode(tone.soundId, tone._id)
+    clearParamsError(tone.soundId)
+    flushParamsSave(tone.soundId)
   }
 
-	render() {
-		return (
+  // Only entries carrying a numeric parameter are knobs. A string / boolean
+  // option has no numeric value and must never be presented as adjustable.
+  renderKnob = (tone, v, i) => {
+    if (!(v instanceof Array)) return null
+
+    const name = getParamName(v)
+    const value = getParamValue(v)
+
+    if (!name || !isNumeric(value)) return null
+
+    // the tuple is [NAME, VAR, MIN, MAX, STEP, INIT?]
+    const min = isNumeric(v[2]) ? v[2] : 0
+    const max = isNumeric(v[3]) ? v[3] : 1
+    const step = isNumeric(v[4]) ? v[4] : 0.01
+
+    return (
+      <Knob
+        key={`${tone.soundId}-${name}`}
+        name={name}
+        val={value}
+        min={min}
+        max={max}
+        step={step}
+        initVal={v[5]}
+        onValueChange={this.changeValue.bind(this, tone, name)} />
+    )
+  }
+
+  render() {
+    return (
       <Table>
         {this.props.tones.map(tone => (
           <SoundMixer key={tone.soundId}>
             <SoundName>{tone.name}</SoundName>
             <div>
-               {(tone.options && tone.options.vars) && tone.options.vars.map((v,i) =>
-                  <Knob
-                    key={`${tone.id}-${i}`}
-                    name={v[0]}
-                    val={v[1].persistedValue ? v[1].persistedValue : v[1][v[0]]}
-                    min={v[2]}
-                    max={v[3]}
-                    step={v[4]}
-                    initVal={v[5]}
-                    onValueChange={this.changeValue.bind(this, tone, i)} />
+               {(tone.options && tone.options.vars) && tone.options.vars.map((v, i) =>
+                  this.renderKnob(tone, v, i)
                )}
             </div>
-            <div onClick={this.saveParamsTone.bind(this, tone)}>save</div>
+            <SaveButton onClick={this.saveParamsTone.bind(this, tone)}>save</SaveButton>
+            {this.state.errors[tone.soundId] && (
+              <Error>{this.state.errors[tone.soundId]}</Error>
+            )}
           </SoundMixer>
           )
         )}
@@ -88,4 +148,19 @@ const SoundMixer = styled.div`
   max-width: 50%;
   margin: 5px;
   float: left;
+`;
+
+const SaveButton = styled.div`
+  cursor: pointer;
+  padding: 4px;
+  border-top: 1px solid #ccc;
+  text-align: center;
+`;
+
+const Error = styled.div`
+  color: red;
+  padding: 4px;
+  max-width: 260px;
+  font-size: 11px;
+  word-wrap: break-word;
 `;

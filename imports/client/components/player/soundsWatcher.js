@@ -1,14 +1,16 @@
-import {filter, reduce, intersection, indexOf, find, isEqual, each} from 'lodash';
+import {filter, reduce, intersection, find, isEqual, each} from 'lodash';
+
+// Properties that require the sound to be re-evaluated by the player.
+const PLAYBACK_PROPS = ['code', 'muted'];
 
 export let soundsWatcher = (props) => {
   // 1 DETECT SOUNDS ADDED
   each(props.array1, sound => {
     if (!sound) return false
 
-    let oldSound = find(props.array2, {'_id': sound._id})
+    let oldSound = find(props.array2, {_id: sound._id})
     if (!oldSound) {
       if (props.added) {
-        // console.log(`${sound.name} added`)
         return props.added(sound)
       }
     }
@@ -18,29 +20,32 @@ export let soundsWatcher = (props) => {
   each(props.array2, sound => {
     if (!sound) return false
 
-    let newSound = find(props.array1, {'_id': sound._id})
+    let newSound = find(props.array1, {_id: sound._id})
     if (!newSound) {
       if (props.deleted) {
-        // console.log(`${sound.name} deleted`)
         return props.deleted(sound)
       }
+
+      return
     }
 
     // 3 DETECT SOUNDS UPDATED
-    let res = reduce(sound, (result, value, key) => isEqual(value, newSound[key]) ? result : result.concat(key), [])
+    let props2 = reduce(sound, (result, value, key) => isEqual(value, newSound[key]) ? result : result.concat(key), [])
 
-    if (res.length === 0) return
+    if (props2.length === 0) return
 
-    if (intersection(['code', 'muted'], res).length > 0)  {
+    let playbackProps = intersection(PLAYBACK_PROPS, props2)
+
+    if (playbackProps.length > 0)  {
       if (props.updated) {
-        console.log(`${newSound.name} updated, prop ${res[0]} changed`)
-        return props.updated(newSound, res[0])
+        return props.updated(newSound, playbackProps[0], props2)
       }
-    } else {
-      if (props.nothing) {
-        // console.log(`${newSound.name} NOT updated, prop ${res[0]} changed`)
-        return props.nothing(newSound, res[0])
-      }
+
+      return
+    }
+
+    if (props.nothing) {
+      return props.nothing(newSound, props2[0])
     }
   })
 }
