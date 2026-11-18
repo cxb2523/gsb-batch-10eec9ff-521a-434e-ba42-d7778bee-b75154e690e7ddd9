@@ -80,6 +80,15 @@ const EASE = 4;
 const SETTLED = 0.002;
 
 /*
+ * What a source reads: its own stable key where it has one (an analyser, so a
+ * clip paused and resumed is still the same sound), otherwise the source
+ * itself. Two different keys are two different voices.
+ */
+const sourceId = (source: LevelSource | null | undefined) => (source ? (source.sourceKey ?? source) : null);
+/* Nothing resolved yet, distinct from every source. */
+const UNSEEN = Symbol("unseen");
+
+/*
  * How a talking orb starts, so pressing Play reads as a sequence rather than
  * a cut: whatever zooms the orb (the page, with CSS) starts at once; the
  * drift speeds up after SPEED_AFTER seconds; the voice's pulse then fades in
@@ -178,6 +187,42 @@ export default function VoiceOrb({
       talk: 0,
     };
 
+    /*
+     * The sources this orb's liquid and heard levels belong to. A source
+     * change starts both over: the heard bands fall to zero at once (no old
+     * voice bleeding in) and `epoch` tells the renderer to empty this view's
+     * liquid, so the new source stirs it up from still water.
+     *
+     * A clip paused and resumed is handed a new reader of the same analyser,
+     * which keeps the same key (see LevelSource.sourceKey), so pausing is not
+     * a switch: the liquid is left to settle by itself. A microphone turned
+     * off is a switch: its key gives way to none, since no voice owns the old
+     * swirls any more.
+     */
+    let voiceOf: unknown = UNSEEN;
+    let callerOf: unknown = UNSEEN;
+    let epoch = 0;
+    const switched = () => {
+      const p = props.current;
+      let changed = false;
+      // The first source an orb hears is not a switch; after that, any
+      // difference in what is heard (including nothing) is one.
+      const nextVoice = sourceId(p.voice);
+      if (voiceOf !== UNSEEN && voiceOf !== nextVoice) changed = true;
+      voiceOf = nextVoice;
+      const nextCaller = sourceId(p.caller);
+      if (callerOf !== UNSEEN && callerOf !== nextCaller) changed = true;
+      callerOf = nextCaller;
+      if (changed) {
+        epoch++;
+        cur.bands = [0, 0, 0, 0];
+        cur.level = 0;
+        cur.input = 0;
+        cur.talk = 0;
+      }
+      return changed;
+    };
+
     const view: OrbView = {
       canvas,
       visible: false,
@@ -199,6 +244,10 @@ export default function VoiceOrb({
         const p = props.current;
         const t = TARGETS[p.state];
         const k = 1 - Math.exp(-dt * EASE);
+        // A changed source clears the last one's levels and ends its sequence,
+        // so the new voice (however quiet) is heard from zero, not from the
+        // old voice's tail.
+        switched();
         const talking = t.voice && Boolean(p.voice);
         cur.talk = talking ? cur.talk + dt : 0;
         // Hold the drift where it is for a moment after Play, then speed up.
@@ -251,6 +300,7 @@ export default function VoiceOrb({
           level: cur.level,
           input: cur.input,
           pull: listening,
+          fluidEpoch: epoch,
           think: cur.think,
           scale: cur.scale,
           dim: cur.dim,
@@ -315,13 +365,18 @@ export default function VoiceOrb({
     };
   }, [artwork]);
 
-  // A changed prop needs at least one frame, even for a still orb.
+  // A changed prop needs at least one frame, even for a still orb. The
+  // sources' keys are included, not just their identity: a page may hand the
+  // same reader a different underlying sound (or none), and the next frame is
+  // what lets the renderer retire the old liquid.
+  const voiceKey = sourceId(voice);
+  const callerKey = sourceId(caller);
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
     view.dirty = true;
     getOrbRenderer()?.wake();
-  }, [variant, state, stops, params, resolvedSeed, voice, caller]);
+  }, [variant, state, stops, params, resolvedSeed, voice, caller, voiceKey, callerKey]);
 
   const style = {
     "--orb-size": size,

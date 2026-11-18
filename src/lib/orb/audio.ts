@@ -48,7 +48,23 @@ export interface LevelSource {
    * second orb a twin instead.
    */
   twin?(): LevelSource;
+  /**
+   * What this reader is listening to. Two readers with the same key hear the
+   * same sound, however they are constructed: a clip paused and played again
+   * keeps its key, while a different file, link or microphone session gets a
+   * new one. The orb starts its liquid and heard levels over when the key
+   * changes, so a new voice never inherits the last one's swirls. Sources
+   * without a key are compared by identity.
+   *
+   * It is read once per frame, so it must be stable and cheap while the same
+   * sound plays: return a cached value, never a fresh object each time.
+   */
+  readonly sourceKey?: unknown;
 }
+
+/* One stable key per analyser, since an element's analyser is kept across
+   plays and a microphone session gets a new one. */
+const analyserKeys = new WeakMap<AnalyserNode, object>();
 
 const EDGES = [90, 350, 1100, 2800, 7000];
 /* The decibel window a band is read in before calibration: wide enough that
@@ -81,6 +97,16 @@ export class AnalyserLevels implements LevelSource {
   private peak: Bands = [0, 0, 0, 0];
 
   constructor(private analyser: AnalyserNode) {}
+
+  /** The analyser, not this reader: the same element sounds the same again. */
+  get sourceKey(): object {
+    let key = analyserKeys.get(this.analyser);
+    if (!key) {
+      key = {};
+      analyserKeys.set(this.analyser, key);
+    }
+    return key;
+  }
 
   twin(): LevelSource {
     return new AnalyserLevels(this.analyser);

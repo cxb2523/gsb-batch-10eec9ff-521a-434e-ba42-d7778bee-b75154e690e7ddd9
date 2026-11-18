@@ -218,9 +218,16 @@ export default function VoiceOrbPage() {
   }, []);
 
   const stopTab = useCallback(() => {
-    tabStop.current?.();
+    const stop = tabStop.current;
     tabStop.current = null;
     setTabHeard(null);
+    // The share is over, so the orb is no longer hearing the tab: go back to
+    // the simulated voice, which is a new source, so the last one's liquid is
+    // not left on screen. With no share to end, the voice is already whatever
+    // the current source set, and is left alone.
+    if (!stop) return;
+    stop();
+    setVoice(new SimulatedVoice(1));
   }, []);
 
   const pauseAll = useCallback(() => {
@@ -314,6 +321,10 @@ export default function VoiceOrbPage() {
   const toggleMic = async () => {
     if (micOn) {
       stopMic();
+      // Let go of the microphone as a source: the orb should not keep the
+      // liquid your voice stirred, so it starts afresh. The page's voice
+      // effect restores a simulated caller for the next listening state.
+      setCaller(null);
       setState("ready");
       return;
     }

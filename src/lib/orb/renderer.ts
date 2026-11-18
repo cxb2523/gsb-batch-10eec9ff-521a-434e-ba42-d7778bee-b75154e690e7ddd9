@@ -29,6 +29,11 @@ import { FRAGMENTS, VERTEX, type OrbShader } from "./shaders";
  *  - The fluid (fluid.ts): a view gets its own small liquid the first time
  *    its voice has bass, keeps it while mounted and stops stepping it once
  *    it has been quiet a while. A still frame (dt 0) never steps it.
+ *  - A changed voice source: the view's frame carries a `fluidEpoch`. When it
+ *    changes, the view's liquid is discarded before anything is drawn, so a
+ *    new source starts from still water instead of inheriting the last
+ *    source's swirls. Pausing and resuming the same audio leaves the epoch
+ *    alone, so the liquid settles by itself rather than being wiped.
  */
 
 export interface OrbFrame {
@@ -46,6 +51,12 @@ export interface OrbFrame {
   input: number;
   /** Listening: the bands are the caller's, and the liquid is pulled inward. */
   pull?: boolean;
+  /**
+   * Which voice source this frame was heard from. The renderer keeps one
+   * liquid per view and starts it over whenever the epoch differs from the
+   * one it was made from; a pause and resume of the same audio keeps it.
+   */
+  fluidEpoch: number;
   think: number;
   scale: number;
   dim: number;
@@ -122,6 +133,8 @@ class OrbRenderer {
   /** The simulation (null where the GPU cannot run it) and each view's liquid. */
   private fluid: Fluid | null = null;
   private liquids = new Map<OrbView, FluidState>();
+  /** The voice source each view's liquid belongs to (see OrbFrame.fluidEpoch). */
+  private epochs = new Map<OrbView, number>();
   /** Bound in place of a liquid: reads as no offset and no velocity. */
   private still: WebGLTexture | null = null;
   private frameId = 0;
@@ -146,6 +159,7 @@ class OrbRenderer {
       this.textures.clear();
       // Their textures went with the context; the next voice starts afresh.
       this.liquids.clear();
+      this.epochs.clear();
       this.fluid = null;
       cancelAnimationFrame(this.frameId);
       this.frameId = 0;
@@ -248,6 +262,7 @@ class OrbRenderer {
       this.fluid?.destroy(liquid);
       this.liquids.delete(view);
     }
+    this.epochs.delete(view);
   }
 
   /** Redraw every view once (a token, a motion preference or the context changed). */
@@ -283,6 +298,24 @@ class OrbRenderer {
     }
   };
 
+  /**
+   * Retire the view's liquid when its voice source has changed, so the next
+   * draw binds the still texture rather than the last source's swirls. Run
+   * before any early return in `draw`: the frame that marks the change is
+   * often the only frame the view gets (a quiet new source, reduced motion, a
+   * dormant orb), and the old offsets must not survive it. The liquid is
+   * recreated from rest by `liquid()` on the new source's first bass.
+   */
+  private retune(view: OrbView, f: OrbFrame) {
+    if (this.epochs.get(view) === f.fluidEpoch) return;
+    const stale = this.liquids.get(view);
+    if (stale) {
+      this.fluid?.destroy(stale);
+      this.liquids.delete(view);
+    }
+    this.epochs.set(view, f.fluidEpoch);
+  }
+
   /** The view's liquid, stepped by `dt`; created when its voice first has bass. */
   private liquid(view: OrbView, f: OrbFrame, dt: number): FluidState | null {
     if (!this.fluid || f.params.fluid <= 0) return null;
@@ -298,6 +331,9 @@ class OrbRenderer {
   private draw(view: OrbView, f: OrbFrame, dt: number): boolean {
     const gl = this.gl;
     if (this.lost || gl.isContextLost()) return false;
+    // A source change is handled next, so no early return below can leave
+    // the previous source's liquid attached to this view.
+    this.retune(view, f);
     const w = view.canvas.width;
     const h = view.canvas.height;
     if (!w || !h) return false;
