@@ -462,7 +462,12 @@ export class VerletPaperEngine {
    */
   public resetPass(animateEntrance = true): void {
     this.isFullyDetached = false
+    // Cancel any in-flight automated zipper tear and discard its accumulated
+    // cadence so a later zipper tear on the fresh pass starts at column 0's own rhythm.
     this.autoTearActive = false
+    this.autoTearTimer = 0
+    this.autoTearDirection = 1
+    this.detachTime = 0
     this.grabbedIndex = -1
     this.isDraggingStub = false
     this.pullAccumulator = 0
@@ -553,7 +558,10 @@ export class VerletPaperEngine {
       this.entranceProgress = Math.min(1.0, this.entranceProgress + clampedDt * 2.8)
     }
 
-    // Handle automated sequential zipper tear if active
+    // Handle automated sequential zipper tear if active.
+    // resetPass() clears autoTearActive/autoTearTimer, so an interrupted zipper
+    // can never resume against a fresh pass; the timer also restarts at zero so
+    // the new cascade's cadence is not inherited from the old one.
     if (this.autoTearActive && !this.isFullyDetached) {
       this.autoTearTimer += clampedDt
       // Sever roughly 1 column every 18ms for a super crisp audible zipper cascade!

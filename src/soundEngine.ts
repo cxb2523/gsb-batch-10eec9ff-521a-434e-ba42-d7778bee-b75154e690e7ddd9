@@ -1,5 +1,6 @@
 export class SoundEngine {
   private ctx: AudioContext | null = null
+  private master: GainNode | null = null
   private enabled = true
   private lastRustleTime = 0
 
@@ -9,6 +10,12 @@ export class SoundEngine {
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
       if (AudioCtx) {
         this.ctx = new AudioCtx()
+        // Every synthesized voice routes through this master gain. Swapping the
+        // node lets reset tear down all still-scheduled voices (e.g. a detach
+        // chord whose notes span >1s) without touching the audio graph itself.
+        this.master = this.ctx.createGain()
+        this.master.gain.value = 1
+        this.master.connect(this.ctx.destination)
       }
     }
     if (this.ctx && this.ctx.state === 'suspended') {
@@ -26,11 +33,31 @@ export class SoundEngine {
   }
 
   /**
+   * Silences every voice already scheduled (fiber ticks, the Fmaj9 detach chord,
+   * flex whooshes) so sounds belonging to the torn pass cannot ring into the
+   * fresh one. Previously scheduled sources keep playing into the disconnected
+   * old gain node, which the audio engine garbage-collects.
+   */
+  public stopAll(): void {
+    if (!this.ctx || !this.master) return
+    const oldMaster = this.master
+    try {
+      oldMaster.disconnect()
+    } catch {
+      // Already disconnected — nothing to tear down.
+    }
+    this.master = this.ctx.createGain()
+    this.master.gain.value = 1
+    this.master.connect(this.ctx.destination)
+  }
+
+  /**
    * Synthesizes a crisp 350gsm card-stock fiber snap tick as each perforation spring severs.
    */
   public playFiberRipTick(seamProgress01: number, intensity = 1.0): void {
     const ctx = this.ensureContext()
-    if (!ctx) return
+    if (!ctx || !this.master) return
+    const master = this.master
 
     const now = ctx.currentTime
     const dur = 0.042
@@ -66,7 +93,7 @@ export class SoundEngine {
     whiteNoise.connect(bandpass)
     bandpass.connect(highpass)
     highpass.connect(noiseGain)
-    noiseGain.connect(ctx.destination)
+    noiseGain.connect(master)
     whiteNoise.start(now)
     whiteNoise.stop(now + dur)
 
@@ -82,7 +109,7 @@ export class SoundEngine {
     popGain.gain.exponentialRampToValueAtTime(0.001, now + 0.025)
 
     osc.connect(popGain)
-    popGain.connect(ctx.destination)
+    popGain.connect(master)
     osc.start(now)
     osc.stop(now + 0.026)
   }
@@ -92,7 +119,8 @@ export class SoundEngine {
    */
   public playStubDetachChord(): void {
     const ctx = this.ensureContext()
-    if (!ctx) return
+    if (!ctx || !this.master) return
+    const master = this.master
 
     const now = ctx.currentTime
 
@@ -120,7 +148,7 @@ export class SoundEngine {
 
     noise.connect(filter)
     filter.connect(ripGain)
-    ripGain.connect(ctx.destination)
+    ripGain.connect(master)
     noise.start(now)
     noise.stop(now + ripDur)
 
@@ -140,7 +168,7 @@ export class SoundEngine {
       gain.gain.exponentialRampToValueAtTime(0.0005, start + duration)
 
       osc.connect(gain)
-      gain.connect(ctx.destination)
+      gain.connect(master)
       osc.start(start)
       osc.stop(start + duration + 0.02)
     })
@@ -151,7 +179,8 @@ export class SoundEngine {
    */
   public playCardFlexWhoosh(strength = 0.5): void {
     const ctx = this.ensureContext()
-    if (!ctx) return
+    if (!ctx || !this.master) return
+    const master = this.master
 
     const nowPerf = performance.now()
     if (nowPerf - this.lastRustleTime < 140) return
@@ -182,7 +211,7 @@ export class SoundEngine {
 
     src.connect(filter)
     filter.connect(gain)
-    gain.connect(ctx.destination)
+    gain.connect(master)
     src.start(now)
     src.stop(now + dur)
   }

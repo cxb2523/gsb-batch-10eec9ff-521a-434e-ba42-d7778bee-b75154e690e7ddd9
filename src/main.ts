@@ -348,9 +348,28 @@ class HolographicTicketApp {
   }
 
   public issueFreshPass(): void {
+    // 1. Cancel any pointer-driven tear/slice so a held drag cannot keep severing
+    //    fibers (or restart the zipper cascade) on the freshly issued pass.
+    this.isPointerDown = false
+    this.isSlicingSeam = false
+    this.lastSliceU = null
+    this.seamHoverAmount = 0
+
+    // 2. Silence every voice scheduled for the old pass. This matters when the
+    //    reset interrupts an automated zipper tear: its queued fiber ticks and
+    //    the long Fmaj9 detach chord must not ring into the new ticket.
+    this.sound.stopAll()
+
+    // 3. Restore every spring/seam, particle pose and tear timer to its initial state.
     this.verlet.resetPass(true)
+
+    // 4. Fresh-pass entrance whoosh, then rebuild fiber strip, percentage readout,
+    //    CTA copy and shader tear uniform from the reset (0% torn) state.
     this.sound.playCardFlexWhoosh(0.8)
     this.syncPerforationUI()
+
+    const cursorPill = document.getElementById('seam-cursor-pill')
+    cursorPill?.classList.remove('is-visible')
   }
 
   private bindStageInteractions(): void {
@@ -438,6 +457,16 @@ class HolographicTicketApp {
 
       // 1. If actively slicing across the perforation seam
       if (this.isPointerDown && this.isSlicingSeam && !this.verlet.isFullyDetached) {
+        // A reset (R / fresh-pass button) restores every fiber while the pointer
+        // may still be held. A genuine new slice severs fibers on pointerdown, so
+        // an active slice against a fully intact seam is a stale one: drop it.
+        if (this.verlet.getIntactSeamCount() >= NUM_COLS) {
+          this.isSlicingSeam = false
+          this.lastSliceU = null
+          cursorPill.classList.remove('is-visible')
+          return
+        }
+
         this.dragPlane.set(new THREE.Vector3(0, 0, 1), 0)
         if (this.raycaster.ray.intersectPlane(this.dragPlane, this.planeHit)) {
           const rawU = this.planeHit.x / TICKET_WIDTH + 0.5
