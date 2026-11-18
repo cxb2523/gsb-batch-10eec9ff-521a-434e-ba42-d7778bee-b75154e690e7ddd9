@@ -1,13 +1,35 @@
-import { onMounted, onUnmounted, reactive, readonly } from 'vue'
-import type { Ref } from 'vue'
+import { nextTick, onMounted, onUnmounted, reactive, readonly, ref, toValue, watch } from 'vue'
+import type { DeepReadonly, MaybeRefOrGetter, Ref } from 'vue'
 import {
   createNativeAdapter,
+  createThumbnailLoader,
   detectSourceType,
   enterFullscreen,
   exitFullscreen,
   getFullscreenElement,
 } from '@vue-player/core'
-import type { PlayerState, PlayerError, Track } from '@vue-player/core'
+import type { PlayerState, PlayerError, ThumbnailCue, Track } from '@vue-player/core'
+
+export interface UsePlayerOptions {
+  /**
+   * WebVTT thumbnail URL for the current source. Accepts a plain string, a ref
+   * or a getter so the URL can follow the active video source. The cue list is
+   * loaded when a source is loaded and reloaded whenever this value changes.
+   */
+  thumbnails?: MaybeRefOrGetter<string | null | undefined>
+}
+
+export interface UsePlayerReturn {
+  state: DeepReadonly<PlayerState>
+  controls: PlayerControls
+  loadSource: (src: string) => Promise<void>
+  /** Read-only cue list for the currently loaded source. Empty while loading, on failure, or when no thumbnails are configured. */
+  thumbnails: Readonly<Ref<readonly ThumbnailCue[]>>
+  /** `true` while a thumbnail manifest request is in flight. */
+  thumbnailsLoading: Readonly<Ref<boolean>>
+  /** Re-fetch the thumbnail manifest for the current source (e.g. after a transient network error). */
+  reloadThumbnails: () => Promise<void>
+}
 
 export interface PlayerControls {
   play: () => Promise<void>
@@ -54,13 +76,53 @@ function makeDefaultState(): PlayerState {
   }
 }
 
-export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
+export function usePlayer(
+  videoRef: Ref<HTMLVideoElement | null>,
+  options: UsePlayerOptions = {},
+): UsePlayerReturn {
   const state = reactive<PlayerState>(makeDefaultState())
 
   let nativeAdapter: ReturnType<typeof createNativeAdapter> | null = null
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let hlsInstance: any = null
   let lastSrc = ''
+  let disposed = false
+
+  // ─── Thumbnail manifest, bound to the source lifecycle ───
+  const thumbnailCues = ref<readonly ThumbnailCue[]>([])
+  const thumbnailsLoading = ref(false)
+  // URL currently applied to the loader — lets the URL watcher skip reloading
+  // when a source switch already loaded the same manifest.
+  let currentThumbnailUrl: string | null = null
+
+  const thumbnailLoader = createThumbnailLoader({
+    onChange: (snapshot) => {
+      thumbnailCues.value = snapshot.cues
+      thumbnailsLoading.value = snapshot.loading
+    },
+  })
+
+  function resolveThumbnailUrl(): string | null {
+    const value = options.thumbnails === undefined ? undefined : toValue(options.thumbnails)
+    return typeof value === 'string' && value.length > 0 ? value : null
+  }
+
+  /** Drop the current cue list — called on every source switch/reload so stale frames never render. */
+  function resetThumbnails() {
+    currentThumbnailUrl = null
+    thumbnailLoader.reset()
+  }
+
+  function loadThumbnails(url: string | null = resolveThumbnailUrl()) {
+    currentThumbnailUrl = url
+    // Never rejects: a failed manifest leaves the list empty without blocking playback.
+    return thumbnailLoader.load(url)
+  }
+
+  /** Public entry point: re-fetch the manifest for the current source. */
+  function reloadThumbnails(): Promise<void> {
+    return loadThumbnails().then(() => undefined)
+  }
 
   function clearVideo() {
     const video = videoRef.value
@@ -95,10 +157,18 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
   }
 
   async function loadSource(src: string) {
+    lastSrc = src
+
+    // The cue list belongs to the previous source — clear it before anything
+    // async happens so a stale manifest can never be shown for the new video.
+    resetThumbnails()
+
+    // Fire-and-forget: a thumbnail failure must never block source loading.
+    void loadThumbnails()
+
     const video = videoRef.value
     if (!video) return
 
-    lastSrc = src
     destroyAdapters()
 
     state.error = null
@@ -324,10 +394,35 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
     syncFromVideo(video)
   })
 
+  // Follow the configured thumbnail URL. Deferred to after the current flush so
+  // that a simultaneous `src` change (which reloads the manifest itself) wins;
+  // only a standalone URL change triggers a reload here.
+  watch(
+    () => resolveThumbnailUrl(),
+    (url) => {
+      if (!lastSrc) return
+      void nextTick(() => {
+        if (disposed || !lastSrc) return
+        if (url === currentThumbnailUrl) return
+        if (url) void loadThumbnails(url)
+        else resetThumbnails()
+      })
+    },
+  )
+
   onUnmounted(() => {
+    disposed = true
+    thumbnailLoader.dispose()
     destroyAdapters()
     document.removeEventListener('fullscreenchange', onFullscreenChange)
   })
 
-  return { state: readonly(state), controls, loadSource }
+  return {
+    state: readonly(state),
+    controls,
+    loadSource,
+    thumbnails: readonly(thumbnailCues),
+    thumbnailsLoading: readonly(thumbnailsLoading),
+    reloadThumbnails,
+  }
 }

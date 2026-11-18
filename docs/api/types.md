@@ -175,6 +175,18 @@ interface ThumbnailCue {
 | `w` | `number` | Sprite frame width in pixels |
 | `h` | `number` | Sprite frame height in pixels |
 
+### Cue resolution
+
+The timeline resolves a hovered/seeking position against the video's real duration and picks the cue whose `[start, end)` range contains that time. Use the exported helpers to do the same in a custom UI:
+
+```ts
+import { findChapterAt, findThumbnailCue, resolveTimelinePreview } from '@vue-player/core'
+
+const cue = findThumbnailCue(cues, 42.5)      // null outside the manifest range
+const chapter = findChapterAt(chapters, 42.5) // null before the first chapter
+const preview = resolveTimelinePreview(chapters, cues, 42.5) // both, from one time
+```
+
 ---
 
 ## VideoSource

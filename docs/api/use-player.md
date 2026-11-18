@@ -1,6 +1,6 @@
 ---
 title: usePlayer
-description: usePlayer composable API — state, controls and loadSource reference.
+description: usePlayer composable API — state, controls, loadSource and thumbnail data reference.
 ---
 
 # usePlayer
@@ -17,11 +17,15 @@ import { usePlayer } from '@vue-player/vue'
 
 ```ts
 function usePlayer(
-  videoRef: Ref<HTMLVideoElement | null>
+  videoRef: Ref<HTMLVideoElement | null>,
+  options?: UsePlayerOptions,
 ): {
-  state: Readonly<PlayerState>
+  state: DeepReadonly<PlayerState>
   controls: PlayerControls
   loadSource: (src: string) => Promise<void>
+  thumbnails: Readonly<Ref<readonly ThumbnailCue[]>>
+  thumbnailsLoading: Readonly<Ref<boolean>>
+  reloadThumbnails: () => Promise<void>
 }
 ```
 
@@ -30,6 +34,7 @@ function usePlayer(
 | Parameter | Type | Description |
 |---|---|---|
 | `videoRef` | `Ref<HTMLVideoElement \| null>` | A template ref bound to a `<video>` element |
+| `options.thumbnails` | `MaybeRefOrGetter<string \| null \| undefined>` | WebVTT thumbnail manifest for the current source. May be a plain string, a ref or a getter so it can follow the active source |
 
 ## Returns
 
@@ -50,7 +55,19 @@ loadSource('https://example.com/video.mp4')
 loadSource('https://example.com/stream.m3u8')  // triggers hls.js
 ```
 
-Calling `loadSource` on an already-playing video will stop playback, destroy adapters, and start fresh.
+Calling `loadSource` on an already-playing video will stop playback, destroy adapters, and start fresh. The thumbnail list is cleared at the same time and refetched for the new source.
+
+### `thumbnails`
+
+Read-only cue list for the currently loaded source. It is empty while a manifest request is in flight, after a failed request, and when no manifest is configured. See [Thumbnail Previews](/guide/thumbnails#source-lifecycle).
+
+### `thumbnailsLoading`
+
+`true` while a thumbnail manifest request is in flight.
+
+### `reloadThumbnails`
+
+Re-fetches the manifest for the current source, e.g. after a transient network error. Never rejects — a failure leaves the cue list empty.
 
 ## Basic Usage
 
@@ -85,3 +102,4 @@ onMounted(() => {
 - `usePlayer` attaches native `<video>` event listeners inside `onMounted` and cleans them up in `onUnmounted` — it must be called inside a component `setup`.
 - `VideoPlayer` uses `usePlayer` internally. You only need this composable when building a custom player shell.
 - The `state` object is `readonly` — never mutate it directly. Use `controls` methods instead.
+- Thumbnail loading never blocks playback: a failed manifest leaves `thumbnails` empty while `loadSource` and the timeline keep working.

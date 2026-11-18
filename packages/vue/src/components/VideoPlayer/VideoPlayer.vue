@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { Chapter, ThumbnailCue, Track, VideoSource } from '@vue-player/core'
-import { isPiPSupported, parseThumbnailVtt } from '@vue-player/core'
+import type { Chapter, Track, VideoSource } from '@vue-player/core'
+import { isPiPSupported } from '@vue-player/core'
 import { usePlayer } from '../../composables/usePlayer'
 import IcoPlay from '../icons/IcoPlay.vue'
 import IcoPause from '../icons/IcoPause.vue'
@@ -60,7 +60,15 @@ const emit = defineEmits<{
 
 const playerEl = ref<HTMLElement | null>(null)
 const videoRef = ref<HTMLVideoElement | null>(null)
-const { state, controls, loadSource } = usePlayer(videoRef)
+// Thumbnail manifest loading lives inside usePlayer and follows the source lifecycle.
+const {
+  state,
+  controls,
+  loadSource,
+  thumbnails: thumbnailCues,
+} = usePlayer(videoRef, {
+  thumbnails: () => props.thumbnails,
+})
 
 const pipSupported = ref(false)
 
@@ -154,17 +162,6 @@ watch(
   (v) => {
     if (v) emit('error', v)
   },
-)
-
-// ─── Thumbnails ───
-const thumbnailCues = ref<ThumbnailCue[]>([])
-
-watch(
-  () => props.thumbnails,
-  async (url) => {
-    thumbnailCues.value = url ? await parseThumbnailVtt(url) : []
-  },
-  { immediate: true },
 )
 
 // ─── Controls visibility ───
@@ -350,7 +347,7 @@ function onTouchStart(e: TouchEvent) {
         :duration="state.duration"
         :buffered="state.buffered"
         :chapters="chapters"
-        :thumbnail-cues="thumbnailCues.length ? thumbnailCues : undefined"
+        :thumbnail-cues="thumbnailCues"
         @seek="controls.seek"
         @seekstart="onSeekStart"
         @seekend="onSeekEnd"

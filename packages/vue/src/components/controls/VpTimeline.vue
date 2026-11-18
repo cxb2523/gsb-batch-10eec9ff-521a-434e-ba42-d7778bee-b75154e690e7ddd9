@@ -1,14 +1,15 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import type { Chapter, ThumbnailCue } from '@vue-player/core'
-import { formatTime } from '@vue-player/core'
+import { formatTime, resolveTimelinePreview } from '@vue-player/core'
+import { spriteStyleForCue, timeFromRatio } from './thumbnailPreview'
 
 const props = defineProps<{
   currentTime: number
   duration: number
   buffered: number
   chapters?: Chapter[]
-  thumbnailCues?: ThumbnailCue[]
+  thumbnailCues?: readonly ThumbnailCue[]
 }>()
 
 const emit = defineEmits<{
@@ -139,39 +140,33 @@ const tooltipRatio = computed(() => {
   return hoverRatio.value
 })
 
-const tooltipTime = computed(() =>
-  tooltipRatio.value !== null ? tooltipRatio.value * props.duration : 0,
-)
-
-const tooltipChapter = computed(() => {
-  const r = tooltipRatio.value
-  if (!props.chapters?.length || r === null) return null
-  return segments.value.find((s) => r >= s.start && r < s.end)?.label ?? null
-})
-
 const showTooltip = computed(() => tooltipRatio.value !== null && props.duration > 0)
 
-// Active thumbnail for the hovered/seeking position
-const activeThumbnail = computed<ThumbnailCue | null>(() => {
-  const cues = props.thumbnailCues
-  if (!cues?.length) return null
-  const t = tooltipRatio.value
-  if (t === null) return null
-  const time = t * props.duration
-  return cues.find((c) => time >= c.start && time < c.end) ?? null
+// ─── Tooltip content ───
+// The chapter label and the thumbnail are resolved together from one
+// media-time value derived from the video's real duration, so they can never
+// disagree about which moment is being previewed.
+const tooltipPreview = computed(() => {
+  const r = tooltipRatio.value
+  if (r === null || !props.duration) {
+    return { time: 0, chapter: null, cue: null }
+  }
+  return resolveTimelinePreview(
+    props.chapters,
+    props.thumbnailCues,
+    timeFromRatio(r, props.duration),
+  )
 })
 
-// Style for sprite-sheet thumbnails (xywh fragment)
-const thumbnailSpriteStyle = computed(() => {
-  const c = activeThumbnail.value
-  if (!c || c.x === undefined) return null
-  return {
-    backgroundImage: `url(${c.url})`,
-    backgroundPosition: `-${c.x}px -${c.y}px`,
-    width: `${c.w}px`,
-    height: `${c.h}px`,
-  }
-})
+const tooltipTime = computed(() => tooltipPreview.value.time)
+const tooltipChapter = computed(() => tooltipPreview.value.chapter?.label ?? null)
+
+// Active thumbnail for the hovered/seeking position. `null` outside the cue
+// list's range — the tooltip then shows only the time and chapter label.
+const activeThumbnail = computed<ThumbnailCue | null>(() => tooltipPreview.value.cue)
+
+// Inline style for an `xywh` sprite slice; `null` for plain image thumbnails.
+const thumbnailSpriteStyle = computed(() => spriteStyleForCue(activeThumbnail.value))
 
 // Clamp so the tooltip doesn't bleed off the track edges.
 // With thumbnails visible the tooltip is ~160px wide (half ≈ 88px).

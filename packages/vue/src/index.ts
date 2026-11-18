@@ -4,7 +4,7 @@ import { VideoPlayer } from './components/VideoPlayer'
 export { VideoPlayer }
 export { default as VpSettingsButton } from './components/controls/VpSettingsButton.vue'
 export { usePlayer } from './composables/usePlayer'
-export type { PlayerControls } from './composables/usePlayer'
+export type { PlayerControls, UsePlayerOptions, UsePlayerReturn } from './composables/usePlayer'
 
 export default {
   install(app: App) {

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `@vue-player/core`: `findThumbnailCue`, `findChapterAt` and `resolveTimelinePreview` helpers for resolving a media time to a cue/chapter on a shared time basis
+- `@vue-player/core`: `createThumbnailLoader` — framework-agnostic manifest loader with request-generation tracking
+- `@vue-player/vue`: `usePlayer(videoRef, { thumbnails })` now owns thumbnail loading, exposing readonly `thumbnails`, `thumbnailsLoading` and `reloadThumbnails()`
+
+### Fixed
+
+- `@vue-player/vue`: thumbnail previews and chapter names now resolve from the video's real duration and a single media-time value, so they can no longer disagree or drift out of sync while hovering or scrubbing
+- `@vue-player/vue`: switching sources clears the previous thumbnail list immediately, aborts the in-flight manifest request, and discards late responses — stale frames from the old video no longer appear
+- `@vue-player/vue`: a failed thumbnail manifest request leaves the cue list empty without blocking playback; the timeline still drags and shows time and chapter
+- `@vue-player/core`: `parseThumbnailVtt` no longer throws and skips malformed cues, BOM-prefixed files and out-of-order entries
+
 ## [0.1.7] — 2026-10-29
 
 ### Fixed

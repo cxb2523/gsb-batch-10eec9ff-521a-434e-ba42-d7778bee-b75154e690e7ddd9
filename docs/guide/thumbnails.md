@@ -94,6 +94,43 @@ WEBVTT
 frame_000.jpg#xywh=0,0,160,90
 ```
 
+## Source Lifecycle
+
+Thumbnail loading is tied to the video source. When `src` changes, the player:
+
+1. Clears the current cue list immediately, so no frame from the previous video can be shown while the new one loads.
+2. Aborts any in-flight manifest request.
+3. Fetches the manifest for the new source.
+
+A late response for an old source is discarded. If the manifest request fails (network error, 404, malformed file), the cue list simply stays empty — playback and timeline dragging keep working, and the tooltip still shows the time and chapter name.
+
+Hovering outside the manifest's time range behaves the same way: no preview image, but the timestamp and chapter label remain.
+
+### Per-source manifests
+
+The `thumbnails` prop can change independently of `src` (for example, when each entry in a source list carries its own manifest):
+
+```vue
+<script setup lang="ts">
+import { ref } from 'vue'
+
+const sources = [
+  { src: '/video-a.mp4', thumbnails: '/thumbs-a.vtt' },
+  { src: '/video-b.mp4', thumbnails: '/thumbs-b.vtt' },
+]
+const active = ref(sources[0])
+</script>
+
+<template>
+  <VideoPlayer :src="active.src" :thumbnails="active.thumbnails" />
+  <button v-for="s in sources" :key="s.src" @click="active = s">
+    {{ s.src }}
+  </button>
+</template>
+```
+
+Changing both at once still results in a single manifest request for the new source.
+
 ## ThumbnailCue Type
 
 If you need to parse the VTT manually or generate cues programmatically, use the `parseThumbnailVtt` utility from `@vue-player/core`:
@@ -104,7 +141,7 @@ import { parseThumbnailVtt } from '@vue-player/core'
 const cues = await parseThumbnailVtt('https://example.com/thumbnails.vtt')
 ```
 
-Each returned cue has the following shape:
+`parseThumbnailVtt` never throws — a failed request resolves to `[]`. Each returned cue has the following shape:
 
 ```ts
 interface ThumbnailCue {
@@ -117,3 +154,33 @@ interface ThumbnailCue {
   h?: number // sprite frame height (px)
 }
 ```
+
+Cues are returned sorted by `start` time, and malformed cues (invalid timestamps, a missing image line, reversed ranges) are skipped.
+
+## usePlayer Integration
+
+When building a custom UI with `usePlayer`, pass the manifest URL as an option. The composable loads it whenever `loadSource` is called, and exposes the result as a read-only ref:
+
+```ts
+import { usePlayer } from '@vue-player/vue'
+
+const { state, controls, loadSource, thumbnails } = usePlayer(videoRef, {
+  thumbnails: () => activeSource.value.thumbnails,
+})
+```
+
+| Return | Type | Description |
+|---|---|---|
+| `thumbnails` | `Readonly<Ref<readonly ThumbnailCue[]>>` | Cues for the current source |
+| `thumbnailsLoading` | `Readonly<Ref<boolean>>` | A manifest request is in flight |
+| `reloadThumbnails()` | `() => Promise<void>` | Re-fetch the manifest for the current source |
+
+Pair them with `resolveTimelinePreview` to build a custom tooltip that always keeps the preview frame and chapter in sync:
+
+```ts
+import { resolveTimelinePreview } from '@vue-player/core'
+
+// `time` is a position in the video's own timeline (seconds).
+const { time, chapter, cue } = resolveTimelinePreview(chapters, thumbnails.value, seekTime)
+```
+

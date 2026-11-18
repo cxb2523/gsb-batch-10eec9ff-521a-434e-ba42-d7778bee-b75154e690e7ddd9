@@ -42,7 +42,7 @@ import { VideoPlayer } from '@vue-player/vue'
 | `pip` | `boolean` | `true` | Show PiP button when browser supports it |
 | `tracks` | `Track[]` | — | Subtitle / caption tracks |
 | `chapters` | `Chapter[]` | — | Timeline chapter markers |
-| `thumbnails` | `string` | — | URL of a WebVTT thumbnail file |
+| `thumbnails` | `string` | — | URL of a WebVTT thumbnail file. Reloaded automatically when `src` changes; a failed request just disables previews |
 
 ## Events
 

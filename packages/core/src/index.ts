@@ -14,6 +14,15 @@ export type { SourceType } from './utils/source'
 
 export { formatTime, parseTimecode } from './utils/time'
 export { parseThumbnailVtt, parseVttText } from './utils/parseThumbnailVtt'
+export type { ParseThumbnailOptions } from './utils/parseThumbnailVtt'
+export { createThumbnailLoader } from './utils/thumbnailLoader'
+export type {
+  ThumbnailLoader,
+  ThumbnailLoaderOptions,
+  ThumbnailLoaderState,
+} from './utils/thumbnailLoader'
+export { findChapterAt, findThumbnailCue, resolveTimelinePreview } from './utils/timeline'
+export type { TimelinePreview } from './utils/timeline'
 
 export {
   isFullscreenSupported,

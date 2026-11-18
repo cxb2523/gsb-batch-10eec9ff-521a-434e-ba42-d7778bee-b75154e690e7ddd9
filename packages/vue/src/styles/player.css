@@ -335,6 +335,7 @@
   overflow: hidden;
   flex-shrink: 0;
   background: var(--vp-timeline-bg);
+  position: relative;
 }
 
 .vp-thumbnail-img {
@@ -345,8 +346,15 @@
   pointer-events: none;
 }
 
+/* Sprite slice: the tile is positioned by its xywh offset inside the sheet.
+   The wrapper stays 160×90 and the sheet is scaled so the tile fills it,
+   which keeps mixed tile sizes from breaking the tooltip layout. */
 .vp-thumbnail-sprite {
+  position: absolute;
+  top: 0;
+  left: 0;
   background-repeat: no-repeat;
+  transform-origin: top left;
 }
 
 /* ─── Volume ─── */

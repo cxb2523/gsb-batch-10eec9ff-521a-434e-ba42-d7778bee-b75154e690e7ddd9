@@ -22,14 +22,20 @@ const sources = [
   {
     label: 'HLS (VOD)',
     src: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
+    // Individual-image manifest for this source.
+    thumbnails: '/thumbnails.vtt',
   },
   {
     label: 'MP4',
     src: 'https://www.papytane.com/mp4/lessapin.mp4',
+    // Sprite-sheet manifest — each cue is an xywh slice of one image.
+    thumbnails: '/thumbnails-sprite.vtt',
   },
   {
     label: 'Live HLS',
     src: 'http://sample.vodobox.com/skate_phantom_flex_4k/skate_phantom_flex_4k.m3u8',
+    // No manifest at all: hovering still shows the time and chapter.
+    thumbnails: undefined,
   },
 ]
 
@@ -63,7 +69,7 @@ const active = ref(sources[0])
             :src="active.src"
             :chapters="testChapters"
             :tracks="testTracks"
-            :thumbnails="active.src === sources[0].src ? '/thumbnails.vtt' : undefined"
+            :thumbnails="active.thumbnails"
             :keyboard="true"
             @error="console.error('player error', $event)"
           />
