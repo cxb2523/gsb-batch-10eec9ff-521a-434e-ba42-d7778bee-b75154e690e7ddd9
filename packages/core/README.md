@@ -137,6 +137,7 @@ const stats = analyzePattern(pattern.grid.cells, getPaletteProvider().colors);
 
 console.log(`Total Beads: ${stats.totalBeads}`);
 console.log(`Empty Cells: ${stats.emptyCells}`);
+console.log(`Transparent (H1) Cells: ${stats.transparentCells}`); // excluded from material counts
 for (const item of stats.colors) {
   console.log(`  ${item.code} (${item.name}): ${item.count} beads (${(item.share * 100).toFixed(1)}%)`);
 }

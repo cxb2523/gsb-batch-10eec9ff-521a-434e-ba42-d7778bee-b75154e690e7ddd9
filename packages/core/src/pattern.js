@@ -61,12 +61,18 @@ export function assessPatternQuality({ width, height, cols, rows, fitMode = 'con
 
 /**
  * Computes material usage, color counts, and distribution statistics for a pattern.
+ *
+ * Transparent anchor cells (e.g. MARD H1) are placeholders, not physical beads:
+ * they are tracked separately via `transparentCells` and never contribute to
+ * `totalBeads`, `beadCounts`, or the per-color material list. Empty/blank cells
+ * (null / -1 / undefined / unresolvable codes) are counted as `emptyCells`.
  */
 export function analyzePattern(cells, palette = getPaletteProvider().colors) {
   const counts = new Map();
   const beadCounts = {};
   let totalBeads = 0;
   let emptyCells = 0;
+  let transparentCells = 0;
 
   for (let i = 0; i < cells.length; i++) {
     const val = cells[i];
@@ -78,6 +84,11 @@ export function analyzePattern(cells, palette = getPaletteProvider().colors) {
     const color = typeof val === 'number' ? palette[val] : palette.find((c) => c.code === val);
     if (!color) {
       emptyCells++;
+      continue;
+    }
+
+    if (color.isTransparent) {
+      transparentCells++;
       continue;
     }
 
@@ -103,6 +114,7 @@ export function analyzePattern(cells, palette = getPaletteProvider().colors) {
   return {
     totalBeads,
     emptyCells,
+    transparentCells,
     usedColors: colors.length,
     density: cells.length > 0 ? totalBeads / cells.length : 0,
     colors,
@@ -163,6 +175,7 @@ export function createPattern({
     statistics: {
       totalBeads: stats.totalBeads,
       emptyCells: stats.emptyCells,
+      transparentCells: stats.transparentCells,
       usedColors: stats.usedColors,
       density: stats.density,
       beadCounts: stats.beadCounts,
@@ -208,21 +221,48 @@ export function parsePattern(input, options = {}) {
   const provider = getPaletteProvider(options.paletteId || raw.palette?.id || raw.palette || 'mard-compatible-base-221');
   const palette = provider.colors;
   const colorByCode = new Map(palette.map((color) => [color.code, color.index]));
+  const transparentCodes = new Set(
+    palette.filter((color) => color.isTransparent).map((color) => color.code),
+  );
+  if (provider.anchors?.transparent) transparentCodes.add(provider.anchors.transparent);
 
   const legacy = raw.version === 1 && (raw.palette === 'universal-screen-64-v1' || raw.palette?.id === 'universal-screen-64-v1');
   const rawIndices = new Int16Array(cols * rows);
   const normalizedCodes = new Array(cols * rows);
+  const unknownCells = [];
+  const transparentCellIndices = [];
+
+  const markEmpty = (i) => {
+    rawIndices[i] = -1;
+    normalizedCodes[i] = null;
+  };
 
   for (let i = 0; i < cells.length; i++) {
     const val = cells[i];
     if (val === null || val === -1 || val === undefined) {
-      rawIndices[i] = -1;
-      normalizedCodes[i] = null;
+      markEmpty(i);
       continue;
     }
     const code = String(val);
+
+    // The transparent anchor (MARD H1) is a placeholder, never a purchasable
+    // material. Preserve it on the grid, but keep it out of the bead counts.
+    if (transparentCodes.has(code)) {
+      rawIndices[i] = colorByCode.get(code);
+      normalizedCodes[i] = code;
+      transparentCellIndices.push(i);
+      continue;
+    }
+
     if (legacy) {
       if (!LEGACY_TO_MARD.has(code)) {
+        if (options.lenient) {
+          // Lenient import: degrade unrecognized legacy codes to blank cells
+          // instead of silently painting an arbitrary color.
+          unknownCells.push({ index: i, code });
+          markEmpty(i);
+          continue;
+        }
         throw new Error(`Unknown legacy color code at index ${i}: ${code}`);
       }
       const mappedIdx = LEGACY_TO_MARD.get(code);
@@ -231,8 +271,8 @@ export function parsePattern(input, options = {}) {
     } else {
       if (!colorByCode.has(code)) {
         if (options.lenient) {
-          rawIndices[i] = -1;
-          normalizedCodes[i] = null;
+          unknownCells.push({ index: i, code });
+          markEmpty(i);
           continue;
         }
         throw new Error(`Unknown color code at index ${i}: ${code} for palette ${provider.id}`);
@@ -242,7 +282,7 @@ export function parsePattern(input, options = {}) {
     }
   }
 
-  return createPattern({
+  const result = createPattern({
     width: cols,
     height: rows,
     cells: normalizedCodes,
@@ -251,9 +291,21 @@ export function parsePattern(input, options = {}) {
     metadata: {
       ...raw.metadata,
       migratedFromLegacy: legacy,
+      ...(legacy
+        ? {
+            legacyVersion: 1,
+            legacyPalette: 'universal-screen-64-v1',
+            targetPalette: provider.id,
+            strictMigration: !options.lenient,
+            unknownLegacyCells: unknownCells,
+            transparentCellIndices,
+          }
+        : null),
       importedAt: new Date().toISOString(),
     },
   });
+
+  return result;
 }
 
 /**

@@ -120,6 +120,8 @@ export interface ColorUsage {
 export interface PatternStatistics {
   totalBeads: number;
   emptyCells: number;
+  /** Cells carrying the transparent anchor color (e.g. H1); excluded from material counts. */
+  transparentCells: number;
   usedColors: number;
   density: number;
   colors: ColorUsage[];

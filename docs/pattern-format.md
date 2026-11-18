@@ -67,6 +67,19 @@ The canonical JSON Schema is published at [`schemas/pattern.schema.json`](../sch
   - `null`: empty space (no bead placed).
   - `"<code>"`: string color code corresponding to the referenced palette provider.
 
+### Transparent anchor (H1)
+
+The MARD-compatible palette reserves `H1` as the transparent anchor. A cell
+carrying `H1` is a see-through placeholder, not a purchasable bead:
+
+- `H1` never participates in automatic palette matching (quantization works on
+  the 220 non-transparent colors only).
+- `H1` cells are preserved verbatim in `grid.cells` and round-trip through
+  serialize/parse unchanged.
+- Material statistics exclude them: they are reported separately as
+  `statistics.transparentCells` and never appear in `totalBeads`, `beadCounts`,
+  or the per-color material list. Blank (`null`) cells remain in `emptyCells`.
+
 ---
 
 ## Compatibility and Migration
@@ -74,7 +87,24 @@ The canonical JSON Schema is published at [`schemas/pattern.schema.json`](../sch
 The format is version-controlled:
 - **`schemaVersion: 1`**: Current open exchange contract.
 - **`version: 2`**: Current application project format using MARD-compatible 221-color IDs.
-- **`version: 1`**: Legacy format using `universal-screen-64-v1`. When opened with `@bead-grid/core`, legacy 64 colors are deterministically mapped via minimum CIEDE2000 perceptual distance to their closest 221 equivalent with zero loss of grid geometry.
+- **`version: 1`**: Legacy format using `universal-screen-64-v1`. When opened with `@bead-grid/core`, legacy 64 colors are deterministically mapped via minimum CIEDE2000 perceptual distance to their closest 221 equivalent (the transparent anchor `H1` is never a mapping target) with zero loss of grid geometry.
+
+### Unknown legacy codes: strict vs. lenient import
+
+`parsePattern(input, options)` accepts `{ lenient: boolean }`:
+
+- **Strict (default):** an unrecognized legacy code throws
+  `Unknown legacy color code at index <i>: <code>`, naming the flat cell index.
+- **Lenient (`{ lenient: true }`):** unrecognized codes degrade to blank
+  (`null` / `-1`) cells instead of being silently painted with an arbitrary
+  color. Affected cells are listed in `metadata.unknownLegacyCells` as
+  `{ index, code }` entries.
+
+Every migrated result records provenance in `metadata`, including
+`migratedFromLegacy: true`, `legacyPalette`, `targetPalette`,
+`strictMigration`, `unknownLegacyCells`, and `transparentCellIndices`.
+Re-serializing a migrated pattern and parsing it again yields identical cell
+codes and blank/transparent cell distribution.
 
 ---
 

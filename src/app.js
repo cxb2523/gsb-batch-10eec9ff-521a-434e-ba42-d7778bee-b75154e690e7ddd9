@@ -1095,13 +1095,16 @@ import {
     function getStats() {
       const counts = new Map();
       let total = 0;
+      let transparent = 0;
       for (const value of state.grid) {
         if (value >= 0 && PALETTE[value]) {
+          // H1 是透明锚点：保留在格子上，但不作为实体豆子计入材料。
+          if (PALETTE[value].isTransparent) { transparent++; continue; }
           counts.set(value, (counts.get(value) || 0) + 1);
           total++;
         }
       }
-      return { counts, total, empty: state.grid.length - total };
+      return { counts, total, transparent, empty: state.grid.length - total - transparent };
     }
 
     function formatShare(count, total) {

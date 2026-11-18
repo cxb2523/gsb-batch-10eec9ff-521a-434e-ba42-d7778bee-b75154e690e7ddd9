@@ -185,8 +185,224 @@ test('pattern: legacy version 1 migration maps correctly to MARD-compatible colo
   assert.equal(migrated.metadata.migratedFromLegacy, true);
   assert.equal(migrated.statistics.emptyCells, 6);
   assert.equal(migrated.statistics.totalBeads, 10);
+  assert.equal(migrated.statistics.transparentCells, 0);
   // N01 should map to H2 (white)
   assert.equal(migrated.grid.cells[0], 'H2');
+  // Every migrated cell must be a MARD code present in the current palette
+  const paletteCodes = new Set(getPaletteProvider().colors.map((color) => color.code));
+  for (const code of migrated.grid.cells) {
+    if (code !== null) assert.ok(paletteCodes.has(code), `migrated code ${code} exists in current palette`);
+  }
+  // Migration provenance is exposed on the import result metadata
+  assert.equal(migrated.metadata.legacyPalette, 'universal-screen-64-v1');
+  assert.equal(migrated.metadata.targetPalette, 'mard-compatible-base-221');
+  assert.equal(migrated.metadata.strictMigration, true);
+  assert.deepEqual(migrated.metadata.unknownLegacyCells, []);
+  // A non-legacy import must not carry the migration marker
+  const modern = parsePattern({
+    type: 'bead-grid-studio',
+    version: 2,
+    palette: { id: 'mard-compatible-base-221' },
+    grid: { cols: 4, rows: 4, cells: new Array(16).fill('H7') },
+  });
+  assert.equal(modern.metadata.migratedFromLegacy, false);
+});
+
+test('pattern: legacy migration also recognizes palette object form universal-screen-64-v1', () => {
+  const migrated = parsePattern({
+    type: 'bead-grid-studio',
+    version: 1,
+    palette: { id: 'universal-screen-64-v1' },
+    grid: {
+      cols: 4,
+      rows: 4,
+      cells: ['N01', null, -1, undefined, ...new Array(12).fill('N11')],
+    },
+  });
+  assert.equal(migrated.metadata.migratedFromLegacy, true);
+  assert.equal(migrated.grid.cells[0], 'H2');
+  // null, -1 and undefined all normalize to blank cells
+  assert.deepEqual(migrated.grid.cells.slice(1, 4), [null, null, null]);
+  assert.equal(migrated.statistics.emptyCells, 3);
+});
+
+test('pattern: unknown legacy color code throws in strict mode and names the cell index', () => {
+  const legacyPattern = {
+    type: 'bead-grid-studio',
+    version: 1,
+    palette: 'universal-screen-64-v1',
+    grid: {
+      cols: 4,
+      rows: 4,
+      cells: [
+        'N01', 'N01', 'N01', 'N01',
+        'N01', 'N01', 'ZZ99', 'N01', // unknown legacy code at flat index 6
+        ...new Array(8).fill(null),
+      ],
+    },
+  };
+
+  // Default (strict) behavior: error must point at the offending cell index
+  assert.throws(() => parsePattern(legacyPattern), /Unknown legacy color code at index 6: ZZ99/);
+  // Explicit strict mode behaves identically
+  assert.throws(() => parsePattern(legacyPattern, { lenient: false }), /index 6/);
+});
+
+test('pattern: unknown legacy color code degrades to blank cells in lenient mode', () => {
+  const legacyPattern = {
+    type: 'bead-grid-studio',
+    version: 1,
+    palette: 'universal-screen-64-v1',
+    grid: {
+      cols: 4,
+      rows: 4,
+      cells: [
+        'N01', 'ZZ99', 'N01', 'N01',
+        'N01', 'N01', 'QQ42', 'N01', // two unknown codes at indices 1 and 6
+        ...new Array(8).fill(null),
+      ],
+    },
+  };
+
+  const migrated = parsePattern(legacyPattern, { lenient: true });
+  assert.equal(migrated.metadata.migratedFromLegacy, true);
+  assert.equal(migrated.metadata.strictMigration, false);
+  // Unknown cells become blank, not a silently painted color
+  assert.equal(migrated.grid.cells[1], null);
+  assert.equal(migrated.grid.cells[6], null);
+  assert.equal(migrated.rawIndices[1], -1);
+  assert.equal(migrated.rawIndices[6], -1);
+  // Known cells still migrate normally
+  assert.equal(migrated.grid.cells[0], 'H2');
+  // The degraded cells are reported in metadata, including their flat indices
+  assert.deepEqual(migrated.metadata.unknownLegacyCells, [
+    { index: 1, code: 'ZZ99' },
+    { index: 6, code: 'QQ42' },
+  ]);
+  // 8 explicit nulls + 2 degraded unknowns = 10 empty; 6 migrated beads
+  assert.equal(migrated.statistics.emptyCells, 10);
+  assert.equal(migrated.statistics.totalBeads, 6);
+
+  // Lenient mode also covers unknown codes in modern (v2) projects
+  const modern = parsePattern({
+    type: 'bead-grid-studio',
+    version: 2,
+    palette: { id: 'mard-compatible-base-221' },
+    grid: { cols: 4, rows: 4, cells: ['NOPE', ...new Array(15).fill(null)] },
+  }, { lenient: true });
+  assert.equal(modern.grid.cells[0], null);
+  assert.equal(modern.statistics.emptyCells, 16);
+  assert.equal(modern.statistics.totalBeads, 0);
+});
+
+test('pattern: transparent anchor H1 is preserved on the grid but excluded from material counts', () => {
+  const pattern = parsePattern({
+    type: 'bead-grid-studio',
+    version: 2,
+    palette: { id: 'mard-compatible-base-221' },
+    grid: {
+      cols: 4,
+      rows: 4,
+      cells: [
+        'H1', 'H7', 'H7', null,
+        'H7', 'H1', null, null,
+        ...new Array(8).fill(null),
+      ],
+    },
+  });
+
+  // H1 stays a first-class cell code rather than being flattened to null
+  assert.equal(pattern.grid.cells[0], 'H1');
+  assert.equal(pattern.grid.cells[5], 'H1');
+  // But it is never counted as purchasable material
+  assert.equal(pattern.statistics.transparentCells, 2);
+  assert.equal(pattern.statistics.totalBeads, 3);
+  assert.equal(pattern.statistics.emptyCells, 11);
+  assert.equal(Object.prototype.hasOwnProperty.call(pattern.statistics.beadCounts, 'H1'), false);
+  assert.deepEqual(pattern.statistics.colors.map((entry) => entry.code), ['H7']);
+  assert.equal(pattern.statistics.beadCounts.H7, 3);
+  // analyzePattern directly applies the same transparent exclusion
+  const direct = analyzePattern(['H1', 'H1', 'H2', null, -1], getPaletteProvider().colors);
+  assert.equal(direct.transparentCells, 2);
+  assert.equal(direct.totalBeads, 1);
+  assert.equal(direct.emptyCells, 2);
+  assert.deepEqual(Object.keys(direct.beadCounts), ['H2']);
+  // Transparent anchor never enters auto-matching palette used by the pipeline
+  const matchable = getPaletteProvider().colors.filter(getPaletteProvider().autoMatchable);
+  assert.equal(matchable.some((color) => color.code === 'H1'), false);
+});
+
+test('pattern: migrated and transparent patterns survive serialize/parse round-trips unchanged', () => {
+  const legacyPattern = {
+    type: 'bead-grid-studio',
+    version: 1,
+    palette: 'universal-screen-64-v1',
+    grid: {
+      cols: 4,
+      rows: 4,
+      cells: [
+        'N01', 'H1', 'ZZ99', 'P07',
+        null, 'N11', 'H1', 'P01',
+        ...new Array(8).fill(null),
+      ],
+    },
+  };
+
+  const migrated = parsePattern(legacyPattern, { lenient: true });
+  const roundTrip = parsePattern(serializePattern(migrated));
+
+  // Cell color codes and blank-cell distribution remain identical after
+  // re-serialization and re-parsing
+  assert.deepEqual(roundTrip.grid.cells, migrated.grid.cells);
+  assert.deepEqual(Array.from(roundTrip.rawIndices), Array.from(migrated.rawIndices));
+  assert.deepEqual(roundTrip.statistics.beadCounts, migrated.statistics.beadCounts);
+  assert.equal(roundTrip.statistics.totalBeads, migrated.statistics.totalBeads);
+  assert.equal(roundTrip.statistics.emptyCells, migrated.statistics.emptyCells);
+  assert.equal(roundTrip.statistics.transparentCells, migrated.statistics.transparentCells);
+  // The re-parsed document is a modern one, but H1 placeholders survive intact
+  assert.equal(roundTrip.metadata.migratedFromLegacy, false);
+  assert.equal(roundTrip.grid.cells[1], 'H1');
+  assert.equal(roundTrip.grid.cells[6], 'H1');
+  assert.equal(roundTrip.grid.cells[2], null);
+
+  // Pure H1/blank grid round-trips with zero materials on both sides
+  const transparentOnly = parsePattern({
+    type: 'bead-grid-studio',
+    version: 2,
+    palette: { id: 'mard-compatible-base-221' },
+    grid: { cols: 4, rows: 4, cells: ['H1', ...new Array(15).fill(null)] },
+  });
+  const transparentAgain = parsePattern(serializePattern(transparentOnly));
+  assert.deepEqual(transparentAgain.grid.cells, transparentOnly.grid.cells);
+  assert.equal(transparentAgain.statistics.totalBeads, 0);
+  assert.equal(transparentAgain.statistics.transparentCells, 1);
+});
+
+test('pattern: dimension and cell-count validations still reject malformed imports', () => {
+  const base = (cols, rows, cells) => ({
+    type: 'bead-grid-studio',
+    version: 2,
+    palette: { id: 'mard-compatible-base-221' },
+    grid: { cols, rows, cells },
+  });
+
+  assert.throws(() => parsePattern(base(3, 4, new Array(12).fill(null))), /Invalid pattern dimensions/);
+  assert.throws(() => parsePattern(base(4, 161, new Array(644).fill(null))), /Invalid pattern dimensions/);
+  assert.throws(
+    () => parsePattern(base(4, 4, new Array(15).fill(null))),
+    /Cells array length \(15\) does not match grid dimensions \(4x4 = 16\)/,
+  );
+  assert.throws(
+    () => parsePattern({ ...base(4, 4, new Array(16).fill(null)), type: 'something-else' }),
+    /Unsupported pattern type/,
+  );
+  // Legacy projects are guarded by the same dimension checks
+  assert.throws(() => parsePattern({
+    type: 'bead-grid-studio',
+    version: 1,
+    palette: 'universal-screen-64-v1',
+    grid: { cols: 2, rows: 2, cells: ['N01', 'N01', 'N01', 'N01'] },
+  }), /Invalid pattern dimensions/);
 });
 
 test('quantize handles edge case inputs gracefully without throwing', () => {

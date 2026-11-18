@@ -2,6 +2,14 @@
 
 All notable changes are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Legacy `version: 1` / `universal-screen-64-v1` project import now supports a lenient mode (`parsePattern(input, { lenient: true })`): unrecognized legacy color codes degrade to blank cells (reported in `metadata.unknownLegacyCells`) instead of throwing, while strict mode remains the default and errors with the offending flat cell index.
+- Transparent anchor cells (`H1`) are preserved on the grid during import and round-trip serialization, but are excluded from material statistics via the new `statistics.transparentCells` field; they never appear in `totalBeads`, `beadCounts`, or the per-color material list, and remain ineligible for automatic palette matching.
+- Migration provenance (`legacyPalette`, `targetPalette`, `strictMigration`, `unknownLegacyCells`, `transparentCellIndices`) is exposed on the import result metadata alongside `migratedFromLegacy`.
+
 ## [1.2.0] - 2026-08-26
 
 ### Added
