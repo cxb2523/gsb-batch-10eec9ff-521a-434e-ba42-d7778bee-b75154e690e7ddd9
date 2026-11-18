@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>three-render-objects state convergence tests</title>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/node_modules/three/build/three.module.js",
+      "three/webgpu": "/node_modules/three/build/three.webgpu.js",
+      "three/tsl": "/node_modules/three/build/three.tsl.js",
+      "three/addons/": "/node_modules/three/examples/jsm/",
+      "three/examples/jsm/": "/node_modules/three/examples/jsm/"
+    }
+  }
+  </script>
+  <style>
+    html, body { margin: 0; width: 640px; }
+    body > div:not(#results) { width: 640px; height: 480px; position: relative; }
+    #results { display: none; }
+  </style>
+</head>
+<body>
+  <div id="results">PENDING</div>
+  <script type="module">
+    import * as THREE from 'three';
+    window.THREE = THREE;
+    const { default: ThreeRenderObjects } = await import('/test/build/three-render-objects.bundle.mjs');
+
+    const wait = ms => new Promise(r => setTimeout(r, ms));
+    const results = [];
+    let failures = 0;
+    const report = (name, ok, detail = '') => {
+      results.push(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ' :: ' + detail : ''}`);
+      if (!ok) failures++;
+    };
+    const assert = (cond, msg) => { if (!cond) throw new Error(msg); };
+
+    // Each test gets its own container and is torn down afterwards
+    const instances = [];
+    const makeRender = () => {
+      const el = document.createElement('div');
+      document.body.appendChild(el);
+      const inst = new ThreeRenderObjects(el, {
+        controlType: 'orbit', waitForLoadComplete: false
+      }).width(640).height(480).showNavInfo(false).pointerRaycasterThrottleMs(0);
+      instances.push(inst);
+      return inst;
+    };
+
+    const makeMesh = (x, label) => {
+      const m = new THREE.Mesh(
+        new THREE.SphereGeometry(10, 12, 12),
+        new THREE.MeshBasicMaterial({ color: 0xffffff })
+      );
+      m.position.set(x, 0, 0);
+      m.userData.label = label;
+      return m;
+    };
+
+    const pointerAt = (container, x, y) => {
+      const rect = container.getBoundingClientRect();
+      for (const type of ['pointermove', 'mousemove']) {
+        container.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, cancelable: true,
+          clientX: rect.left + x, clientY: rect.top + y,
+          pageX: rect.left + x, pageY: rect.top + y
+        }));
+      }
+    };
+
+    const tooltipText = container =>
+      container.querySelector('.float-tooltip-kap')?.textContent ?? '';
+
+    // Find a screen coordinate that raycasts onto the given object (nav-info aware)
+    const pointAtObject = (inst, obj) => {
+      const w = inst.width(), h = inst.height();
+      for (const [x, y] of [[w / 2, h / 2], [w / 2, h / 2 + 30], [w / 2 - 40, h / 2], [w / 2 + 40, h / 2 + 20]]) {
+        const hits = inst.intersectingObjects(x, y).filter(d => d.object === obj || d.object.parent === obj);
+        if (hits.length) return { x, y };
+      }
+      const centerHits = inst.intersectingObjects(w / 2, h / 2);
+      throw new Error('could not find screen point over object ' + obj.userData.label
+        + ` (centerHits=${centerHits.length}, type=${centerHits[0]?.object?.type}, isObj=${centerHits[0]?.object === obj})`);
+    };
+
+    // ---------- Test 1: 换批后悬停收敛（离开事件 + 清空 tooltip） ----------
+    async function testHoverConvergesOnBatchChange() {
+      const meshA = makeMesh(0, 'A');
+      const meshB = makeMesh(200, 'B');
+      const hoverEvents = [];
+      const inst = makeRender()
+        .tooltipContent(obj => `tooltip-${obj.userData.label}`)
+        .onHover((obj, prev, intersection) =>
+          hoverEvents.push({ obj: obj?.userData.label ?? null, prev: prev?.userData.label ?? null, hasIntersection: !!intersection }))
+        .objects([meshA, meshB]);
+      await wait(20);
+      inst.tick(); // ensure world matrices are computed before raycasting
+
+      // Hover meshA by pointing at its screen position
+      const pt = pointAtObject(inst, meshA);
+      pointerAt(inst.renderer().domElement.parentNode, pt.x, pt.y);
+      await wait(20);
+      inst.tick();
+      await wait(20);
+      assert(inst.scene().children.includes(meshA), 'precondition: meshA in scene');
+      assert(hoverEvents.length >= 1 && hoverEvents.at(-1).obj === 'A',
+        'precondition: hover-enter fired for meshA, got ' + JSON.stringify(hoverEvents));
+      assert(tooltipText(inst.renderer().domElement.parentNode).includes('tooltip-A'),
+        'precondition: tooltip shows meshA label');
+
+      // Replace the whole batch with objects that do NOT include the hovered one
+      const meshC = makeMesh(400, 'C');
+      inst.objects([meshC]);
+      await wait(20);
+
+      // onHover(null, oldObj, null) fired exactly once with the removed object
+      const leave = hoverEvents.filter(e => e.obj === null);
+      assert(leave.length === 1, `expected exactly one hover-leave, got ${leave.length}`);
+      assert(leave[0].prev === 'A', 'leave event must carry the removed object as previous, got ' + leave[0].prev);
+      assert(leave[0].hasIntersection === false, 'leave event must carry null intersection');
+
+      // tooltip detached from the removed object
+      assert(!tooltipText(inst.renderer().domElement.parentNode).includes('tooltip-A'),
+        'tooltip content must be cleared');
+      assert(tooltipText(inst.renderer().domElement.parentNode) === '', 'tooltip element must be empty');
+
+      // scene graph reflects the new batch only
+      assert(!inst.scene().children.includes(meshA), 'old object removed from scene');
+      assert(inst.scene().children.includes(meshC), 'new object added to scene');
+
+      // A subsequent tick must not re-emit hover events for the removed object
+      const eventsBefore = hoverEvents.length;
+      inst.tick();
+      assert(hoverEvents.length === eventsBefore, 'no spurious hover events after convergence');
+      report('batch change: hover converges with onHover(null, old, null) and tooltip cleared', true);
+      return inst;
+    }
+
+    // ---------- Test 2: 换批时悬停对象仍在新列表中则保留 ----------
+    async function testHoverRetainedWhenObjectStays() {
+      const meshA = makeMesh(0, 'A2');
+      const meshB = makeMesh(200, 'B2');
+      const hoverEvents = [];
+      const inst = makeRender()
+        .tooltipContent(obj => `tip-${obj.userData.label}`)
+        .onHover((obj, prev) =>
+          hoverEvents.push({ obj: obj?.userData.label ?? null, prev: prev?.userData.label ?? null }))
+        .objects([meshA, meshB]);
+      await wait(20);
+      inst.tick(); // ensure world matrices are computed before raycasting
+
+      const pt = pointAtObject(inst, meshA);
+      pointerAt(inst.renderer().domElement.parentNode, pt.x, pt.y);
+      await wait(20);
+      inst.tick();
+      await wait(20);
+      assert(hoverEvents.at(-1)?.obj === 'A2', 'precondition: hovering meshA');
+      assert(tooltipText(inst.renderer().domElement.parentNode).includes('tip-A2'),
+        'precondition: tooltip for meshA');
+
+      // New batch keeps meshA, drops meshB
+      inst.objects([meshA]);
+      await wait(20);
+      inst.tick();
+
+      const leaves = hoverEvents.filter(e => e.obj === null);
+      assert(leaves.length === 0, 'no hover-leave while hovered object stays in the batch');
+      assert(tooltipText(inst.renderer().domElement.parentNode).includes('tip-A2'),
+        'tooltip retained for the still-present hovered object');
+      report('batch change: hover state retained when object stays in new list', true);
+      return inst;
+    }
+
+    // ---------- Test 3: 换批取消正在进行的 cameraPosition 补间（位置补间） ----------
+    async function testCameraPosTweenCancelled() {
+      const meshA = makeMesh(0, 'tweenA');
+      const meshB = makeMesh(50, 'tweenB');
+      const inst = makeRender()
+        .objects([meshA]);
+      await wait(20);
+
+      // Start a long camera position tween towards a far-away (stale) target
+      inst.cameraPosition({ x: 500, y: 500, z: 500 }, { x: 0, y: 0, z: 0 }, 2000);
+      const startPos = inst.camera().position.clone();
+      inst.tick(); // tween starts
+      await wait(100);
+      inst.tick(); // let the tween move the camera partway
+      const midPos = inst.camera().position.clone();
+      assert(midPos.distanceTo(startPos) > 1, 'precondition: camera is moving under the tween');
+
+      // Batch change must cancel the in-flight tween
+      inst.objects([meshB]);
+      await wait(20);
+      const frozenPos = inst.camera().position.clone();
+
+      // Keep ticking: without cancellation the camera would keep flying towards (500,500,500)
+      await wait(150);
+      inst.tick();
+      await wait(150);
+      inst.tick();
+      const laterPos = inst.camera().position.clone();
+
+      assert(laterPos.distanceTo(frozenPos) < 1e-6,
+        `camera must freeze at the cancellation point, drifted ${laterPos.distanceTo(frozenPos)}`);
+      assert(laterPos.distanceTo(new THREE.Vector3(500, 500, 500)) > 50,
+        'camera must not reach the stale tween target');
+      report('batch change: ongoing cameraPosition tween is cancelled', true);
+      return inst;
+    }
+
+    // ---------- Test 4: 换批取消 lookAt 补间（controls.target 不再被驱动） ----------
+    async function testLookAtTweenCancelled() {
+      const meshA = makeMesh(0, 'lookA');
+      const meshB = makeMesh(60, 'lookB');
+      const inst = makeRender()
+        .objects([meshA]);
+      await wait(20);
+
+      inst.cameraPosition({ x: 0, y: 0, z: 1000 }, { x: 300, y: 200, z: 100 }, 2000);
+      inst.tick();
+      await wait(100);
+      inst.tick(); // lookAt tween (duration = 2000/3) has pushed the target partway
+      const midTarget = inst.controls().target.clone();
+      assert(midTarget.distanceTo(new THREE.Vector3(0, 0, 0)) > 1,
+        'precondition: controls.target is being tweened');
+
+      inst.objects([meshB]);
+      await wait(20);
+      const frozenTarget = inst.controls().target.clone();
+
+      await wait(300); // longer than the lookAt tween's remaining time
+      inst.tick();
+      inst.tick();
+      const laterTarget = inst.controls().target.clone();
+
+      assert(laterTarget.distanceTo(frozenTarget) < 1e-6,
+        `controls.target must freeze, drifted ${laterTarget.distanceTo(frozenTarget)}`);
+      assert(laterTarget.distanceTo(new THREE.Vector3(300, 200, 100)) > 1,
+        'controls.target must not reach the stale lookAt target');
+      report('batch change: ongoing lookAt tween is cancelled', true);
+      return inst;
+    }
+
+    // ---------- Test 5: getBbox / zoomToFit 只统计新列表 ----------
+    async function testBboxOnlyCountsNewList() {
+      const farMesh = makeMesh(1000, 'far');
+      farMesh.position.set(1000, 1000, 1000);
+      const nearMesh = makeMesh(0, 'near');
+      nearMesh.position.set(0, 0, 0);
+
+      const inst = makeRender()
+        .objects([farMesh]);
+      await wait(20);
+
+      // Swap: the far-away object is gone, only the origin-centered one remains
+      inst.objects([nearMesh]);
+      await wait(20);
+
+      const bbox = inst.getBbox();
+      assert(Math.abs(bbox.x[0] - (-10)) < 1e-6 && Math.abs(bbox.x[1] - 10) < 1e-6,
+        `bbox must describe only the new object, got x=[${bbox.x[0]}, ${bbox.x[1]}]`);
+      assert(Math.abs(bbox.z[0] - (-10)) < 1e-6 && Math.abs(bbox.z[1] - 10) < 1e-6,
+        `bbox z must describe only the new object, got z=[${bbox.z[0]}, ${bbox.z[1]}]`);
+
+      // zoomToFit must frame the new (origin) object: a center raycast then hits it,
+      // and framing the removed far object would leave the new one off-screen
+      inst.zoomToFit(0, 10);
+      await wait(20);
+      inst.tick();
+      const fitHits = inst.intersectingObjects(320, 240).length;
+      assert(fitHits > 0, 'after zoomToFit the new object must be framed at screen center');
+      const camDist = inst.camera().position.distanceTo(new THREE.Vector3(0, 0, 0));
+      assert(camDist < 200, `camera must frame the small near object (dist=${camDist}), not the removed far one`);
+      report('getBbox/zoomToFit only account for the new object list', true);
+      return inst;
+    }
+
+    try {
+      await testHoverConvergesOnBatchChange();
+      await testHoverRetainedWhenObjectStays();
+      await testCameraPosTweenCancelled();
+      await testLookAtTweenCancelled();
+      await testBboxOnlyCountsNewList();
+      instances.forEach(i => i._destructor());
+      document.getElementById('results').textContent =
+        (failures ? 'FAIL ' : 'PASS ') + `${results.length} checks; ` + results.join(' || ');
+    } catch (e) {
+      instances.forEach(i => { try { i._destructor(); } catch { /* noop */ } });
+      document.getElementById('results').textContent =
+        'FAIL uncaught: ' + e.message + ' | stack: ' + (e.stack || '').split('\n')[1];
+    }
+  </script>
+</body>
+</html>

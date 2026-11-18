@@ -43,6 +43,8 @@
   "scripts": {
     "build": "rimraf dist && rollup -c",
     "dev": "rollup -w -c rollup.config.dev.js",
+    "test": "node test/run.mjs",
+    "test:build": "rollup -c rollup.config.test.js",
     "prepare": "npm run build"
   },
   "dependencies": {

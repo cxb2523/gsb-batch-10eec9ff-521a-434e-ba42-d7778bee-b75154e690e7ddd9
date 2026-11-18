@@ -151,9 +151,8 @@ export default Kapsule({
         const finalPos = position;
         const finalLookAt = lookAt || {x: 0, y: 0, z: 0};
 
-        // cancel any ongoing pov animation
-        state.povPosTween?.end();
-        state.povTgtTween?.end();
+        // cancel any ongoing pov animation (jumping to its end state)
+        this._cancelCameraTweens(true);
 
         if (!transitionDuration) { // no animation
           setCameraPos(finalPos);
@@ -219,6 +218,17 @@ export default Kapsule({
             .add(camera.position)
         );
       }
+    },
+    // Cancel any ongoing camera position/lookAt tweens.
+    // jumpToEnd=true ends them at their target (replaces the old .end() behavior);
+    // jumpToEnd=false stops them in place, leaving the camera where it currently is.
+    _cancelCameraTweens: function(state, jumpToEnd = false) {
+      [state.povPosTween, state.povTgtTween].forEach(tween => {
+        if (!tween) return;
+        jumpToEnd ? tween.end() : tween.stop();
+        state.tweenGroup.remove(tween);
+      });
+      state.povPosTween = state.povTgtTween = undefined;
     },
     zoomToFit: function (state, transitionDuration = 0, padding = 10, bboxArg, preserveLookDirection) {
       return this.fitToBbox(this.getBbox(bboxArg), transitionDuration, padding, preserveLookDirection);
@@ -563,8 +573,21 @@ export default Kapsule({
     }
 
     if (changedProps.hasOwnProperty('objects')) {
-      (changedProps.objects || []).forEach(obj => state.scene.remove(obj)); // Clear the place
+      const prevObjects = changedProps.objects || [];
+      prevObjects.forEach(obj => state.scene.remove(obj)); // Clear the place
       state.objects.forEach(obj => state.scene.add(obj)); // Add to scene
+
+      // Cancel any in-flight camera tween so it stops driving the camera towards stale targets
+      this._cancelCameraTweens();
+
+      // Converge hover/tooltip state: hovered object must belong to the new object list
+      if (state.hoverObj && !state.objects.includes(state.hoverObj)) {
+        const prevHoverObj = state.hoverObj;
+        state.hoverObj = null;
+        state.intersection = null;
+        state.tooltip?.content(null); // detach tooltip from the removed object
+        state.onHover(null, prevHoverObj, null); // emit a final hover-leave event
+      }
     }
 
     //

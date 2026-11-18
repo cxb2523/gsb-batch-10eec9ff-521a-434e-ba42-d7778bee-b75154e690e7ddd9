@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>regression baseline (all checks, non-aborting)</title>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/node_modules/three/build/three.module.js",
+      "three/webgpu": "/node_modules/three/build/three.webgpu.js",
+      "three/tsl": "/node_modules/three/build/three.tsl.js",
+      "three/addons/": "/node_modules/three/examples/jsm/",
+      "three/examples/jsm/": "/node_modules/three/examples/jsm/"
+    }
+  }
+  </script>
+  <style>
+    html, body { margin: 0; width: 640px; }
+    body > div:not(#results) { width: 640px; height: 480px; position: relative; }
+    #results { display: none; }
+  </style>
+</head>
+<body>
+  <div id="results">PENDING</div>
+  <script type="module">
+    import * as THREE from 'three';
+    window.THREE = THREE;
+    const bundle = new URLSearchParams(location.search).get('bundle') || 'three-render-objects.bundle.mjs';
+    const { default: ThreeRenderObjects } = await import('/test/build/' + bundle);
+
+    const wait = ms => new Promise(r => setTimeout(r, ms));
+    const results = [];
+    const check = (name, fn) => fn()
+      .then(() => results.push('PASS ' + name))
+      .catch(e => results.push('FAIL ' + name + ' :: ' + e.message));
+
+    const makeMesh = (x, label) => {
+      const m = new THREE.Mesh(new THREE.SphereGeometry(10, 12, 12), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+      m.position.set(x, 0, 0); m.userData.label = label; return m;
+    };
+    const pointerAt = (container, x, y) => {
+      const rect = container.getBoundingClientRect();
+      ['pointermove', 'mousemove'].forEach(type =>
+        container.dispatchEvent(new MouseEvent(type, {
+          bubbles: true,
+          clientX: rect.left + x, clientY: rect.top + y,
+          pageX: rect.left + x, pageY: rect.top + y
+        })));
+    };
+    const tipText = c => c.querySelector('.float-tooltip-kap')?.textContent ?? '';
+    const pointAtObject = (inst, obj) => {
+      const w = inst.width(), h = inst.height();
+      for (const [x, y] of [[w/2, h/2], [w/2, h/2+30], [w/2-40, h/2], [w/2+40, h/2+20]]) {
+        if (inst.intersectingObjects(x, y).some(d => d.object === obj)) return { x, y };
+      }
+      throw new Error('no screen point over ' + obj.userData.label);
+    };
+    const make = (hoverEvents) => {
+      const el = document.createElement('div');
+      document.body.appendChild(el);
+      return new ThreeRenderObjects(el, {
+        controlType: 'orbit', waitForLoadComplete: false
+      })
+        .width(640).height(480).showNavInfo(false).pointerRaycasterThrottleMs(0)
+        .tooltipContent(o => 'tip-' + o.userData.label)
+        .onHover((obj, prev, ix) => hoverEvents.push({
+          obj: obj?.userData.label ?? null, prev: prev?.userData.label ?? null, hasIx: !!ix
+        }));
+    };
+
+    await check('hover converges on batch change', async () => {
+      const ev = [];
+      const inst = make(ev).objects([makeMesh(0, 'A'), makeMesh(200, 'B')]);
+      await wait(20); inst.tick();
+      const pt = pointAtObject(inst, inst.objects()[0]);
+      pointerAt(inst.renderer().domElement.parentNode, pt.x, pt.y);
+      await wait(20); inst.tick(); await wait(20);
+      if (!ev.some(e => e.obj === 'A')) throw new Error('precondition hover-enter missing');
+      inst.objects([makeMesh(400, 'C')]);
+      await wait(20);
+      const leaves = ev.filter(e => e.obj === null);
+      if (leaves.length !== 1 || leaves[0].prev !== 'A' || leaves[0].hasIx)
+        throw new Error('expected one onHover(null, A, null), got ' + JSON.stringify(leaves));
+      if (tipText(inst.renderer().domElement.parentNode) !== '') throw new Error('tooltip not cleared');
+      inst._destructor();
+    });
+
+    await check('hover retained when object stays', async () => {
+      const ev = [];
+      const a = makeMesh(0, 'A2');
+      const inst = make(ev).objects([a, makeMesh(200, 'B2')]);
+      await wait(20); inst.tick();
+      const pt = pointAtObject(inst, a);
+      pointerAt(inst.renderer().domElement.parentNode, pt.x, pt.y);
+      await wait(20); inst.tick(); await wait(20);
+      inst.objects([a]);
+      await wait(20); inst.tick();
+      if (ev.some(e => e.obj === null)) throw new Error('unexpected hover-leave');
+      if (!tipText(inst.renderer().domElement.parentNode).includes('tip-A2')) throw new Error('tooltip lost');
+      inst._destructor();
+    });
+
+    await check('cameraPosition tween cancelled', async () => {
+      const inst = make([]).objects([makeMesh(0, 'tA')]);
+      await wait(20);
+      inst.cameraPosition({ x: 500, y: 500, z: 500 }, { x: 0, y: 0, z: 0 }, 2000);
+      inst.tick(); await wait(100); inst.tick();
+      inst.objects([makeMesh(50, 'tB')]);
+      await wait(20);
+      const frozen = inst.camera().position.clone();
+      await wait(150); inst.tick(); await wait(150); inst.tick();
+      const drift = inst.camera().position.distanceTo(frozen);
+      if (drift > 1e-6) throw new Error('camera kept drifting by ' + drift);
+      inst._destructor();
+    });
+
+    await check('lookAt tween cancelled', async () => {
+      const inst = make([]).objects([makeMesh(0, 'lA')]);
+      await wait(20);
+      inst.cameraPosition({ x: 0, y: 0, z: 1000 }, { x: 300, y: 200, z: 100 }, 2000);
+      inst.tick(); await wait(100); inst.tick();
+      inst.objects([makeMesh(60, 'lB')]);
+      await wait(20);
+      const frozen = inst.controls().target.clone();
+      await wait(300); inst.tick(); inst.tick();
+      const drift = inst.controls().target.distanceTo(frozen);
+      if (drift > 1e-6) throw new Error('lookAt target kept drifting by ' + drift);
+      inst._destructor();
+    });
+
+    const failed = results.filter(r => r.startsWith('FAIL')).length;
+    document.getElementById('results').textContent =
+      (failed ? 'FAIL ' : 'PASS ') + results.length + ' checks; ' + results.join(' || ');
+  </script>
+</body>
+</html>

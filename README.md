@@ -104,6 +104,21 @@ new ThreeRenderObjects(<domElement>, { configOptions })
 | <b>getSceneCoords</b>(<i>x</i>, <i>y</i>, <i>distance</i>) | Utility method to translate viewport distance coordinates to the scene 3D domain. Given a set of `x`,`y` viewport coordinates and distance from the camera, returns the current equivalent `{x, y, z}` in 3D scene coordinates. If no distance is provided, defaults to `0`. |
 | <b>intersectingObjects</b>(<i>x</i>, <i>y</i>) | Utility method to retrieve the list of objects under the line of sight of the given viewport coordinates. Returns an array of [intersectObject](https://threejs.org/docs/#api/en/core/Raycaster.intersectObject), sorted by distance (from closest to farthest). |
 
+## Testing
+
+The suite runs in a headless Chromium-based browser via Chrome's `--dump-dom` mode (no DevTools connection required). A local HTTP server serves the pages, and each page writes a `PASS`/`FAIL` result into the DOM which the runner asserts on.
+
+```
+npm test
+```
+
+It first builds a browser test bundle from `src/` (`rollup.config.test.js`, three.js stays external and is served from `node_modules`) and then runs:
+
+- `test/state-convergence.html` — hover convergence (`onHover(null, old, null)` + tooltip cleared, hover retained when the object stays), camera-position tween cancellation, lookAt tween cancellation, and `getBbox`/`zoomToFit` only counting the new object list.
+- `test/regression-all.html` — the same checks in non-aborting form; can be pointed at any bundle via `?bundle=`.
+
+The browser executable is auto-detected from standard Chrome/Edge locations; override with the `CHROME_BIN` environment variable if needed.
+
 [npm-img]: https://img.shields.io/npm/v/three-render-objects
 [npm-url]: https://npmjs.org/package/three-render-objects
 [build-size-img]: https://img.shields.io/bundlephobia/minzip/three-render-objects
