@@ -511,13 +511,11 @@ function addSong(e) {
 	if (cfg.enqueue || cfg.locked)
 		add(li.id);
 	else {
-		load(li.id, 'next');
-		if (cfg.playlist[cfg.index + 1].path != li.path)	// Other songs are set to be played first
+		const index = load(li.id, 'next');
+		if (!cfg.playlist[index] || cfg.playlist[index].path != li.path)	// Other songs are set to be played first
 			return setToast({ 'className': 'error', 'textContent': str.othersongsnext });
-		else {
-			stop();
-			playNext();
-		}
+		stop();
+		playNext();
 	}
 	if (audio[track].paused) fillShare(li.path);
 }
@@ -633,6 +631,7 @@ function endDrag() {
 	dom.playlist.querySelectorAll('#last').forEach(li => dom.playlist.removeChild(li));
 	setTrashPos();
 	drag = null;
+	highlightPlaying();
 }
 
 function dropItem(e) {
@@ -645,39 +644,81 @@ function dropItem(e) {
 	const indexfrom = e.dataTransfer.getData('text');
 	const indexto = getIndex(to);
 	if (indexto != indexfrom) moveItem(drag, to, indexfrom, indexto);
-	if (cfg.index != -1) cls(dom.playlist.childNodes[cfg.index], 'playing', ADD);
+	else highlightPlaying();
 	log('Drag from '+ indexfrom +' to '+ indexto);
 	log('Playback index to '+ cfg.index);
 }
 
+/*
+ * Playlist index maintenance
+ *
+ * All structural changes to cfg.playlist (drag/drop, removal, insertion and
+ * random prefetching) go through changePlaylist(): it remembers which song was
+ * playing and which one was prefetched, lets the caller mutate the array, and
+ * then restores both positions from that identity. This keeps the highlight and
+ * cfg.index on the same song (or on its successor when it was removed) and
+ * makes a stale prefetch impossible to play, without every caller having to
+ * reimplement the index arithmetic.
+ */
+function changePlaylist(mutate) {
+	const other = audio && audio[+!track],
+		prev = {
+			'index': cfg.index,
+			'song': cfg.index != -1 ? cfg.playlist[cfg.index] : null,
+			'prepped': other && other.prepped ? other.song || null : null
+		};
+
+	const result = mutate();
+
+	if (prev.song) {
+		const found = cfg.playlist.indexOf(prev.song);
+		// Removed while playing: fall back to the item that took its place (or the last one)
+		cfg.index = found != -1 ? found : Math.min(prev.index, cfg.playlist.length - 1);
+	} else if (cfg.playlist.length == 0)
+		cfg.index = -1;
+
+	if (other && other.prepped)
+		if (prev.prepped && cfg.playlist.indexOf(prev.prepped) == cfg.index + 1) {
+			other.index = cfg.index + 1;
+			other.song = prev.prepped;
+		} else
+			other.prepped = false;	// PlayNext will re-align before switching
+
+	highlightPlaying();
+	return result;
+}
+
+function highlightPlaying() {
+	if (!dom || !dom.playlist) return;
+	const playing = cfg.index != -1 ? dom.playlist.childNodes[cfg.index] : null;
+	dom.playlist.querySelectorAll('li.playing').forEach(function(li) {
+		if (li !== playing) cls(li, 'playing', REM);
+	});
+	if (playing) cls(playing, 'playing', ADD);
+}
+
 function moveItem(drag, to, indexfrom, indexto) {
-	dom.playlist.insertBefore(drag, to);
-	cfg.playlist.splice(indexto - (indexfrom < indexto ? 1 : 0), 0, cfg.playlist.splice(indexfrom, 1)[0]);
 	log('Playback index from '+ cfg.index);
-	if (cfg.index != -1) {
-		if (indexfrom == cfg.index)
-			cfg.index = indexfrom < indexto ? indexto - 1 : indexto;
-		else if (indexfrom < cfg.index && indexto > cfg.index)
-			cfg.index--;
-		else if (indexfrom > cfg.index && indexto <= cfg.index)
-			cfg.index++;
-	}
+	changePlaylist(function() {
+		dom.playlist.insertBefore(drag, to);
+		cfg.playlist.splice(indexto - (indexfrom < indexto ? 1 : 0), 0, cfg.playlist.splice(indexfrom, 1)[0]);
+	});
+	log('Playback index to '+ cfg.index);
 }
 
 function removeItem(e) {
 	e.preventDefault();
 	e.stopPropagation();
 	const index = getIndex(drag);
-	const playing = index == cfg.index;
-	const [removed] = cfg.playlist.splice(index, 1);
-	dom.playlist.removeChild(dom.playlist.childNodes[index]);
-	if (cfg.index != -1 && index <= cfg.index)
-		cfg.index--;
-	if (cfg.index != -1 && !playing)
-		cls(dom.playlist.childNodes[cfg.index], 'playing', ADD);
+	const removed = changePlaylist(function() {
+		const [song] = cfg.playlist.splice(index, 1);
+		const li = dom.playlist.childNodes[index];
+		if (li) dom.playlist.removeChild(li);
+		return song;
+	});
 	endDrag();
 	resizePlaylist();
-	undimSong(removed.path);
+	if (removed) undimSong(removed.path);
 }
 
 function getIndex(li) {
@@ -818,16 +859,26 @@ function next() {
 	if (!cfg.locked) playNext();
 }
 
+/*
+ * Pick a random song to prefetch from the ordinary entries directly following
+ * the currently playing one. Songs queued with "Play next" keep their FIFO
+ * order, and staying inside that contiguous run means they are never moved.
+ */
+function randomNextIndex() {
+	const start = cfg.index + 1;
+	var end = start;
+	while (end < cfg.playlist.length && !cfg.playlist[end].playNext) end++;
+	if (end == start) return -1;	// Only queued songs left
+	return start + ~~(Math.random() * (end - start));
+}
+
 function prepNext() {
 	if (cfg.playlist.length > cfg.index + 1) {
 		log('prepNext from playlist');
 		if (cfg.random && !cfg.playlist[cfg.index + 1].playNext) {
-			const next = cfg.index + ~~(Math.random() * (cfg.playlist.length - cfg.index));
-			const drag = dom.playlist.childNodes[next],
-				to = dom.playlist.childNodes[cfg.index + 1],
-				indexfrom = next,
-				indexto = cfg.index + 1;
-			moveItem(drag, to, indexfrom, indexto);
+			const next = randomNextIndex();
+			if (next != -1 && next != cfg.index + 1)
+				moveItem(dom.playlist.childNodes[next], dom.playlist.childNodes[cfg.index + 1], next, cfg.index + 1);
 		}
 		load(cfg.index + 1);
 	} else if (cfg.after != 'stopplayback') {
@@ -914,12 +965,16 @@ function load(id, addtoplaylist = false) {
 	log('load('+ id +', addtoplaylist = '+ addtoplaylist +')');
 	clearInterval(retry);
 
-	if (addtoplaylist == 'next') add(id, true);
-	else if (addtoplaylist) add(id);
+	if (addtoplaylist == 'next') var added = add(id, true);
+	else if (addtoplaylist) var added = add(id);
 
 	const a = audio[+!track];
 	a.prepped = true;
-	a.index = addtoplaylist ? cfg.index + 1 : id;
+	// add() returns false when the requested song is already playing, so prep
+	// the current index instead of shifting it; otherwise "Play next" preps the
+	// immediate successor (the head of the FIFO queue), exactly as before.
+	a.index = addtoplaylist ? (added === false ? cfg.index : cfg.index + 1) : id;
+	a.song = cfg.playlist[a.index];	// Identity of the prefetched song, used by changePlaylist()
 	log('a.index = '+ a.index);
 	a.autoplay = false;
 	a.canplaythrough = false;
@@ -935,6 +990,8 @@ function load(id, addtoplaylist = false) {
 			a.load();
 		} else clearInterval(retry);
 	}, 8000);
+
+	return a.index;
 }
 
 function play(id) {
@@ -963,10 +1020,12 @@ function shuffle(e) {
 	while (cfg.playlist[nextIndex] && cfg.playlist[nextIndex].playNext) nextIndex++;
 	if (!cfg.playlist[nextIndex]) return;
 	const range = cfg.playlist.length - nextIndex;
-	for (var i = cfg.playlist.length - 1; i >= nextIndex; i--) {
-		var j = nextIndex + ~~(Math.random() * range);
-		[cfg.playlist[i], cfg.playlist[j]] = [cfg.playlist[j], cfg.playlist[i]];
-	}
+	changePlaylist(function() {
+		for (var i = cfg.playlist.length - 1; i >= nextIndex; i--) {
+			var j = nextIndex + ~~(Math.random() * range);
+			[cfg.playlist[i], cfg.playlist[j]] = [cfg.playlist[j], cfg.playlist[i]];
+		}
+	});
 	buildPlaylist();
 }
 
@@ -1165,8 +1224,8 @@ function add(id, next = false) {
 	var i = nodupes ? -1 : cfg.index;
 	if (cfg.playlist.length > 0) {
 		if (next && cfg.index > -1) {
-			if (s.path == cfg.playlist[i].path) return cfg.index--;	// Currently playing
-			if (cfg.playlist.length > cfg.index + 1 && s.path == cfg.playlist[i+1].path) return;	// Next up
+			if (i > -1 && s.path == cfg.playlist[i].path) return false;	// Currently playing: prep the current index instead
+			if (cfg.playlist.length > cfg.index + 1 && s.path == cfg.playlist[cfg.index + 1].path) return;	// Next up
 		}
 		i++;
 		for (; i < cfg.playlist.length && (next ? cfg.playlist[i].playNext : true); i++) {
@@ -1176,14 +1235,16 @@ function add(id, next = false) {
 	}
 
 	const li = playlistItem(s);
-	if (next) {
-		s.playNext = 1;
-		cfg.playlist.splice(i, 0, s);
-		playlist.insertBefore(li, dom.playlist.childNodes[i]);
-	} else {
-		cfg.playlist.push(s);
-		dom.playlist.appendChild(li);
-	}
+	changePlaylist(function() {
+		if (next) {
+			s.playNext = 1;
+			cfg.playlist.splice(i, 0, s);
+			dom.playlist.insertBefore(li, dom.playlist.childNodes[i]);
+		} else {
+			cfg.playlist.push(s);
+			dom.playlist.appendChild(li);
+		}
+	});
 	cls(songs[id], 'dim', ADD);
 
 	resizePlaylist();
@@ -1204,21 +1265,25 @@ function playNext(ended = false) {
 			delete li.playNext;
 		}
 	}
-	if (cfg.index + 1 == cfg.playlist.length && !audio[+!track].prepped && cfg.after == 'stopplayback') return;
-	if (!audio[+!track].prepped) {
+	const a = audio[+!track];
+	// Drop a prefetch that a drag/delete has made stale: it no longer matches the
+	// song at its index, so it must be re-aligned below instead of played as-is.
+	if (a.prepped && (!cfg.playlist[a.index] || a.song !== cfg.playlist[a.index]
+			|| esc(root + cfg.playlist[a.index].path) != a.getAttribute('src'))) {
+		log('PlayNext: last minute adjustment to playlist detected, prepping next track', true);
+		a.prepped = false;
+	}
+	if (cfg.index + 1 == cfg.playlist.length && !a.prepped && cfg.after == 'stopplayback') return;
+	if (!a.prepped) {
 		log('PlayNext: not prepped');
 		prepNext();
 		stop();
 	}
-	if (audio[+!track].index && (!cfg.playlist[audio[+!track].index] || esc(root + cfg.playlist[audio[+!track].index].path) != audio[+!track].getAttribute('src'))) {
-		log('PlayNext: last minute adjustment to playlist detected, prepping next track', true);
-		prepNext();
-	}
+	if (!a.prepped) return;	// Nothing left to play
 	if (!ended && !cfg.crossfade) stop();
 
 	track ^= 1;
-	const a = audio[track],
-		index = cfg.index = a.index;
+	const index = cfg.index = a.index;
 	start(a);
 
 	const path = cfg.playlist[cfg.index].path,
