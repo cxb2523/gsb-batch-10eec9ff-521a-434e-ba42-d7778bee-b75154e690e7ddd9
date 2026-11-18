@@ -37,6 +37,28 @@ export abstract class Module {
     this.applyParams();
   }
 
+  /**
+   * Replaces this module's whole parameter set when a graph reload reuses the
+   * instance. Every incoming value is pushed through setParam() — the same
+   * path a live UI edit takes — so cached fields are refreshed without
+   * touching DSP state (oscillator phase, delay buffer, slew value). Params
+   * absent from `params` fall back to the module's defaults.
+   */
+  replaceParams(params: ModuleParams): void {
+    this.params = {};
+    let applied = false;
+    for (const [key, value] of Object.entries(params) as Array<
+      [string, number | string | undefined]
+    >) {
+      if (value === undefined) continue;
+      this.setParam(key, value);
+      applied = true;
+    }
+    // With no incoming params no setParam() ran applyParams(); do it here so
+    // omitted params fall back to the module's defaults.
+    if (!applied) this.applyParams();
+  }
+
   protected applyParams(): void {}
 
   getScratchBuffer(): Float32Array {

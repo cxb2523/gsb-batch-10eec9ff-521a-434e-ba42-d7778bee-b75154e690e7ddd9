@@ -48,15 +48,27 @@ export class ModularProcessor extends AudioWorkletProcessor {
   }
 
   loadGraph(graph: Graph): void {
-    this.modules.clear();
+    // Structural edits (adding/removing modules or cables) reload the whole
+    // graph, but a module that still exists under the same id and kind keeps
+    // its instance: oscillator phase, delay line contents, slew state and
+    // scratch buffers all survive the reload, so live patches don't click.
+    // Only params and the input/output wiring are refreshed.
+    const nextModules = new Map<string, Module>();
+    for (const modDef of graph.modules) {
+      const existing = this.modules.get(modDef.id);
+      if (existing && existing.kind === modDef.kind) {
+        existing.replaceParams(modDef.params || {});
+        nextModules.set(modDef.id, existing);
+      } else {
+        nextModules.set(modDef.id, this.createModule(modDef));
+      }
+    }
+    this.modules = nextModules;
+
     this.sortedModules = [];
     this.outputModule = null;
-
-    for (const modDef of graph.modules) {
-      const module = this.createModule(modDef);
-      this.modules.set(modDef.id, module);
-
-      if (modDef.kind === 'OUTPUT') {
+    for (const module of this.modules.values()) {
+      if (module.kind === 'OUTPUT') {
         this.outputModule = module as OutputModule;
       }
     }
