@@ -1,6 +1,7 @@
 """Real ASGI WebSocket authorization tests with no model/network calls."""
 
 import asyncio
+import json
 from uuid import uuid4
 
 import pytest
@@ -442,3 +443,252 @@ def test_long_history_has_independent_budget_and_retriable_page(monkeypatch, mod
             assert [event["payload"]["event_id"] for event in received] == list(range(1, 3102))
             host.send_json({"event_type": "chat", "data": {"message": "Still connected"}})
             assert receive_until(host, "chat_echo")["payload"]["chat"] == "Still connected"
+
+
+def _drain_available(socket):
+    """Receive every already-queued event without blocking on the portal's receive channel."""
+    messages = []
+
+    async def collect():
+        while socket._send_rx.statistics().current_buffer_used:
+            message = await socket._send_rx.receive()
+            if message["type"] == "websocket.close":
+                raise WebSocketDisconnect(message.get("code", 1000))
+            messages.append(message)
+
+    socket.portal.call(collect)
+    return [json.loads(message["text"]) for message in messages]
+
+
+def _start_two_player_game(client):
+    """Authenticate host plus one player and advance into an active two-player game."""
+    host_id, player_id = str(uuid4()), str(uuid4())
+    host = client.websocket_connect(f"/ws/{host_id}").__enter__()
+    authenticate(host, host_id)
+    host_token = receive_until(host, "auth_ok")["payload"]["reconnect_token"]
+    host.send_json({"event_type": "scenario_init", "data": {"scenario": "A cabin."}})
+    receive_until(host, "scenario_ready")
+    player = client.websocket_connect(f"/ws/{player_id}").__enter__()
+    authenticate(player, player_id, "Arxs", settings.server.player_password)
+    player_token = receive_until(player, "auth_ok")["payload"]["reconnect_token"]
+    host.send_json({"event_type": "start_game", "data": {}})
+    receive_until(player, "turn_directive")
+    return host, player, host_id, player_id, host_token, player_token
+
+
+def test_reconnect_takeover_closes_old_socket_without_disconnect_side_effects():
+    """A valid reconnect replaces the socket while the player stays present and in turn order."""
+    app = create_app(FakeResolver)
+    with TestClient(app) as client:
+        host, player, _, player_id, _, player_token = _start_two_player_game(client)
+        try:
+            engine = app.state.engine
+            host.send_json({"event_type": "action", "data": {"action": "Open the door"}})
+            receive_until(
+                player,
+                "turn_directive",
+                lambda event: event["payload"]["active_player_id"] == player_id,
+            )
+            # The queue position is fixed by play; reconnect itself must not rotate it.
+            queue_before = list(engine.turn_queue)
+            with client.websocket_connect(f"/ws/{player_id}") as recovered:
+                authenticate(
+                    recovered,
+                    player_id,
+                    "Arxs",
+                    settings.server.player_password,
+                    player_token,
+                )
+                snapshot = receive_until(recovered, "auth_ok")["payload"]
+                assert snapshot["client_id"] == player_id
+                # The replaced socket is closed with the takeover code, not a transport failure.
+                with pytest.raises(WebSocketDisconnect) as exc:
+                    player.receive_json()
+                assert exc.value.code == 4001
+                # No departure side effects: the character never left the party or the queue.
+                present = engine.players[player_id]
+                assert present.is_connected
+                assert not present.departure_pending and not present.return_pending
+                assert list(engine.turn_queue) == queue_before
+                # Everything already queued for the host carries no departure announcement.
+                host_events = _drain_available(host)
+                assert all(
+                    event["payload"].get("msg") != "Arxs disconnected." for event in host_events
+                )
+                # The reconnected socket owns the character and can act in its original place.
+                recovered.send_json({"event_type": "chat", "data": {"message": "Still here"}})
+                assert receive_until(recovered, "chat_echo")["payload"]["name"] == "Arxs"
+        finally:
+            player.__exit__(None, None, None)
+            host.__exit__(None, None, None)
+
+
+def test_late_old_socket_disconnect_cannot_mark_the_replacement_offline():
+    """The old socket's disconnect event arriving after reauth must not touch the new connection."""
+    app = create_app(FakeResolver)
+    with TestClient(app) as client:
+        host, player, _, player_id, _, player_token = _start_two_player_game(client)
+        try:
+            engine = app.state.engine
+            host.send_json({"event_type": "action", "data": {"action": "Open the door"}})
+            receive_until(
+                player,
+                "turn_directive",
+                lambda event: event["payload"]["active_player_id"] == player_id,
+            )
+            before_version = engine.players[player_id].connection_version
+            recovered = client.websocket_connect(f"/ws/{player_id}").__enter__()
+            try:
+                authenticate(
+                    recovered,
+                    player_id,
+                    "Arxs",
+                    settings.server.player_password,
+                    player_token,
+                )
+                receive_until(recovered, "auth_ok")
+                with pytest.raises(WebSocketDisconnect) as exc:
+                    player.receive_json()
+                assert exc.value.code == 4001
+                # The replaced socket's endpoint finally block runs as its context is torn down.
+                player.__exit__(None, None, None)
+                # Pump the portal so the late disconnect cleanup fully settles while the new
+                # socket remains the active owner of the character.
+                client.portal.call(lambda: asyncio.sleep(0))
+                present = engine.players[player_id]
+                assert present.is_connected
+                assert present.connection_version == before_version
+                assert not present.departure_pending
+                # No idle action was injected for a player whose new socket is still active...
+                assert player_id not in engine.round_buffer
+                assert engine.active_player_id == player_id
+                # ...and no departure announcement reached the host after the late cleanup settled.
+                host_events = _drain_available(host)
+                assert all(
+                    event["payload"].get("msg") != "Arxs disconnected." for event in host_events
+                )
+                # The replacement still owns the turn; its action is accepted normally.
+                recovered.send_json({"event_type": "action", "data": {"action": "Guard the door"}})
+                echo = receive_until(recovered, "action_echo")["payload"]
+                assert echo["action"] == "Guard the door"
+                assert echo["player_name"] == "Arxs"
+            finally:
+                recovered.__exit__(None, None, None)
+        finally:
+            host.__exit__(None, None, None)
+
+
+def test_reconnected_history_requests_keep_their_own_budget(monkeypatch):
+    """Journal catch-up after reconnect must not consume or be blocked by the chat budget."""
+    from api import admission
+
+    settings.server.player_messages_per_window = 2
+    settings.server.player_message_window_seconds = 10.0
+    now = [100.0]
+    monkeypatch.setattr(admission, "monotonic", lambda: now[0])
+    app = create_app(FakeResolver)
+    with TestClient(app) as client:
+        host_id = str(uuid4())
+        with client.websocket_connect(f"/ws/{host_id}") as host:
+            authenticate(host, host_id)
+            token = receive_until(host, "auth_ok")["payload"]["reconnect_token"]
+            # The window holds two chat messages; the third is rejected.
+            for number in range(2):
+                host.send_json({"event_type": "chat", "data": {"message": f"Chat {number}"}})
+                receive_until(host, "chat_echo")
+            host.send_json({"event_type": "chat", "data": {"message": "Overflow"}})
+            blocked = host.receive_json()
+            assert blocked["type"] == "error"
+            assert blocked["payload"]["msg"] == "Message rate exceeded; please wait."
+            # Reconnect on a fresh socket; budgets are keyed by client id and intentionally kept.
+            with client.websocket_connect(f"/ws/{host_id}") as recovered:
+                authenticate(recovered, host_id, reconnect_token=token)
+                receive_until(recovered, "auth_ok")
+                # The rejoin broadcasts a public system message to every active socket;
+                # drain it so the rate-limit reply is the next event under assertion.
+                queued = _drain_available(recovered)
+                assert queued and all(
+                    event["type"] in {"system_msg", "player_roster"} for event in queued
+                )
+                # The chat budget is still exhausted...
+                recovered.send_json({"event_type": "chat", "data": {"message": "Blocked"}})
+                assert recovered.receive_json()["payload"]["msg"] == (
+                    "Message rate exceeded; please wait."
+                )
+                # ...but the independent history budget admits catch-up pages right away.
+                recovered.send_json(
+                    {
+                        "event_type": "journal_request",
+                        "data": {
+                            "mode": "replay",
+                            "after": 0,
+                            "limit": 100,
+                            "search": "",
+                        },
+                    }
+                )
+                page = receive_until(recovered, "journal_page")["payload"]
+                assert page["mode"] == "replay"
+                # Thirty history requests fit inside the dedicated window on the reconnected
+                # socket, proving history paging is independent of the chat allowance.
+                for _ in range(29):
+                    recovered.send_json(
+                        {
+                            "event_type": "journal_request",
+                            "data": {
+                                "mode": "history",
+                                "after": 0,
+                                "limit": 100,
+                                "search": "",
+                            },
+                        }
+                    )
+                    receive_until(recovered, "journal_page")
+                recovered.send_json(
+                    {
+                        "event_type": "journal_request",
+                        "data": {
+                            "mode": "history",
+                            "after": 0,
+                            "limit": 100,
+                            "search": "",
+                        },
+                    }
+                )
+                limited = receive_until(recovered, "error")["payload"]
+                assert limited["code"] == "journal_rate_limited"
+                # History exhaustion must not spend any of the player chat allowance.
+                now[0] += 11
+                recovered.send_json({"event_type": "chat", "data": {"message": "Chat later"}})
+                assert receive_until(recovered, "chat_echo")["payload"]["chat"] == "Chat later"
+
+
+def test_successful_reconnect_keeps_accumulated_source_auth_failures():
+    """A reconnect must not erase earlier failed logins accumulated for the source address."""
+    settings.server.failed_logins_per_source = 3
+    app = create_app(FakeResolver)
+    with TestClient(app) as client:
+        host_id = str(uuid4())
+        with client.websocket_connect(f"/ws/{host_id}") as host:
+            authenticate(host, host_id)
+            token = receive_until(host, "auth_ok")["payload"]["reconnect_token"]
+            # Two failed attempts from this source leave one record of headroom in the budget.
+            for _ in range(2):
+                probe_id = str(uuid4())
+                with client.websocket_connect(f"/ws/{probe_id}") as probe:
+                    authenticate(probe, probe_id, password="wrong")
+                    assert probe.receive_json()["type"] == "error"
+            # A legitimate reconnect succeeds without clearing the accumulated failures.
+            with client.websocket_connect(f"/ws/{host_id}") as recovered:
+                authenticate(recovered, host_id, reconnect_token=token)
+                receive_until(recovered, "auth_ok")
+            # The next failed attempt fills the budget and locks out the source address.
+            probe_id = str(uuid4())
+            with client.websocket_connect(f"/ws/{probe_id}") as probe:
+                authenticate(probe, probe_id, password="wrong")
+                assert probe.receive_json()["type"] == "error"
+            # Even a valid reconnect is now refused at the handshake until the window expires.
+            with pytest.raises(WebSocketDisconnect) as exc:
+                with client.websocket_connect(f"/ws/{host_id}"):
+                    pass
+            assert exc.value.code == 1013
