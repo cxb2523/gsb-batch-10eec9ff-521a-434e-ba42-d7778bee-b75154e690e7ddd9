@@ -50,13 +50,32 @@ export type GlassViewSpec = {
   cursorLight?: boolean
   /** Redraw every frame even while nothing moves (the naive loop the site's demo compares against). */
   alwaysRender?: boolean
+  /**
+   * Skip the first-frame shader-compile verification (test environments without a real GPU
+   * cannot produce pixels, so the blank-pixel retry would otherwise loop on every frame).
+   * Production views leave this unset and keep the default 240-frame verification window.
+   */
+  skipFirstFrameVerify?: boolean
 }
 
-/** Running totals for one view: GPU passes and main-thread time spent in them. */
-export type GlassViewStats = { renders: number; ms: number }
+/** Running totals for one view: GPU passes, main-thread time, and layer texture uploads. */
+export type GlassViewStats = {
+  renders: number
+  ms: number
+  /** Per-layer texture upload requests (test instrumentation; zero in production stubs). */
+  bgUploads?: number
+  fgUploads?: number
+}
 
 export type GlassViewHandle = {
   invalidate: () => void
+  /**
+   * The nearest data-theme ancestor changed. On-screen views repaint at the new theme this
+   * frame; off-screen views only remember it (low-power devices don't even queue it) and
+   * catch up when they scroll back. Equivalent to the document-level MutationObserver path,
+   * callable directly from React's theme-prop re-renders.
+   */
+  themeChanged: () => void
   dispose: () => void
   stats: () => GlassViewStats
 }
@@ -78,6 +97,13 @@ type View = {
   devH: number
   dpr: number
   dirty: boolean
+  /**
+   * A theme change happened while this view existed. Unlike `dirty` it survives being
+   * off-screen untouched: an off-screen view is only marked (cheap bookkeeping) and is
+   * repainted at the current theme the next time the IntersectionObserver puts it back
+   * on screen. Low-power views never get this flag while off-screen (see scheduleThemeSync).
+   */
+  themeDirty: boolean
   visible: boolean
   ready: boolean
   /** Renders left to confirm the first frame really reached the canvas. */
@@ -307,23 +333,72 @@ async function createRuntime() {
   const quad = new THREE.PlaneGeometry(2, 2)
   const views = new Set<View>()
   const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)')
+  // Phones/tablets and narrow viewports: an off-screen queue of theme-dirty views would
+  // still cost observer bookkeeping and a burst of work on every scroll-back. There the
+  // off-screen views opt out of theme sync entirely and get repainted on demand when they
+  // re-enter the viewport, where the current theme is read directly from the DOM.
+  const lowPowerQuery = window.matchMedia('(pointer: coarse), (max-width: 767px)')
 
   const io = new IntersectionObserver((entries) => {
     for (const entry of entries) {
       for (const v of views) {
         if (v.canvas === entry.target) {
+          const wasVisible = v.visible
           v.visible = entry.isIntersecting
-          if (v.visible) v.dirty = true
+          // Re-entering the viewport: repaint once at whatever theme is current now.
+          // This covers both a theme change that happened while scrolled away (the flag
+          // set by scheduleThemeSync) and low-power views, which never receive the flag —
+          // a plain dirty still makes render() re-read themeOf() and --glass-surface.
+          if (v.visible && !wasVisible) {
+            v.dirty = true
+            v.themeDirty = false
+          }
         }
       }
     }
   })
-  // Theme switches anywhere re-render every view.
-  new MutationObserver(() => views.forEach((v) => (v.dirty = true))).observe(document.documentElement, {
+
+  // Theme switches re-render every *on-screen* view this frame. Off-screen views are only
+  // marked themeDirty — no render, no texture upload — and wait until they scroll back.
+  // The observer callback can fire several times inside one frame (rapid toggles, nested
+  // data-theme subtrees); coalesce to a single rAF so only the last theme reaches the GPU.
+  let themeFrame = 0
+  function markViewForTheme(v: View) {
+    if (v.visible) v.dirty = true
+    else if (!lowPowerQuery.matches) v.themeDirty = true
+  }
+  function scheduleThemeSync() {
+    if (themeFrame) return
+    themeFrame = requestAnimationFrame(() => {
+      themeFrame = 0
+      for (const v of views) markViewForTheme(v)
+    })
+  }
+  new MutationObserver(scheduleThemeSync).observe(document.documentElement, {
     attributes: true,
     attributeFilter: ['data-theme'],
     subtree: true,
   })
+
+  // A window resize or zoom changes CSS layout size and/or devicePixelRatio. Layers are
+  // rebuilt lazily inside render() via resizeLayers(), but an idle view would never call
+  // it — so mark every view dirty here. The mark carries no colors of its own: the
+  // rebuilt layers and --glass-surface are read at whatever theme is current at render
+  // time (resizeLayers also resets the cached surface), never from a stale theme snapshot.
+  // rAF-coalesced like theme syncs, so a burst of resize events costs one mark per view.
+  let resizeFrame = 0
+  const scheduleResizeSync = () => {
+    if (resizeFrame) return
+    resizeFrame = requestAnimationFrame(() => {
+      resizeFrame = 0
+      for (const v of views) {
+        if (v.visible) v.dirty = true
+        else if (!lowPowerQuery.matches) v.themeDirty = true
+      }
+    })
+  }
+  window.addEventListener('resize', scheduleResizeSync, { passive: true })
+  window.addEventListener('orientationchange', scheduleResizeSync)
 
   function resizeLayers(v: View, spec: GlassViewSpec) {
     const dpr = Math.min(window.devicePixelRatio || 1, 2)
@@ -342,6 +417,12 @@ async function createRuntime() {
       // A texture can't change size in place; dispose so it re-uploads at the new size.
       ;(layer === 'bg' ? v.bgTex : v.fgTex).dispose()
     }
+    // The layers were just destroyed: the cached surface color and any pending theme mark
+    // are stale now. Force render() to re-read themeOf() and --glass-surface at the
+    // *current* theme rather than re-uploading the cached colors into the rebuilt textures.
+    v.surface = ''
+    v.themeDirty = true
+    v.dirty = true
   }
 
   // Cursor light, shared by every view. `mix` fades in on the first move and out when the
@@ -429,6 +510,9 @@ async function createRuntime() {
     setVec3(u.frostCenter, lens.frostCenter ?? tokens.frostCenter)
     setVec3(u.frostEdge, lens.frostEdge ?? tokens.frostEdge)
     // What the glass sits on (a card, the page) comes from CSS so nested glass matches it.
+    // Every repaint that was requested (dirty, a theme switch or a layer rebuild) re-reads
+    // the variable at the current theme; the cached value only serves re-shade passes that
+    // redraw nothing (cursor light movement), where the theme cannot have changed anyway.
     if (refresh || !v.surface) v.surface = getComputedStyle(v.canvas).getPropertyValue('--glass-surface').trim() || tokens.surface
     setVec3(u.surface, v.surface.startsWith('#') ? v.surface : tokens.surface)
     u.lensOn.value = lens.visible === false ? 0 : 1
@@ -442,7 +526,7 @@ async function createRuntime() {
 
     // The lens interior is always opaque. If its center came out empty the program
     // wasn't linked yet (parallel shader compile), so try again next frame.
-    if (v.verifyLeft > 0 && lens.visible !== false) {
+    if (v.verifyLeft > 0 && lens.visible !== false && !spec.skipFirstFrameVerify) {
       const px = Math.round(lens.x * spec.unit * v.dpr)
       const py = Math.round(lens.y * spec.unit * v.dpr)
       const inside = px >= 0 && py >= 0 && px < v.devW && py < v.devH
@@ -466,10 +550,18 @@ async function createRuntime() {
       if (!v.ready) continue
       const spec = v.spec()
       const moving = spec.step?.(dt, reducedMotion.matches) ?? false
-      if (!v.visible) continue
+      if (!v.visible) {
+        // Off-screen views never render. A theme switch only left themeDirty behind (or
+        // nothing at all on low-power devices); it is consumed on the frame the view
+        // re-enters the viewport, so no off-screen GPU work or texture upload ever happens.
+        continue
+      }
+      // A theme change queued while the view was off-screen falls due now that it is visible.
+      if (v.themeDirty) v.dirty = true
       if (moving || v.dirty || spec.alwaysRender) {
         const refresh = v.dirty
         v.dirty = false
+        v.themeDirty = false
         render(v, refresh)
       } else if (relight && v.devW > 0) {
         // Only the light moved: re-shade with the existing layers, no redraw or upload.
@@ -510,9 +602,10 @@ async function createRuntime() {
         devH: 0,
         dpr: 0,
         dirty: true,
+        themeDirty: false,
         visible: true,
         ready: false,
-        verifyLeft: 240,
+        verifyLeft: spec().skipFirstFrameVerify ? 0 : 240,
         surface: '',
         lensX: 0,
         lensY: 0,
@@ -528,7 +621,13 @@ async function createRuntime() {
         invalidate: () => {
           view.dirty = true
         },
-        stats: () => ({ renders: view.renders, ms: view.renderMs }),
+        themeChanged: () => markViewForTheme(view),
+        stats: () => ({
+          renders: view.renders,
+          ms: view.renderMs,
+          bgUploads: (view.bgTex as { needsUpdateCount?: number }).needsUpdateCount,
+          fgUploads: (view.fgTex as { needsUpdateCount?: number }).needsUpdateCount,
+        }),
         dispose: () => {
           views.delete(view)
           io.unobserve(canvas)
@@ -547,4 +646,13 @@ let runtime: ReturnType<typeof createRuntime> | null = null
 export function getGlassRuntime() {
   runtime ??= createRuntime()
   return runtime
+}
+
+/**
+ * Drops the shared renderer so the next getGlassRuntime() builds a fresh one. Test-only:
+ * the runtime is a module singleton holding views and observers that would otherwise leak
+ * across test cases.
+ */
+export function __resetGlassRuntimeForTests() {
+  runtime = null
 }
