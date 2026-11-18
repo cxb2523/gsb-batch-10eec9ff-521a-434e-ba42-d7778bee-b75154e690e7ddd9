@@ -38,8 +38,19 @@ export class AsciiRenderer {
   private animId:       number | null = null;
   private sourceTex:    THREE.Texture | null = null;
 
+  // Character grid state.  Kept in sync with uCellCount so the CPU-side text
+  // export samples exactly the same cells the shader rendered.
+  private cssWidth:     number = 0;
+  private cssHeight:    number = 0;
+  private gridCols:     number = 1;
+  private gridRows:     number = 1;
+
   constructor(canvas: HTMLCanvasElement, config: RendererConfig) {
     this.config = { ...config };
+
+    this.cssWidth  = canvas.clientWidth;
+    this.cssHeight = canvas.clientHeight;
+    this.updateGridState();
 
     this.renderer = new THREE.WebGLRenderer({
       canvas,
@@ -69,7 +80,8 @@ export class AsciiRenderer {
     const size    = this.renderer.getSize(new THREE.Vector2());
     this.edgeFBO  = this.makeEdgeFBO(size.x, size.y);
     this.edgeMat  = this.makeEdgeMat(size.x, size.y);
-    this.asciiMat = this.makeAsciiMat(size.x, size.y);
+    this.asciiMat = this.makeAsciiMat();
+    this.syncCellCountUniform();
 
     // Scene graphs — one mesh per pass
     const edgeMesh  = new THREE.Mesh(this.geometry, this.edgeMat);
@@ -112,9 +124,18 @@ export class AsciiRenderer {
       || patch.fontFamily !== undefined;
 
     if (needsAtlas) this.rebuildAtlas();
+
+    // Cell size changes reshape the character grid used by both the shader
+    // and the text export.
+    if (patch.cellSize !== undefined) {
+      this.updateGridState();
+      this.syncCellCountUniform();
+    }
   }
 
   resize(cssWidth: number, cssHeight: number): void {
+    this.cssWidth  = cssWidth;
+    this.cssHeight = cssHeight;
     this.renderer.setSize(cssWidth, cssHeight, false);
 
     // Actual pixel dimensions after DPR scaling
@@ -124,9 +145,10 @@ export class AsciiRenderer {
     this.edgeFBO.setSize(w, h);
     this.edgeMat.uniforms['uTexelSize'].value.set(1 / w, 1 / h);
 
-    const cols = Math.max(1, Math.floor(cssWidth  / this.config.cellSize));
-    const rows = Math.max(1, Math.floor(cssHeight / this.config.cellSize));
-    this.asciiMat.uniforms['uCellCount'].value.set(cols, rows);
+    // Recompute the character grid on the CSS-pixel dimensions (same units
+    // as cellSize) and push it to the shader.
+    this.updateGridState();
+    this.syncCellCountUniform();
   }
 
   render(): void {
@@ -181,13 +203,21 @@ export class AsciiRenderer {
 
   /**
    * Convert the current rendered frame to plain ASCII text via a 2D canvas
-   * pixel readback. High-luminance cells map to dense charset characters,
-   * low-luminance cells map to sparse ones.
+   * pixel readback.  Sampling uses the same cols×rows character grid the
+   * shader rendered with, so the exported text matches the visible frame.
+   *
+   * Each grid cell covers the same slice of the frame the shader assigns to
+   * it (columns/rows split evenly across the full width/height, matching
+   * `floor(vUv * uCellCount)`).  The average luminance of a cell's pixel
+   * region is mapped to a charset index the same way ascii.frag.glsl maps
+   * intensity: dense characters (index 0) for bright cells, sparse ones
+   * (index n-1) for dark cells.
    */
   generateAsciiText(): string {
     const src = this.renderer.domElement;
     const w   = src.width;
     const h   = src.height;
+    if (w === 0 || h === 0) return '';
 
     const tmp = document.createElement('canvas');
     tmp.width  = w;
@@ -197,32 +227,45 @@ export class AsciiRenderer {
     ctx.drawImage(src, 0, 0);
     const { data: px } = ctx.getImageData(0, 0, w, h);
 
-    const { cellSize, charset } = this.config;
-    const n    = charset.length;
-    const cols = Math.max(1, Math.floor(w / cellSize));
-    const rows = Math.max(1, Math.floor(h / cellSize));
-    const lines: string[] = [];
+    // Mirror GlyphAtlas: duplicates are dropped while preserving order, so
+    // the text indices and the shader's uCharCount refer to the same glyphs.
+    const chars   = [...new Set([...this.config.charset])];
+    const n       = chars.length;
+    if (n === 0) return '';
+    const cols    = this.gridCols;
+    const rows    = this.gridRows;
 
+    // Cell boundaries in device pixels, derived from the shader's own cell
+    // rule floor(uv * uCellCount) sampled at each pixel centre, so edge cells
+    // are neither clipped nor double-counted.
+    const xEdges = cellBoundaries(cols, w);
+    const yEdges = cellBoundaries(rows, h);
+
+    const lines: string[] = [];
     for (let row = 0; row < rows; row++) {
       let line = '';
+      const y0 = yEdges[row];
+      const y1 = yEdges[row + 1];
       for (let col = 0; col < cols; col++) {
-        const x0 = Math.floor(col * w / cols);
-        const x1 = Math.floor((col + 1) * w / cols);
-        const y0 = Math.floor(row * h / rows);
-        const y1 = Math.floor((row + 1) * h / rows);
+        const x0 = xEdges[col];
+        const x1 = xEdges[col + 1];
+
         let sum = 0, cnt = 0;
         for (let y = y0; y < y1; y++) {
+          const rowOffset = y * w;
           for (let x = x0; x < x1; x++) {
-            const i = (y * w + x) * 4;
+            const i = (rowOffset + x) * 4;
             sum += px[i] * 0.2126 + px[i + 1] * 0.7152 + px[i + 2] * 0.0722;
             cnt++;
           }
         }
         const lum = cnt > 0 ? sum / (cnt * 255) : 0;
-        // Dense charset chars are at index 0 (@), sparse/space at index n-1.
-        // High luminance = more fg pixels = denser character = lower index.
-        const idx = Math.min(n - 1, Math.floor((1 - lum) * n));
-        line += charset[idx];
+
+        // ascii.frag.glsl: charIndex = floor(intensity * (charCount - 1)),
+        // where intensity ~ luminance.  Index 0 is the densest glyph, so a
+        // bright cell selects a low index and a dark cell a high one.
+        const idx = Math.min(n - 1, Math.floor((1 - lum) * (n - 1)));
+        line += chars[idx];
       }
       lines.push(line);
     }
@@ -242,6 +285,23 @@ export class AsciiRenderer {
   // -------------------------------------------------------------------------
   // Private helpers
   // -------------------------------------------------------------------------
+
+  /**
+   * Recompute the character grid from the current CSS dimensions and
+   * cellSize.  Both the shader uniform and generateAsciiText() read this
+   * state, so the on-screen glyph grid and the copied text always share the
+   * same cols/rows.
+   */
+  private updateGridState(): void {
+    const cellSize = Math.max(1, this.config.cellSize);
+    this.gridCols = Math.max(1, Math.floor(this.cssWidth  / cellSize));
+    this.gridRows = Math.max(1, Math.floor(this.cssHeight / cellSize));
+  }
+
+  /** Push the current grid dimensions into the shader's uCellCount uniform. */
+  private syncCellCountUniform(): void {
+    this.asciiMat.uniforms['uCellCount'].value.set(this.gridCols, this.gridRows);
+  }
 
   private buildAtlasTex(): THREE.CanvasTexture {
     const tex       = new THREE.CanvasTexture(this.atlas.canvas);
@@ -272,10 +332,8 @@ export class AsciiRenderer {
     });
   }
 
-  private makeAsciiMat(cssW: number, cssH: number): THREE.RawShaderMaterial {
+  private makeAsciiMat(): THREE.RawShaderMaterial {
     const { metrics } = this.atlas;
-    const cols = Math.max(1, Math.floor(cssW / this.config.cellSize));
-    const rows = Math.max(1, Math.floor(cssH / this.config.cellSize));
 
     return new THREE.RawShaderMaterial({
       glslVersion:    THREE.GLSL3,
@@ -285,7 +343,7 @@ export class AsciiRenderer {
         uSource:     { value: null },
         uEdge:       { value: this.edgeFBO.texture },
         uAtlas:      { value: this.atlasTex },
-        uCellCount:  { value: new THREE.Vector2(cols, rows) },
+        uCellCount:  { value: new THREE.Vector2(this.gridCols, this.gridRows) },
         uAtlasDims:  { value: new THREE.Vector2(metrics.cols, metrics.rows) },
         uEdgeWeight: { value: this.config.edgeWeight },
         uContrast:   { value: this.config.contrast },
@@ -310,4 +368,23 @@ export class AsciiRenderer {
     u['uAtlasDims'].value.set(this.atlas.metrics.cols, this.atlas.metrics.rows);
     u['uCharCount'].value = this.atlas.metrics.charCount;
   }
+}
+
+/**
+ * Device-pixel boundaries of `count` evenly spaced cells across `extent`
+ * pixels, returned as an array of `count + 1` offsets.
+ *
+ * A pixel x belongs to cell c when floor((x + 0.5) / extent * count) === c,
+ * i.e. the shader's `floor(vUv * uCellCount)` evaluated at the pixel centre.
+ * Solving for x gives the boundary ceil(c * extent / count - 0.5), so the CPU
+ * cell partition matches the GPU one exactly — including the last partial cell
+ * at the right/bottom edge.
+ */
+function cellBoundaries(count: number, extent: number): number[] {
+  const edges = new Array<number>(count + 1);
+  for (let i = 0; i <= count; i++) {
+    const edge = Math.ceil((i * extent) / count - 0.5);
+    edges[i] = Math.min(extent, Math.max(0, edge));
+  }
+  return edges;
 }
