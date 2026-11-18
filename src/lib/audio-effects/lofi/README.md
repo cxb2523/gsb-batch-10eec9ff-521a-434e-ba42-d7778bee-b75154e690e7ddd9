@@ -3,9 +3,10 @@
 A byte-identical copy of files from the lovelofi monorepo
 (`github.com/lovelofi/app`, `packages/shared/src`), in the same relative layout
 so their imports work unchanged. Taken at commit `9764a46` on 2026-10-26.
-Nothing in this folder is edited; Chorus-specific code lives beside it
-(`../lofi-rack.ts`) and in `$lib/stores/lofi.ts` and
-`$lib/audio-effects/quick-presets.ts`. A sync is a copy and a diff:
+Apart from one change described below, nothing in this folder is edited;
+Chorus-specific code lives beside it (`../lofi-rack.ts`) and in
+`$lib/stores/lofi.ts` and `$lib/audio-effects/quick-presets.ts`. A sync is a
+copy and a diff:
 
     LOVELOFI=~/funspace/lovelofi/app/packages/shared/src
     (cd src/lib/audio-effects/lofi && find . -name '*.ts') | while read -r f; do
@@ -31,3 +32,14 @@ Left out on purpose:
 
 The `*.test.ts` files run under `bun run test` against the Web Audio mocks in
 `src/test/setup.ts`, also copied from lovelofi.
+
+## Local change: `audio/effects/vinyl-crackle.ts`
+
+`destroy()` only stopped sources that already existed, so a sample whose fetch
+and decode were still in flight when the rack was destroyed started a fresh
+looping source afterwards — audible with the rack gone and the extension
+bypassed. The file now carries a `destroyed` flag: `loadSample` drops its
+buffer instead of starting playback, `startSamplePlayback` and
+`initSyntheticFallback` return early, and `destroy()` disconnects its output.
+Nothing about the effect's sound changed. This is the one intentional
+divergence to keep when syncing from lovelofi; upstream may want the same fix.

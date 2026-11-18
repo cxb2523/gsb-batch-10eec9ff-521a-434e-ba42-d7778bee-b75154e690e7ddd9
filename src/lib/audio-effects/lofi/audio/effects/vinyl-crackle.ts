@@ -7,6 +7,7 @@ export class VinylCrackleEffect {
   private _intensity = 30;
   private sampleBuffer: AudioBuffer | null = null;
   private usingSynthetic = false;
+  private destroyed = false;
 
   // Synthetic fallback nodes
   private syntheticSources: AudioBufferSourceNode[] = [];
@@ -37,12 +38,16 @@ export class VinylCrackleEffect {
   private async loadSample(url: string): Promise<void> {
     const response = await fetch(url);
     const arrayBuffer = await response.arrayBuffer();
-    this.sampleBuffer = await this.ctx.decodeAudioData(arrayBuffer);
+    const decoded = await this.ctx.decodeAudioData(arrayBuffer);
+    // destroy() may have landed while the sample was loading: drop it rather
+    // than start a loop nobody owns.
+    if (this.destroyed) return;
+    this.sampleBuffer = decoded;
     this.startSamplePlayback();
   }
 
   private startSamplePlayback(): void {
-    if (!this.sampleBuffer) return;
+    if (this.destroyed || !this.sampleBuffer) return;
     this.stopSources();
 
     this.source = this.ctx.createBufferSource();
@@ -53,6 +58,7 @@ export class VinylCrackleEffect {
   }
 
   private initSyntheticFallback(): void {
+    if (this.destroyed) return;
     this.usingSynthetic = true;
 
     this.hissGain = this.ctx.createGain();
@@ -203,6 +209,12 @@ export class VinylCrackleEffect {
   }
 
   destroy(): void {
+    this.destroyed = true;
     this.stopSources();
+    try {
+      this.gainNode.disconnect();
+    } catch {
+      // never connected
+    }
   }
 }

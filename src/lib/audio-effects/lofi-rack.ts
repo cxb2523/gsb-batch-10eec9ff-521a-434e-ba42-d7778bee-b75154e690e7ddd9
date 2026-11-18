@@ -78,6 +78,14 @@ export class LofiRack {
     private processed?: GainNode
     private texture?: GainNode
     private sourceActive = true
+    /** The state the last setEffects asked for, replayed when the nodes exist. */
+    private settings: EffectSettings = normalizeEffectSettings(DEFAULT_EFFECT_SETTINGS)
+    /** True while no effect is on: the dry path is in use. Starts bypassed. */
+    private bypassed = true
+    /** Set by destroy(); a late sample load or a late build must not revive sound. */
+    private destroyed = false
+    /** Bumped per build so a destroy/re-init race has an unambiguous winner. */
+    private generation = 0
     private ready?: Promise<void>
 
     constructor(ctx: AudioContext, urls: { workletsUrl: string; sampleUrl?: string }) {
@@ -90,9 +98,13 @@ export class LofiRack {
 
     /** Load the worklets and build the chain once; later calls share the first. */
     init(): Promise<void> {
+        // A destroyed rack starts over from scratch; the generation tells a
+        // build that was awaiting its worklets whether destroy() superseded it.
+        this.destroyed = false
         if (!this.ready) {
-            this.ready = this.build().catch((error) => {
-                this.ready = undefined
+            const generation = ++this.generation
+            this.ready = this.build(generation).catch((error) => {
+                if (this.generation === generation) this.ready = undefined
                 throw error
             })
         }
@@ -103,12 +115,20 @@ export class LofiRack {
         return Boolean(this.nodes)
     }
 
-    private async build(): Promise<void> {
+    /** The noise bus level: 1 while the crackle can be heard, 0 in bypass or paused. */
+    get noiseGain(): number {
+        return this.texture?.gain.value ?? 0
+    }
+
+    private async build(generation: number): Promise<void> {
         await Promise.all(
             LOFI_WORKLETS.map((name) =>
                 this.ctx.audioWorklet.addModule(`${this.workletsUrl}${name}-processor.js`)
             )
         )
+        // destroy() (or a newer build) landed while the modules loaded: don't
+        // install a chain that no longer has an owner.
+        if (this.destroyed || generation !== this.generation) return
 
         const ctx = this.ctx
         const n: Nodes = {
@@ -148,20 +168,27 @@ export class LofiRack {
         n.equalizer.output.connect(this.output)
         this.dryBypass.connect(this.output)
 
-        // Crackle is a looping sample mixed into the processed path. It is muted
-        // while the element is paused so a paused Spotify stays silent.
+        // Crackle is a looping sample mixed into the processed path. Its bus is
+        // opened only while the rack is actually processing and the element is
+        // playing (updateTexture), so bypass and pause both silence it.
         n.vinylCrackle.output.connect(this.texture)
         this.texture.connect(this.processed)
-        this.texture.gain.value = this.sourceActive ? 1 : 0
+        this.texture.gain.value = 0
 
         this.nodes = n
-        this.setEffects(DEFAULT_EFFECT_SETTINGS)
+        // Replay whatever was asked for before the nodes existed, so a caller
+        // that set effects (or paused) during the worklet load is not lost.
+        this.applySettings(this.settings)
     }
 
     setEffects(settings: EffectSettings): void {
+        this.settings = normalizeEffectSettings(settings)
+        this.applySettings(this.settings)
+    }
+
+    private applySettings(s: EffectSettings): void {
         const n = this.nodes
         if (!n || !this.dryBypass || !this.processed) return
-        const s = normalizeEffectSettings(settings)
 
         // Enabled first, then intensity: most effects ignore setIntensity while off.
         n.lowPass.enabled = s.lowPass.enabled
@@ -189,18 +216,35 @@ export class LofiRack {
         n.vocalCut.setIntensity(s.vocalCut.intensity)
         n.equalizer.setSettings(s.equalizer ?? { enabled: false, bands: [] })
 
-        const bypass = !hasLofiEffects(s)
-        this.dryBypass.gain.value = bypass ? 1 : 0
-        this.processed.gain.value = bypass ? 0 : 1
+        this.bypassed = !hasLofiEffects(s)
+        this.dryBypass.gain.value = this.bypassed ? 1 : 0
+        this.processed.gain.value = this.bypassed ? 0 : 1
+        this.updateTexture()
     }
 
     /** Pause mutes the crackle loop; play brings it back. */
     setSourceActive(active: boolean): void {
         this.sourceActive = active
-        if (this.texture) this.texture.gain.value = active ? 1 : 0
+        this.updateTexture()
+    }
+
+    /**
+     * The crackle bus is open only when it can be heard: the rack is processing
+     * (not bypassed) and the element is playing. Both inputs are stored, so the
+     * order setEffects / setSourceActive arrive in does not matter.
+     */
+    private updateTexture(): void {
+        if (!this.texture) return
+        const audible = !this.bypassed && this.sourceActive
+        this.texture.gain.value = audible ? 1 : 0
     }
 
     destroy(): void {
+        // Mark first: the crackle effect's sample load may still be in flight and
+        // must not start a loop after this point, nor may a build in progress
+        // finish and install nodes.
+        this.destroyed = true
+        this.generation++
         this.nodes?.vinylCrackle.destroy()
         this.nodes?.chorus.destroy()
         try {
@@ -209,6 +253,10 @@ export class LofiRack {
         } catch {
             // never connected
         }
+        this.texture?.disconnect()
+        this.texture = undefined
+        this.dryBypass = undefined
+        this.processed = undefined
         this.nodes = undefined
         this.ready = undefined
     }
@@ -246,9 +294,11 @@ export default class Lofi {
 
     apply(settings: EffectSettings): void {
         this.settings = normalizeEffectSettings(settings)
+        // Recorded on the rack even before it is built, so a build that is still
+        // in flight finishes with these settings rather than the defaults.
+        this.rack?.setEffects(this.settings)
 
         if (!this.active) {
-            this.rack?.setEffects(this.settings)
             if (this.connected) {
                 this.connected = false
                 this._audioManager.removeEffect('lofi')
@@ -258,7 +308,6 @@ export default class Lofi {
 
         // Not built: prepare() was skipped or failed (and said so).
         if (!this.rack?.initialized) return
-        this.rack.setEffects(this.settings)
         if (!this.connected) {
             this.connected = true
             this._audioManager.connectLofi(this.rack)
@@ -309,6 +358,9 @@ export default class Lofi {
                 workletsUrl,
                 sampleUrl: soundsUrl ? `${soundsUrl}vinyl-crackle.mp3` : undefined
             })
+            // State that arrived before the rack existed (a settings update, a
+            // pause) is recorded on it now and replayed once the chain builds.
+            this.rack.setEffects(this.settings)
             this.rack.setSourceActive(this.playing)
         }
 
