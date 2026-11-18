@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { markSharedAsset } from './dispose';
 
 export interface GameAssets {
   plane: THREE.Group | null;
@@ -15,7 +16,7 @@ async function loadOne(loader: GLTFLoader, file: string): Promise<THREE.Group | 
   try {
     const gltf = await loader.loadAsync(`${MODEL_DIR}/${file}`);
     // assets are cached and reused across worlds — never dispose their GPU resources
-    gltf.scene.traverse((o) => (o.userData.noDispose = true));
+    markSharedAsset(gltf.scene);
     return gltf.scene;
   } catch {
     console.warn(`Asset ${file} unavailable — using procedural fallback.`);
@@ -49,33 +50,43 @@ function recolorPlane(plane: THREE.Group) {
 }
 
 let cached: GameAssets | null = null;
+let pending: Promise<GameAssets> | null = null;
 
 export async function loadAssets(onProgress?: (done: number, total: number) => void): Promise<GameAssets> {
+  // one in-flight load at a time: preview and a fast take-off can both ask
+  if (pending) return pending;
   if (cached) return cached;
-  const loader = new GLTFLoader();
-  const files = [
-    'plane.glb',
-    'b_small.glb',
-    'b_medium.glb',
-    'b_large.glb',
-    'prop_ac.glb',
-    'tree1.glb',
-    'tree2.glb',
-    'tree3.glb',
-    'bush.glb',
-  ];
-  let done = 0;
-  const tick = () => onProgress?.(++done, files.length);
-  const [plane, small, medium, large, ac, tree1, tree2, tree3, bush] = await Promise.all(
-    files.map((f) => loadOne(loader, f).then((g) => (tick(), g)))
-  );
-  if (plane) recolorPlane(plane);
-  cached = {
-    plane,
-    cityBuildings: [small, medium, large].filter((g): g is THREE.Group => g !== null),
-    trees: [tree1, tree2, tree3].filter((g): g is THREE.Group => g !== null),
-    bush,
-    acUnit: ac,
-  };
-  return cached;
+  pending = (async () => {
+    const loader = new GLTFLoader();
+    const files = [
+      'plane.glb',
+      'b_small.glb',
+      'b_medium.glb',
+      'b_large.glb',
+      'prop_ac.glb',
+      'tree1.glb',
+      'tree2.glb',
+      'tree3.glb',
+      'bush.glb',
+    ];
+    let done = 0;
+    const tick = () => onProgress?.(++done, files.length);
+    const [plane, small, medium, large, ac, tree1, tree2, tree3, bush] = await Promise.all(
+      files.map((f) => loadOne(loader, f).then((g) => (tick(), g)))
+    );
+    if (plane) recolorPlane(plane);
+    cached = {
+      plane,
+      cityBuildings: [small, medium, large].filter((g): g is THREE.Group => g !== null),
+      trees: [tree1, tree2, tree3].filter((g): g is THREE.Group => g !== null),
+      bush,
+      acUnit: ac,
+    };
+    return cached;
+  })();
+  try {
+    return await pending;
+  } finally {
+    pending = null;
+  }
 }

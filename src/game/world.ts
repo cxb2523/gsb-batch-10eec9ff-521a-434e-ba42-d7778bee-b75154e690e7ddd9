@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { BuildingRecord, ContributionDay } from './types';
 import type { GameAssets } from './assets';
+import { disposeObject3D, markShared } from './dispose';
 
 export const BLOCK_DEPTH = 5; // one day of city depth
 export const LANE_WIDTH = 6; // one weekday lane
@@ -196,7 +197,9 @@ function makeBannerTexture(text: string): THREE.CanvasTexture {
 
 // ---------------------------------------------------------------- helpers
 
-/** Baked cumulus textures: overlapping soft puffs with a flatter, shaded base. */
+/** Baked cumulus textures: overlapping soft puffs with a flatter, shaded base.
+ *  The textures are cached for the page and shared by every city, so they must
+ *  outlive individual worlds. */
 const cloudTextures: THREE.CanvasTexture[] = [];
 function cloudTexture(variant: number): THREE.CanvasTexture {
   if (cloudTextures[variant]) return cloudTextures[variant];
@@ -229,6 +232,7 @@ function cloudTexture(variant: number): THREE.CanvasTexture {
   ctx.globalCompositeOperation = 'source-over';
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
+  markShared(tex); // cached across worlds — see cloudTextures
   cloudTextures[variant] = tex;
   return tex;
 }
@@ -334,7 +338,7 @@ function instanceModel(
       }
     });
     inst.castShadow = opts.castShadow ?? false;
-    inst.userData.noDispose = true; // geometry/material belong to the cached asset
+    markShared(inst); // geometry/material belong to the cached asset
     scene.add(inst);
   }
 }
@@ -500,7 +504,7 @@ export function buildWorld(days: ContributionDay[], assets?: GameAssets | null):
         acs.setMatrixAt(i, m4);
       });
       acs.count = busy.length;
-      acs.userData.noDispose = true; // geometry/material belong to the cached asset
+      markShared(acs); // geometry/material belong to the cached asset
       scene.add(acs);
     }
   }
@@ -854,14 +858,10 @@ export function buildWorld(days: ContributionDay[], assets?: GameAssets | null):
       if (beaconMat) beaconMat.opacity = 0.35 + 0.25 * Math.sin(t * 3);
     },
     dispose() {
-      scene.traverse((obj) => {
-        if (obj.userData.noDispose) return;
-        const mesh = obj as THREE.Mesh;
-        if (mesh.geometry) mesh.geometry.dispose();
-        const mat = mesh.material as THREE.Material | THREE.Material[] | undefined;
-        if (Array.isArray(mat)) mat.forEach((mm) => mm.dispose());
-        else if (mat) mat.dispose();
-      });
+      // Only the resources this world created are released: meshes instanced
+      // from the shared model cache are tagged noDispose (see dispose.ts), so
+      // the next preview/run can keep reusing them.
+      disposeObject3D(scene);
     },
   };
 }

@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { GameAssets } from './assets';
+import { disposeObject3D, markOwned, markSharedAsset } from './dispose';
 
 export const BASE_SPEED = 26;
 export const BOOST_MULT = 1.6;
@@ -26,6 +27,7 @@ export interface Plane {
     reducedMotion: boolean
   ): void;
   addShake(amount: number): void;
+  dispose(): void;
 }
 
 /** Cockpit interior from primitives + the Quaternius plane body around the
@@ -89,14 +91,19 @@ function buildCockpit(assets?: GameAssets | null, golden = false): { group: THRE
   let noseZ = -2.6;
   if (assets?.plane) {
     const model = assets.plane.clone();
+    // The model's GPU resources live in the page-wide asset cache and are
+    // shared with every other cockpit/preview, so keep them tagged as such.
+    markSharedAsset(model);
     // SmallPlane spans roughly x±4.3, y −1..1.4, z −5.7..3.1 (nose toward −z)
     model.position.set(0, -1.25, 0.4);
     if (golden) {
-      // clone materials (they're shared with the cached asset) and go gold
+      // clone materials (they're shared with the cached asset) and go gold;
+      // the clones belong to this cockpit, not to the shared cache
       model.traverse((o) => {
         const mesh = o as THREE.Mesh;
         if (!mesh.isMesh) return;
         const mat = (mesh.material as THREE.MeshStandardMaterial).clone();
+        markOwned(mat);
         if (mat.name === 'Body') mat.color.setHex(0xf2b93a);
         if (mat.name === 'Bottom') mat.color.setHex(0xfff0c4);
         mat.metalness = 0.5;
@@ -171,6 +178,14 @@ export function createPlane(aspect: number, assets?: GameAssets | null, golden =
 
     addShake(amount: number) {
       shake = Math.min(shake + amount, 1);
+    },
+
+    dispose() {
+      // The cockpit hangs off the camera, which is added to the world scene,
+      // so release its own (procedural) resources here; cached plane-model
+      // resources are tagged noDispose and survive.
+      disposeObject3D(cockpit);
+      camera.remove(cockpit);
     },
 
     update(dt, input, elapsed, maxAlt, reducedMotion) {

@@ -309,6 +309,8 @@ export class Game {
     this.input.dispose();
     this.audio.stopEngine();
     this.audio.stopMusic();
+    // the cockpit lives under the camera, not the city scene — tear it down too
+    this.plane.dispose();
     this.world.dispose();
     document.body.classList.remove('playing');
   }

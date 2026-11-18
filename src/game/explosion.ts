@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { disposeObject3D, markShared } from './dispose';
 
 // Procedural crash explosion: debris chunks, a fireball flash, smoke puffs
 // and a decaying orange light. Self-contained — create, update, dispose.
@@ -7,6 +8,7 @@ const DEBRIS_COUNT = 42;
 const SMOKE_COUNT = 12;
 const FIRE_COUNT = 9;
 
+// Puff textures are baked once for the page and reused by every explosion.
 const texCache = new Map<string, THREE.CanvasTexture>();
 function puffTexture(inner: string, outer: string): THREE.CanvasTexture {
   const key = inner + outer;
@@ -24,6 +26,7 @@ function puffTexture(inner: string, outer: string): THREE.CanvasTexture {
   ctx.fillRect(0, 0, S, S);
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
+  markShared(tex); // cached across explosions
   texCache.set(key, tex);
   return tex;
 }
@@ -174,13 +177,10 @@ export class Explosion {
   }
 
   dispose() {
+    // The puff textures come from the page-wide cache and are shared with
+    // later explosions; disposeObject3D leaves the tagged ones alone.
     this.group.parent?.remove(this.group);
-    this.debris.geometry.dispose();
-    (this.debris.material as THREE.Material).dispose();
-    for (const p of this.puffs) {
-      const mat = p.sprite.material as THREE.SpriteMaterial;
-      mat.map?.dispose();
-      mat.dispose();
-    }
+    disposeObject3D(this.group);
+    this.puffs.length = 0;
   }
 }
