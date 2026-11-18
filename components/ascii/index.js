@@ -8,7 +8,7 @@ import { GUI } from 'components/gui'
 import { button, useControls } from 'leva'
 import { text } from 'lib/leva/text'
 import { useStore } from 'lib/store'
-import { useContext, useEffect, useRef, useState } from 'react'
+import { useContext, useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import {
   AnimationMixer,
@@ -22,6 +22,11 @@ import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader'
 import tunnel from 'tunnel-rat'
 import s from './ascii.module.scss'
+import {
+  DEFAULT_CHARACTERS,
+  getEffectiveCharacters,
+  parsePositiveInt,
+} from './characters'
 import { AsciiContext } from './context'
 
 const ui = tunnel()
@@ -280,7 +285,7 @@ function Postprocessing() {
   const {
     charactersTexture,
     granularity,
-    charactersLimit,
+    effectiveCharactersCount,
     fillPixels,
     color,
     greyscale,
@@ -289,17 +294,15 @@ function Postprocessing() {
     time,
     background,
   } = useContext(AsciiContext)
-  console.log('background', background)
 
   return (
     <EffectComposer>
       <ASCIIEffect
         charactersTexture={charactersTexture}
         granularity={granularity * viewport.dpr}
-        charactersLimit={charactersLimit}
+        charactersLimit={effectiveCharactersCount}
         fillPixels={fillPixels}
         color={color}
-        fit={fit}
         greyscale={greyscale}
         invert={invert}
         matrix={matrix}
@@ -344,7 +347,7 @@ function Inner() {
 }
 
 const DEFAULT = {
-  characters: ' *,    ./O#DE',
+  characters: DEFAULT_CHARACTERS,
   granularity: 4,
   charactersLimit: 25,
   fontSize: 87,
@@ -399,8 +402,11 @@ export function ASCII({ children }) {
       charactersLimit: {
         min: 1,
         max: 48,
-        value:
-          initialUrlParams.get('charactersLimit') || DEFAULT.charactersLimit,
+        value: parsePositiveInt(
+          initialUrlParams.get('charactersLimit'),
+          DEFAULT.charactersLimit,
+          { min: 1, max: 48 }
+        ),
         step: 1,
         label: 'charLimit',
       },
@@ -511,6 +517,15 @@ export function ASCII({ children }) {
     window.history.replaceState({}, null, url)
   }, [UrlParams])
 
+  // Single source of truth shared by the atlas (FontEditor) and the shader
+  // (ASCIIEffect): empty/whitespace-only sets fall back to the default set,
+  // duplicates are removed, and the number of bins is min(set length, limit).
+  const { characters: effectiveCharacters, count: effectiveCharactersCount } =
+    useMemo(
+      () => getEffectiveCharacters(characters.toUpperCase(), charactersLimit),
+      [characters, charactersLimit]
+    )
+
   function set({ charactersTexture, canvas, ...props }) {
     if (charactersTexture) setCharactersTexture(charactersTexture)
     if (canvas) setCanvas(canvas)
@@ -526,6 +541,8 @@ export function ASCII({ children }) {
       <AsciiContext.Provider
         value={{
           characters: characters.toUpperCase(),
+          effectiveCharacters,
+          effectiveCharactersCount,
           granularity,
           charactersTexture,
           charactersLimit,

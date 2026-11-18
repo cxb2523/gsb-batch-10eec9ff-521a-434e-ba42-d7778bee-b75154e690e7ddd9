@@ -47,8 +47,15 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, out vec4 outputColor)
         grayColor = 1. - grayColor;
     }
 
-    // get the character index
-    float charIndex = floor(grayColor * (uCharactersLimit -  1.));
+    // uCharactersLimit is the number of glyph cells actually drawn in the
+    // atlas (min of the deduped character set length and the configured
+    // limit). Binning only within that range guarantees the sampled cell
+    // always contains a glyph, regardless of canvas resolution or DPR: the
+    // index only depends on luminance, never on `division`/resolution.
+    float charIndex = floor(grayColor * (uCharactersLimit - 1.));
+    // Defense in depth: never address a cell outside the drawn grid, even if
+    // a malformed uniform slips through.
+    charIndex = clamp(charIndex, 0., uCharactersLimit - 1.);
     float charX = mod(charIndex, size.x);
     float charY = floor(charIndex / size.y);
 
