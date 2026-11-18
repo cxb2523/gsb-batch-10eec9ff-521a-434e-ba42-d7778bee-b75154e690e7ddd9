@@ -31,6 +31,20 @@ import type { LFSRMode } from '../synthesis/LFSR';
 /**
  * Channel configuration for the 8-channel setup
  */
+
+/**
+ * Per-channel default gains. Values are intentionally conservative because
+ * overlapping notes stack on the same gain node; the limiter catches the
+ * remaining peaks. Noise channels were previously created at 0 gain (muted),
+ * which made drum tracks mapped to n1/n2 inaudible.
+ */
+const DEFAULT_PULSE_GAIN = 0.12; // 4 channels  × 0.12 = 0.48 max
+const DEFAULT_WAVE_GAIN = 0.15;  // 2 channels  × 0.15 = 0.30 max
+const DEFAULT_NOISE_GAIN = 0.04; // 2 channels  × 0.04 = 0.08 max
+// Total nominal max: 0.48 + 0.30 + 0.08 = 0.86 — still under 1.0, leaving
+// headroom before the master gain and limiter, so enabling the two noise
+// channels does not noticeably increase clipping.
+
 const CHANNEL_CONFIG = {
   pulse: [
     { id: 'p1' as const, hasSweep: true,  defaultDuty: 2 as DutyIndex },
@@ -106,38 +120,41 @@ export class GameBoyAPU {
   
   /**
    * Initialize all 8 channels with their gain nodes.
-   * 
-   * Gain staging: Keep total well under 1.0 to leave headroom
-   * Notes stack when overlapping, so we use conservative values
-   * The limiter will catch peaks, but we want to minimize its work
+   *
+   * Gain staging: Keep total well under 1.0 to leave headroom.
+   * Notes stack when overlapping, so we use conservative values.
+   * The noise channels start at a small but clearly audible non-zero gain
+   * (DEFAULT_NOISE_GAIN) instead of being muted, while still keeping the
+   * summed nominal maximum (0.86) under 1.0. The limiter catches peaks.
    */
   private initializeChannels(): void {
     // Create pulse channels (4 × 0.12 = 0.48 max)
     for (const config of CHANNEL_CONFIG.pulse) {
-      const gain = this.createChannelGain(config.id, 0.12);
+      const gain = this.createChannelGain(config.id, DEFAULT_PULSE_GAIN);
       const channel = new PulseChannel(this.audioContext, gain, config.hasSweep);
       channel.setDutyCycle(config.defaultDuty);
+      channel.markInitialDuty();
       this.pulseChannels.set(config.id, channel);
       this.initChannelState(config.id);
     }
-    
+
     // Create wave channels for bass (2 × 0.15 = 0.30 max)
     for (const config of CHANNEL_CONFIG.wave) {
-      const gain = this.createChannelGain(config.id, 0.15);
+      const gain = this.createChannelGain(config.id, DEFAULT_WAVE_GAIN);
       const channel = new WaveChannel(this.audioContext, gain, config.preset);
       this.waveChannels.set(config.id, channel);
       this.initChannelState(config.id);
     }
-    
-    // Create noise channels - MUTED for now
+
+    // Create noise channels — audible but conservative default gain so drum
+    // tracks mapped to n1/n2 are actually heard without eating the headroom.
     for (const config of CHANNEL_CONFIG.noise) {
-      const gain = this.createChannelGain(config.id, 0);
+      const gain = this.createChannelGain(config.id, DEFAULT_NOISE_GAIN);
       const channel = new NoiseChannel(this.audioContext, gain, config.mode);
       this.noiseChannels.set(config.id, channel);
       this.initChannelState(config.id);
     }
   }
-  // Total max: 0.48 + 0.30 + 0.08 = 0.86 (limiter handles peaks)
   
   /**
    * Create a gain node for a channel and connect to master.
@@ -458,20 +475,36 @@ export class GameBoyAPU {
   
   /**
    * Reset all channel states.
+   *
+   * In addition to the busy/state bookkeeping, every channel is returned to
+   * its initial internal state. For the noise channels this means dropping
+   * cached LFSR buffers and restoring the constructor mode, so a song played
+   * after stopAll() cannot reuse buffers or state left over from a previous
+   * run. Per-channel gain nodes (including user volume changes) are left
+   * untouched — reset is about playback state, not the mixer.
    */
   reset(): void {
     for (const id of this.channelStates.keys()) {
       this.initChannelState(id);
     }
+    for (const channel of this.pulseChannels.values()) {
+      channel.reset();
+    }
+    for (const channel of this.waveChannels.values()) {
+      channel.reset();
+    }
+    for (const channel of this.noiseChannels.values()) {
+      channel.reset();
+    }
     this.scheduledNoteCount = 0;
   }
-  
+
   /**
    * Stop all currently playing and scheduled sounds immediately.
    */
   stopAll(): void {
     const now = this.audioContext.currentTime;
-    
+
     // Stop all tracked nodes
     for (const node of this.activeNodes) {
       try {
@@ -481,8 +514,9 @@ export class GameBoyAPU {
       }
     }
     this.activeNodes.clear();
-    
-    // Reset channel states
+
+    // Reset channel states AND channel internals (noise LFSR cache/mode), so
+    // the next playback starts clean with no residual sources or stale buffers.
     this.reset();
   }
   

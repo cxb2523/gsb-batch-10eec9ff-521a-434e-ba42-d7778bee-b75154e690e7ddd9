@@ -11,6 +11,7 @@
     "build:backend": "cd server && npm run build",
     "preview": "vite preview",
     "lint": "eslint src --ext .ts,.tsx",
+    "test:v2": "tsx --test src-v2/test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "typecheck:worker": "tsc -p worker/tsconfig.json",
     "dev:worker": "npm run build && wrangler dev",
@@ -21,8 +22,10 @@
     "@typescript-eslint/eslint-plugin": "^6.0.0",
     "@typescript-eslint/parser": "^6.0.0",
     "eslint": "^8.0.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.0.0",
     "vite": "^5.0.0",
+    "web-audio-engine": "^0.13.4",
     "wrangler": "^4.152.0"
   },
   "dependencies": {

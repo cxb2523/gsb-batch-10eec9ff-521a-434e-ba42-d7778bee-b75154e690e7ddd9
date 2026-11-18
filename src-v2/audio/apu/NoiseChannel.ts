@@ -22,18 +22,33 @@ interface NoiseBufferCache {
   buffer: AudioBuffer;
   frequency: number;
   mode: LFSRMode;
+  /** Requested duration this entry was generated for (seconds) */
   duration: number;
 }
+
+/**
+ * Extra tail added to every generated noise buffer so note envelopes have
+ * room to release. Kept here as a single source of truth.
+ */
+const ENVELOPE_TAIL_SECONDS = 0.1;
+
+/**
+ * Tolerance when comparing a cached buffer's length against the requested
+ * duration. Buffer lengths are rounded up to whole samples, so two
+ * "equal" durations can differ by a fraction of a sample.
+ */
+const DURATION_EPSILON = 1e-6;
 
 export class NoiseChannel {
   private audioContext: AudioContext;
   private mode: LFSRMode;
+  private readonly initialMode: LFSRMode;
   private outputNode: GainNode;
-  
+
   // Cache recently used noise buffers
   private bufferCache: NoiseBufferCache[] = [];
   private maxCacheSize = 8;
-  
+
   constructor(
     audioContext: AudioContext,
     outputNode: GainNode,
@@ -42,8 +57,9 @@ export class NoiseChannel {
     this.audioContext = audioContext;
     this.outputNode = outputNode;
     this.mode = mode;
+    this.initialMode = mode;
   }
-  
+
   /**
    * Set the LFSR mode.
    * '7bit' = more tonal, metallic sound (good for snares)
@@ -52,49 +68,56 @@ export class NoiseChannel {
   setMode(mode: LFSRMode): void {
     this.mode = mode;
   }
-  
+
   /**
    * Get current mode.
    */
   getMode(): LFSRMode {
     return this.mode;
   }
-  
+
   /**
    * Get or create a noise buffer with the given parameters.
+   *
+   * A cached entry is only reused when the buffer it holds is actually long
+   * enough for the requested duration (frequency and mode must match too).
+   * Comparing the real AudioBuffer length — rather than the stored requested
+   * duration — guarantees a cache hit can never hand back a buffer whose tail
+   * would be cut off mid-note.
    */
   private getNoiseBuffer(
     frequency: number,
     duration: number,
     mode: LFSRMode
   ): AudioBuffer {
-    // Check cache first
+    // Check cache first: same frequency/mode AND the stored buffer covers the
+    // full requested duration (with a tiny epsilon for sample rounding).
     const cached = this.bufferCache.find(
-      c => c.frequency === frequency && 
-           c.mode === mode && 
-           c.duration >= duration
+      c => c.frequency === frequency &&
+           c.mode === mode &&
+           c.buffer.duration + DURATION_EPSILON >= duration
     );
-    
+
     if (cached) {
       return cached.buffer;
     }
-    
-    // Generate new buffer
+
+    // Generate new buffer, including headroom for the envelope tail.
     const buffer = generateNoiseBuffer(
       this.audioContext,
-      duration + 0.1, // Extra time for envelope tail
+      duration + ENVELOPE_TAIL_SECONDS,
       frequency,
       mode
     );
-    
+
     // Add to cache
     this.bufferCache.push({ buffer, frequency, mode, duration });
-    
+
     // Trim cache if too large
     while (this.bufferCache.length > this.maxCacheSize) {
       this.bufferCache.shift();
     }
-    
+
     return buffer;
   }
   
@@ -311,5 +334,16 @@ export class NoiseChannel {
    */
   clearCache(): void {
     this.bufferCache = [];
+  }
+
+  /**
+   * Return the channel to its initial state: drop every cached LFSR buffer
+   * and restore the mode the channel was constructed with. Called by the APU
+   * on stopAll()/reset() so a subsequent playback cannot reuse buffers or
+   * mode changes left over from the previous run.
+   */
+  reset(): void {
+    this.clearCache();
+    this.mode = this.initialMode;
   }
 }

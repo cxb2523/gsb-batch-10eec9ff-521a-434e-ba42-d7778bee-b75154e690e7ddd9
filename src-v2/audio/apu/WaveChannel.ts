@@ -34,7 +34,8 @@ export class WaveChannel {
   private volume: WaveVolume = 1; // Default to 100%
   private outputNode: GainNode;
   private currentPreset: WavePreset;
-  
+  private readonly initialPreset: WavePreset;
+
   constructor(
     audioContext: AudioContext,
     outputNode: GainNode,
@@ -43,7 +44,8 @@ export class WaveChannel {
     this.audioContext = audioContext;
     this.outputNode = outputNode;
     this.currentPreset = preset;
-    
+    this.initialPreset = preset;
+
     // Initialize wavetable with preset
     this.waveTable = new WaveTable();
     this.loadPreset(preset);
@@ -233,5 +235,14 @@ export class WaveChannel {
    */
   getWaveformSamples(): Uint8Array {
     return this.waveTable.getSamples();
+  }
+
+  /**
+   * Restore the channel to its initial preset and full GB volume. Called by
+   * the APU on stopAll()/reset() so playback state never leaks across runs.
+   */
+  reset(): void {
+    this.loadPreset(this.initialPreset);
+    this.volume = 1;
   }
 }

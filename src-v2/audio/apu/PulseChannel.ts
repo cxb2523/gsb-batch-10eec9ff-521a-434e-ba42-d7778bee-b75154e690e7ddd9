@@ -21,9 +21,10 @@ export class PulseChannel {
   private audioContext: AudioContext;
   private dutyWaves: PeriodicWave[];
   private currentDuty: DutyIndex = 2; // Default to 50%
+  private initialDuty: DutyIndex = 2;
   private hasSweep: boolean;
   private outputNode: GainNode;
-  
+
   constructor(
     audioContext: AudioContext,
     outputNode: GainNode,
@@ -32,23 +33,40 @@ export class PulseChannel {
     this.audioContext = audioContext;
     this.outputNode = outputNode;
     this.hasSweep = hasSweep;
-    
+
     // Pre-create all duty cycle waveforms
     this.dutyWaves = createAllDutyWaves(audioContext);
   }
-  
+
   /**
    * Set the duty cycle for subsequent notes.
    */
   setDutyCycle(duty: DutyIndex): void {
     this.currentDuty = duty;
   }
-  
+
+  /**
+   * Record the currently selected duty cycle as the baseline that reset()
+   * returns to. The APU calls this once during setup after applying the
+   * channel's configured default duty.
+   */
+  markInitialDuty(): void {
+    this.initialDuty = this.currentDuty;
+  }
+
   /**
    * Get current duty cycle.
    */
   getDutyCycle(): DutyIndex {
     return this.currentDuty;
+  }
+
+  /**
+   * Restore the channel to its initial duty cycle. Called by the APU on
+   * stopAll()/reset() so the next playback starts from a clean state.
+   */
+  reset(): void {
+    this.currentDuty = this.initialDuty;
   }
   
   /**
