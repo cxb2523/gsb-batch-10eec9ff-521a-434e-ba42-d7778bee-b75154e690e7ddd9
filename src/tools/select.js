@@ -1,6 +1,22 @@
 // src/tools/select.js
 
+function _getSelectionGeometry() {
+    try {
+        if (typeof VexelSelectionGeometry !== 'undefined') return VexelSelectionGeometry;
+    } catch (e) {
+        // Lexical binding may still be in its TDZ if this script loads first.
+    }
+    if (typeof globalThis !== 'undefined' && globalThis.VexelSelectionGeometry) {
+        return globalThis.VexelSelectionGeometry;
+    }
+    if (typeof require === 'function') return require('./selection-geometry');
+    return null;
+}
+
 class VexelSelectTool {
+    get geometry() {
+        return _getSelectionGeometry();
+    }
     constructor(vexel) {
         this.vexel = vexel;
         this.active = false;
@@ -12,9 +28,11 @@ class VexelSelectTool {
         this.marqueeEnd = null;
         this.dragStart = null;
         this.dragOffset = { x: 0, y: 0 };
+        this.dragStartPositions = new Map();
         this.resizeHandle = null;
         this.resizeStartBounds = null;
         this.resizeStartPoint = null;
+        this.resizeParticipants = [];
         this.rotateStart = null;
         this.rotateCenter = null;
         this.rotateStartAngle = 0;
@@ -63,6 +81,36 @@ class VexelSelectTool {
         };
     }
 
+    _getZoom() {
+        const zoom = this.vexel.viewport && this.vexel.viewport.zoom;
+        return zoom > 0 ? zoom : 1;
+    }
+
+    /**
+     * Lock state lives on VexelSceneNode; shape objects may not carry a
+     * `locked` flag at all. Ask the Vexel instance to resolve the scene node
+     * association first (that is the authoritative source), then fall back to
+     * the shape's own flag. When no association exists the shape is explicitly
+     * treated as unlocked.
+     */
+    _isShapeLocked(shape) {
+        if (!shape) return false;
+        if (this.vexel && typeof this.vexel.isShapeLocked === 'function') {
+            return this.vexel.isShapeLocked(shape) === true;
+        }
+        return shape.locked === true;
+    }
+
+    getSelectionBounds() {
+        const selected = this.vexel.selectedShapes || [];
+        return _getSelectionGeometry().selectionBounds(selected);
+    }
+
+    /** Screen-space hit radius converted to canvas units for the current zoom. */
+    _hitRadius(screenPixels) {
+        return screenPixels / this._getZoom();
+    }
+
     _handleMouseDown(e) {
         if (!this.active || e.button !== 0) return;
 
@@ -75,9 +123,21 @@ class VexelSelectTool {
             return;
         }
 
-        if (this.hoveredHandle && this.vexel.selectedShapes.length === 1) {
-            this._startResize(this.hoveredHandle, point);
-            return;
+        const selectionBounds = this.getSelectionBounds();
+
+        if (selectionBounds) {
+            const handle = _getSelectionGeometry().hitTestHandle(
+                point,
+                selectionBounds,
+                this._hitRadius(this.handleSize + this.hitTolerance)
+            );
+            if (handle) {
+                // A handle was grabbed: either start scaling the unlocked
+                // participants, or consume the click when every selected shape
+                // is locked (locked geometry must never change).
+                this._startResize(handle, point);
+                return;
+            }
         }
 
         if (this.vexel.selectedShapes.length === 1 && this._isNearRotationHandle(point)) {
@@ -113,9 +173,11 @@ class VexelSelectTool {
             const dy = point.y - this.dragStart.y;
 
             for (const shape of this.vexel.selectedShapes) {
-                if (!shape.locked) {
-                    shape.x = this.dragOffset[shape.id].x + dx;
-                    shape.y = this.dragOffset[shape.id].y + dy;
+                if (!this._isShapeLocked(shape)) {
+                    const start = this.dragOffset[shape.id];
+                    if (!start) continue;
+                    shape.x = start.x + dx;
+                    shape.y = start.y + dy;
 
                     if (this.vexel.snapEnabled) {
                         shape.x = Math.round(shape.x / this.vexel.snapSize) * this.vexel.snapSize;
@@ -127,7 +189,7 @@ class VexelSelectTool {
             return;
         }
 
-        if (this.resizing && this.vexel.selectedShapes.length === 1) {
+        if (this.resizing) {
             this._updateResize(point);
             return;
         }
@@ -171,7 +233,11 @@ class VexelSelectTool {
         this.resizing = false;
         this.rotating = false;
         this.dragStart = null;
+        this.dragStartPositions = new Map();
         this.resizeHandle = null;
+        this.resizeStartBounds = null;
+        this.resizeStartPoint = null;
+        this.resizeParticipants = [];
         this.rotateStart = null;
     }
 
@@ -217,7 +283,7 @@ class VexelSelectTool {
 
     _nudge(dx, dy) {
         for (const shape of this.vexel.selectedShapes) {
-            if (!shape.locked) {
+            if (!this._isShapeLocked(shape)) {
                 shape.x += dx;
                 shape.y += dy;
             }
@@ -245,8 +311,22 @@ class VexelSelectTool {
     _hitTest(point) {
         for (let i = this.vexel.shapes.length - 1; i >= 0; i--) {
             const shape = this.vexel.shapes[i];
-            if (shape.visible !== false && !shape.locked && shape.containsPoint(point.x, point.y)) {
-                return shape;
+            if (shape.visible === false || this._isShapeLocked(shape)) continue;
+
+            if (typeof shape.containsPoint === 'function') {
+                if (shape.containsPoint(point.x, point.y)) return shape;
+                continue;
+            }
+
+            // Legacy shape classes only expose getBounds(); hit-test those.
+            if (typeof shape.getBounds === 'function') {
+                const b = shape.getBounds();
+                if (
+                    point.x >= b.x && point.x <= b.x + b.width &&
+                    point.y >= b.y && point.y <= b.y + b.height
+                ) {
+                    return shape;
+                }
             }
         }
         return null;
@@ -256,80 +336,175 @@ class VexelSelectTool {
         this.dragging = true;
         this.dragStart = point;
         this.dragOffset = {};
+        this.dragStartPositions = new Map();
 
         for (const shape of this.vexel.selectedShapes) {
             this.dragOffset[shape.id] = { x: shape.x, y: shape.y };
+            this.dragStartPositions.set(shape.id, { x: shape.x, y: shape.y });
         }
     }
 
     _finishDrag() {
+        const positions = [];
+        const previousPositions = [];
+
+        for (const shape of this.vexel.selectedShapes) {
+            const start = this.dragStartPositions.get(shape.id);
+            if (!start) continue;
+            if (start.x !== shape.x || start.y !== shape.y) {
+                positions.push({ id: shape.id, x: shape.x, y: shape.y });
+                previousPositions.push({ id: shape.id, x: start.x, y: start.y });
+            }
+        }
+
+        if (positions.length > 0) {
+            this._recordHistory({
+                type: 'move-shapes',
+                positions,
+                previousPositions
+            });
+        }
+
         this.dragging = false;
         this.dragStart = null;
         this.dragOffset = {};
+        this.dragStartPositions = new Map();
     }
 
+    _recordHistory(action) {
+        const history = this.vexel && this.vexel.history;
+
+        // VexelHistory instances keep their own undo/redo stacks and already
+        // de-duplicate batched actions; the plain history object on Vexel is
+        // handled by _pushHistory.
+        if (history && Array.isArray(history.undoStack) && typeof history.push === 'function') {
+            history.push(action);
+            return;
+        }
+
+        if (this.vexel && typeof this.vexel._pushHistory === 'function') {
+            this.vexel._pushHistory(action);
+        }
+    }
+
+    /**
+     * Start a resize of the union bounds of every selected shape. Locked shapes
+     * stay in the selection (and in the union bounds they define) but are
+     * excluded from `resizeParticipants`, so they keep their geometry while the
+     * rest scale about the union anchor.
+     *
+     * Returns false when there is nothing that can be scaled.
+     */
     _startResize(handle, point) {
-        const shape = this.vexel.selectedShapes[0];
+        const selected = this.vexel.selectedShapes || [];
+        const bounds = this.getSelectionBounds();
+
+        if (!bounds || selected.length === 0) return false;
+
+        const participants = [];
+        for (const shape of selected) {
+            if (this._isShapeLocked(shape)) continue;
+            participants.push({
+                shape,
+                snapshot: _getSelectionGeometry().captureGeometry(shape)
+            });
+        }
+
+        if (participants.length === 0) return false;
+
         this.resizing = true;
         this.resizeHandle = handle;
-        this.resizeStartBounds = shape.getBounds();
+        this.resizeStartBounds = { ...bounds };
         this.resizeStartPoint = point;
+        this.resizeParticipants = participants;
+        return true;
     }
 
     _updateResize(point) {
-        const shape = this.vexel.selectedShapes[0];
-        const bounds = this.resizeStartBounds;
+        const startBounds = this.resizeStartBounds;
+        if (!startBounds) return;
+
+        const handle = this.resizeHandle;
         const dx = point.x - this.resizeStartPoint.x;
         const dy = point.y - this.resizeStartPoint.y;
 
-        switch (this.resizeHandle) {
-            case 'nw':
-                shape.x = bounds.x + dx;
-                shape.y = bounds.y + dy;
-                shape.width = bounds.width - dx;
-                shape.height = bounds.height - dy;
-                break;
-            case 'ne':
-                shape.y = bounds.y + dy;
-                shape.width = bounds.width + dx;
-                shape.height = bounds.height - dy;
-                break;
-            case 'sw':
-                shape.x = bounds.x + dx;
-                shape.width = bounds.width - dx;
-                shape.height = bounds.height + dy;
-                break;
-            case 'se':
-                shape.width = bounds.width + dx;
-                shape.height = bounds.height + dy;
-                break;
-            case 'n':
-                shape.y = bounds.y + dy;
-                shape.height = bounds.height - dy;
-                break;
-            case 's':
-                shape.height = bounds.height + dy;
-                break;
-            case 'w':
-                shape.x = bounds.x + dx;
-                shape.width = bounds.width - dx;
-                break;
-            case 'e':
-                shape.width = bounds.width + dx;
-                break;
-        }
+        const targetBounds = _getSelectionGeometry().targetBoundsForHandle(
+            handle,
+            startBounds,
+            dx,
+            dy,
+            1
+        );
 
-        if (shape.width < 1) shape.width = 1;
-        if (shape.height < 1) shape.height = 1;
+        const scaleX = startBounds.width > 0 ? targetBounds.width / startBounds.width : 1;
+        const scaleY = startBounds.height > 0 ? targetBounds.height / startBounds.height : 1;
+        const anchor = _getSelectionGeometry().anchorForHandle(handle, startBounds);
+
+        for (const participant of this.resizeParticipants) {
+            const { shape, snapshot } = participant;
+            const shapeBounds = snapshot.bounds;
+
+            const target = {
+                x: anchor.x + (shapeBounds.x - anchor.x) * scaleX,
+                y: anchor.y + (shapeBounds.y - anchor.y) * scaleY,
+                width: shapeBounds.width * scaleX,
+                height: shapeBounds.height * scaleY,
+                scaleX,
+                scaleY,
+                anchor
+            };
+
+            _getSelectionGeometry().applyBounds(shape, snapshot, target);
+        }
 
         this.vexel.dirty = true;
     }
 
     _finishResize() {
+        if (this.resizeParticipants.length > 0) {
+            const changes = [];
+            const previous = [];
+
+            for (const participant of this.resizeParticipants) {
+                const { shape, snapshot } = participant;
+                const originalBounds = snapshot.bounds;
+                const currentBounds = shape.getBounds();
+
+                if (
+                    originalBounds.x !== currentBounds.x ||
+                    originalBounds.y !== currentBounds.y ||
+                    originalBounds.width !== currentBounds.width ||
+                    originalBounds.height !== currentBounds.height
+                ) {
+                    changes.push({
+                        id: shape.id,
+                        bounds: { ...currentBounds },
+                        state: _getSelectionGeometry().captureState(shape)
+                    });
+                    previous.push({
+                        id: shape.id,
+                        bounds: { ...originalBounds },
+                        state: snapshot.state
+                    });
+                }
+            }
+
+            if (changes.length > 0) {
+                // A single history entry covers the entire drag, so undo
+                // restores every participating shape at once.
+                this._recordHistory({
+                    type: 'transform-shapes',
+                    shapes: changes,
+                    previousShapes: previous
+                });
+            }
+        }
+
         this.resizing = false;
         this.resizeHandle = null;
         this.resizeStartBounds = null;
         this.resizeStartPoint = null;
+        this.resizeParticipants = [];
     }
 
     _startRotate(point) {
@@ -375,39 +550,25 @@ class VexelSelectTool {
         if (this.vexel.selectedShapes.length !== 1) return false;
         const shape = this.vexel.selectedShapes[0];
         const bounds = shape.getBounds();
+        const zoom = this._getZoom();
         const cx = bounds.x + bounds.width / 2;
-        const cy = bounds.y - 30;
+        const cy = bounds.y - 30 / zoom;
         const dist = Math.sqrt((point.x - cx) ** 2 + (point.y - cy) ** 2);
-        return dist < 15;
+        return dist < 15 / zoom;
     }
 
     _updateHoveredHandle(point) {
-        if (this.vexel.selectedShapes.length !== 1) {
+        const bounds = this.getSelectionBounds();
+        if (!bounds) {
             this.hoveredHandle = null;
             return;
         }
 
-        const shape = this.vexel.selectedShapes[0];
-        const bounds = shape.getBounds();
-        const handles = {
-            nw: { x: bounds.x, y: bounds.y },
-            ne: { x: bounds.x + bounds.width, y: bounds.y },
-            sw: { x: bounds.x, y: bounds.y + bounds.height },
-            se: { x: bounds.x + bounds.width, y: bounds.y + bounds.height },
-            n: { x: bounds.x + bounds.width / 2, y: bounds.y },
-            s: { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height },
-            w: { x: bounds.x, y: bounds.y + bounds.height / 2 },
-            e: { x: bounds.x + bounds.width, y: bounds.y + bounds.height / 2 }
-        };
-
-        this.hoveredHandle = null;
-        for (const [key, pos] of Object.entries(handles)) {
-            const dist = Math.sqrt((point.x - pos.x) ** 2 + (point.y - pos.y) ** 2);
-            if (dist < this.handleSize + this.hitTolerance) {
-                this.hoveredHandle = key;
-                return;
-            }
-        }
+        this.hoveredHandle = _getSelectionGeometry().hitTestHandle(
+            point,
+            bounds,
+            this._hitRadius(this.handleSize + this.hitTolerance)
+        );
     }
 
     _updateCursor(point) {
@@ -445,7 +606,7 @@ class VexelSelectTool {
 
         const selected = [];
         for (const shape of this.vexel.shapes) {
-            if (shape.visible !== false && !shape.locked) {
+            if (shape.visible !== false && !this._isShapeLocked(shape)) {
                 const bounds = shape.getBounds();
                 if (
                     bounds.x + bounds.width >= x1 &&

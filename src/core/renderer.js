@@ -1,5 +1,24 @@
 // src/core/renderer.js
 
+function _getSelectionGeometry() {
+    try {
+        if (typeof VexelSelectionGeometry !== 'undefined') return VexelSelectionGeometry;
+    } catch (e) {
+        // Ignore TDZ errors; fall back to global/module lookup.
+    }
+    if (typeof globalThis !== 'undefined' && globalThis.VexelSelectionGeometry) {
+        return globalThis.VexelSelectionGeometry;
+    }
+    if (typeof require === 'function') {
+        try {
+            return require('../tools/selection-geometry');
+        } catch (e) {
+            return null;
+        }
+    }
+    return null;
+}
+
 class VexelRenderer {
     constructor(vexel) {
         this.vexel = vexel;
@@ -224,12 +243,14 @@ class VexelRenderer {
         const selected = this.vexel.selectedShapes;
         if (selected.length === 0) return;
 
-        ctx.save();
-        ctx.translate(this.vexel.viewport.x, this.vexel.viewport.y);
-        ctx.scale(this.vexel.viewport.zoom, this.vexel.viewport.zoom);
+        const geometry = _getSelectionGeometry();
+        const bounds = geometry ? geometry.selectionBounds(selected) : null;
 
-        for (const shape of selected) {
-            const bounds = shape.getBounds();
+        if (bounds) {
+            ctx.save();
+            ctx.translate(this.vexel.viewport.x, this.vexel.viewport.y);
+            ctx.scale(this.vexel.viewport.zoom, this.vexel.viewport.zoom);
+
             const z = this.vexel.viewport.zoom;
             const handleSize = 7 / z;
 
@@ -244,18 +265,9 @@ class VexelRenderer {
             );
             ctx.setLineDash([]);
 
-            const handles = [
-                { x: bounds.x, y: bounds.y },
-                { x: bounds.x + bounds.width, y: bounds.y },
-                { x: bounds.x, y: bounds.y + bounds.height },
-                { x: bounds.x + bounds.width, y: bounds.y + bounds.height },
-                { x: bounds.x + bounds.width / 2, y: bounds.y },
-                { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height },
-                { x: bounds.x, y: bounds.y + bounds.height / 2 },
-                { x: bounds.x + bounds.width, y: bounds.y + bounds.height / 2 }
-            ];
+            const handles = geometry.handlePositions(bounds);
 
-            for (const h of handles) {
+            for (const h of Object.values(handles)) {
                 ctx.fillStyle = '#ffffff';
                 ctx.strokeStyle = '#4A90D9';
                 ctx.lineWidth = 1.5 / z;
@@ -272,9 +284,9 @@ class VexelRenderer {
                     handleSize
                 );
             }
-        }
 
-        ctx.restore();
+            ctx.restore();
+        }
 
         if (this.vexel.selectTool && this.vexel.selectTool.marquee) {
             this.vexel.selectTool.drawMarquee(ctx);

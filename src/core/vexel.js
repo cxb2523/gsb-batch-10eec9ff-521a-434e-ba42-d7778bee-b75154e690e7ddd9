@@ -1,5 +1,24 @@
 // src/core/vexel.js
 
+function _getSelectionGeometry() {
+    try {
+        if (typeof VexelSelectionGeometry !== 'undefined') return VexelSelectionGeometry;
+    } catch (e) {
+        // Lexical binding may still be in its TDZ depending on load order.
+    }
+    if (typeof globalThis !== 'undefined' && globalThis.VexelSelectionGeometry) {
+        return globalThis.VexelSelectionGeometry;
+    }
+    if (typeof require === 'function') {
+        try {
+            return require('../tools/selection-geometry');
+        } catch (e) {
+            return null;
+        }
+    }
+    return null;
+}
+
 class Vexel {
     constructor(config = {}) {
         this.container = typeof config.container === 'string' 
@@ -18,6 +37,8 @@ class Vexel {
         this.layers = [];
         this.shapes = [];
         this.selectedShapes = [];
+        this.sceneGraph = config.sceneGraph || null;
+        this._shapeNodeIds = new Map();
         this.clipboard = [];
         this.history = { undo: [], redo: [], maxSteps: config.maxHistory || 100 };
         this.viewport = { x: 0, y: 0, zoom: 1, rotation: 0 };
@@ -117,25 +138,28 @@ class Vexel {
 
     _drawSelectionHandles() {
         if (this.selectedShapes.length === 0) return;
+
+        const geometry = _getSelectionGeometry();
+        if (!geometry) return;
+
+        const bounds = geometry.selectionBounds(this.selectedShapes);
+        if (!bounds) return;
+
         this.overlayCtx.save();
         this.overlayCtx.translate(this.viewport.x, this.viewport.y);
         this.overlayCtx.scale(this.viewport.zoom, this.viewport.zoom);
-        for (const shape of this.selectedShapes) {
-            const bounds = shape.getBounds();
-            this.overlayCtx.strokeStyle = '#4A90D9';
-            this.overlayCtx.lineWidth = 1.5 / this.viewport.zoom;
-            this.overlayCtx.setLineDash([4, 4]);
-            this.overlayCtx.strokeRect(bounds.x, bounds.y, bounds.width, bounds.height);
-            this.overlayCtx.setLineDash([]);
-            this._drawHandle(bounds.x, bounds.y);
-            this._drawHandle(bounds.x + bounds.width, bounds.y);
-            this._drawHandle(bounds.x, bounds.y + bounds.height);
-            this._drawHandle(bounds.x + bounds.width, bounds.y + bounds.height);
-            this._drawHandle(bounds.x + bounds.width / 2, bounds.y);
-            this._drawHandle(bounds.x + bounds.width / 2, bounds.y + bounds.height);
-            this._drawHandle(bounds.x, bounds.y + bounds.height / 2);
-            this._drawHandle(bounds.x + bounds.width, bounds.y + bounds.height / 2);
+
+        this.overlayCtx.strokeStyle = '#4A90D9';
+        this.overlayCtx.lineWidth = 1.5 / this.viewport.zoom;
+        this.overlayCtx.setLineDash([4, 4]);
+        this.overlayCtx.strokeRect(bounds.x, bounds.y, bounds.width, bounds.height);
+        this.overlayCtx.setLineDash([]);
+
+        const handles = geometry.handlePositions(bounds);
+        for (const pos of Object.values(handles)) {
+            this._drawHandle(pos.x, pos.y);
         }
+
         this.overlayCtx.restore();
     }
 
@@ -332,6 +356,91 @@ class Vexel {
         this.dirty = true;
     }
 
+    /**
+     * Associate a shape with a scene-graph node. The node is the authoritative
+     * source for lock state, so callers that draw shapes from the scene graph
+     * can lock/unlock them via VexelSceneGraph#setLocked.
+     */
+    attachShapeToSceneNode(shape, nodeId, options = {}) {
+        if (!shape) return null;
+        const graph = this._ensureSceneGraph();
+        if (!graph) return null;
+
+        const id = nodeId || shape.id;
+        let node = graph.getNode(id);
+
+        if (!node) {
+            node = graph.createNode(id, options.type || shape.type || 'shape');
+        }
+
+        node.shape = shape;
+        if (options.locked !== undefined) node.locked = !!options.locked;
+        this._shapeNodeIds.set(shape.id, id);
+        return node;
+    }
+
+    _ensureSceneGraph() {
+        if (this.sceneGraph) return this.sceneGraph;
+
+        let SceneGraph = null;
+        try {
+            if (typeof VexelSceneGraph !== 'undefined') SceneGraph = VexelSceneGraph;
+        } catch (e) {
+            // TDZ when core files are loaded out of order.
+        }
+        if (!SceneGraph && typeof globalThis !== 'undefined' && globalThis.VexelSceneGraph) {
+            SceneGraph = globalThis.VexelSceneGraph;
+        }
+        if (!SceneGraph && typeof require === 'function') {
+            try {
+                SceneGraph = require('./scene-graph').VexelSceneGraph;
+            } catch (e) {
+                SceneGraph = null;
+            }
+        }
+
+        if (SceneGraph) this.sceneGraph = new SceneGraph();
+        return this.sceneGraph;
+    }
+
+    getSceneNodeForShape(shape) {
+        if (!shape) return null;
+        const graph = this._ensureSceneGraph();
+        if (!graph) return null;
+
+        const mappedId = this._shapeNodeIds.get(shape.id);
+        if (mappedId) {
+            const mapped = graph.getNode(mappedId);
+            if (mapped) return mapped;
+        }
+
+        // Fall back to identity/ID lookup for nodes created by callers that
+        // used the shape id directly.
+        const direct = graph.getNode(shape.id);
+        if (direct) return direct;
+
+        for (const node of graph.nodeMap.values()) {
+            if (node.shape === shape) return node;
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolve the lock state of a shape through its scene-graph node, which is
+     * the only authoritative source of lock state. When no association can be
+     * established the shape is explicitly treated as unlocked rather than
+     * having its lock semantics guessed.
+     */
+    isShapeLocked(shape) {
+        if (!shape) return false;
+
+        const node = this.getSceneNodeForShape(shape);
+        if (node && typeof node.locked === 'boolean') return node.locked;
+
+        return false;
+    }
+
     deleteSelected() {
         for (const shape of [...this.selectedShapes]) {
             this.remove(shape);
@@ -409,6 +518,19 @@ class Vexel {
             this.shapes.splice(action.index, 0, action.shape);
         } else if (action.type === 'clear') {
             this.shapes = [...action.shapes];
+        } else if (action.type === 'move-shapes') {
+            for (const item of action.previousPositions || []) {
+                const shape = this.shapes.find(s => s.id === item.id);
+                if (shape) {
+                    shape.x = item.x;
+                    shape.y = item.y;
+                }
+            }
+        } else if (action.type === 'transform-shapes') {
+            this._applyShapeStates(action.previousShapes);
+        } else if (action.type === 'transform-shape') {
+            const shape = this.shapes.find(s => s.id === action.shapeId);
+            if (shape && action.previousState) Object.assign(shape, action.previousState);
         }
     }
 
@@ -420,6 +542,39 @@ class Vexel {
             if (index > -1) this.shapes.splice(index, 1);
         } else if (action.type === 'clear') {
             this.shapes = [];
+        } else if (action.type === 'move-shapes') {
+            for (const item of action.positions || []) {
+                const shape = this.shapes.find(s => s.id === item.id);
+                if (shape) {
+                    shape.x = item.x;
+                    shape.y = item.y;
+                }
+            }
+        } else if (action.type === 'transform-shapes') {
+            this._applyShapeStates(action.shapes);
+        } else if (action.type === 'transform-shape') {
+            const shape = this.shapes.find(s => s.id === action.shapeId);
+            if (shape && action.newState) Object.assign(shape, action.newState);
+        }
+    }
+
+    _applyShapeStates(items) {
+        if (!Array.isArray(items)) return;
+
+        const geometry = _getSelectionGeometry();
+
+        for (const item of items) {
+            const shape = this.shapes.find(s => s.id === item.id);
+            if (!shape) continue;
+
+            if (item.state && geometry) {
+                geometry.restoreState(shape, item.state);
+            } else if (item.bounds) {
+                shape.x = item.bounds.x;
+                shape.y = item.bounds.y;
+                shape.width = item.bounds.width;
+                shape.height = item.bounds.height;
+            }
         }
     }
 

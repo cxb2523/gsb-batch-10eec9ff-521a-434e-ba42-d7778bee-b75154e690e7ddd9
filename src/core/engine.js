@@ -1,5 +1,24 @@
 // src/core/engine.js
 
+function _getSelectionGeometry() {
+    try {
+        if (typeof VexelSelectionGeometry !== 'undefined') return VexelSelectionGeometry;
+    } catch (e) {
+        // Ignore TDZ errors; fall back to global/module lookup.
+    }
+    if (typeof globalThis !== 'undefined' && globalThis.VexelSelectionGeometry) {
+        return globalThis.VexelSelectionGeometry;
+    }
+    if (typeof require === 'function') {
+        try {
+            return require('../tools/selection-geometry');
+        } catch (e) {
+            return null;
+        }
+    }
+    return null;
+}
+
 class VexelRenderEngine {
     constructor(vexel) {
         this.vexel = vexel;
@@ -119,48 +138,42 @@ class VexelRenderEngine {
         const selected = this.vexel.selectedShapes;
         if (selected.length === 0) return;
 
+        const geometry = _getSelectionGeometry();
+        if (!geometry) return;
+
+        const bounds = geometry.selectionBounds(selected);
+        if (!bounds) return;
+
         ctx.save();
         ctx.translate(this.vexel.viewport.x, this.vexel.viewport.y);
         ctx.scale(this.vexel.viewport.zoom, this.vexel.viewport.zoom);
 
-        for (const shape of selected) {
-            const bounds = shape.getBounds();
-            const z = this.vexel.viewport.zoom;
+        const z = this.vexel.viewport.zoom;
 
+        ctx.strokeStyle = '#4A90D9';
+        ctx.lineWidth = 1.5 / z;
+        ctx.setLineDash([6 / z, 3 / z]);
+        ctx.strokeRect(bounds.x - 2 / z, bounds.y - 2 / z, bounds.width + 4 / z, bounds.height + 4 / z);
+        ctx.setLineDash([]);
+
+        const handleSize = 7 / z;
+        const handles = geometry.handlePositions(bounds);
+
+        for (const h of Object.values(handles)) {
+            ctx.fillStyle = '#ffffff';
             ctx.strokeStyle = '#4A90D9';
             ctx.lineWidth = 1.5 / z;
-            ctx.setLineDash([6 / z, 3 / z]);
-            ctx.strokeRect(bounds.x - 2 / z, bounds.y - 2 / z, bounds.width + 4 / z, bounds.height + 4 / z);
-            ctx.setLineDash([]);
+            ctx.fillRect(h.x - handleSize / 2, h.y - handleSize / 2, handleSize, handleSize);
+            ctx.strokeRect(h.x - handleSize / 2, h.y - handleSize / 2, handleSize, handleSize);
+        }
 
-            const handleSize = 7 / z;
-            const handles = [
-                { x: bounds.x, y: bounds.y },
-                { x: bounds.x + bounds.width, y: bounds.y },
-                { x: bounds.x, y: bounds.y + bounds.height },
-                { x: bounds.x + bounds.width, y: bounds.y + bounds.height },
-                { x: bounds.x + bounds.width / 2, y: bounds.y },
-                { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height },
-                { x: bounds.x, y: bounds.y + bounds.height / 2 },
-                { x: bounds.x + bounds.width, y: bounds.y + bounds.height / 2 }
-            ];
-
-            for (const h of handles) {
-                ctx.fillStyle = '#ffffff';
-                ctx.strokeStyle = '#4A90D9';
-                ctx.lineWidth = 1.5 / z;
-                ctx.fillRect(h.x - handleSize / 2, h.y - handleSize / 2, handleSize, handleSize);
-                ctx.strokeRect(h.x - handleSize / 2, h.y - handleSize / 2, handleSize, handleSize);
-            }
-
-            if (selected.length === 1) {
-                const cx = bounds.x + bounds.width / 2;
-                const cy = bounds.y + bounds.height / 2;
-                ctx.fillStyle = '#4A90D9';
-                ctx.beginPath();
-                ctx.arc(cx, cy, 4 / z, 0, Math.PI * 2);
-                ctx.fill();
-            }
+        if (selected.length === 1) {
+            const cx = bounds.x + bounds.width / 2;
+            const cy = bounds.y + bounds.height / 2;
+            ctx.fillStyle = '#4A90D9';
+            ctx.beginPath();
+            ctx.arc(cx, cy, 4 / z, 0, Math.PI * 2);
+            ctx.fill();
         }
 
         ctx.restore();

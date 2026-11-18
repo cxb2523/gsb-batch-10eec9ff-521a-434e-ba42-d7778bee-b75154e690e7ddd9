@@ -1,0 +1,10 @@
+{
+  "name": "vexel",
+  "version": "1.0.0",
+  "description": "The Vector Graphics Engine for the Web",
+  "private": true,
+  "scripts": {
+    "test": "node tests/selection-transform.test.js"
+  },
+  "license": "MIT"
+}

@@ -1,5 +1,38 @@
 // src/utils/history.js
 
+function _getSelectionGeometry() {
+    try {
+        if (typeof VexelSelectionGeometry !== 'undefined') return VexelSelectionGeometry;
+    } catch (e) {
+        // Ignore TDZ errors; fall back to global/module lookup.
+    }
+    if (typeof globalThis !== 'undefined' && globalThis.VexelSelectionGeometry) {
+        return globalThis.VexelSelectionGeometry;
+    }
+    if (typeof require === 'function') {
+        try {
+            return require('../tools/selection-geometry');
+        } catch (e) {
+            return null;
+        }
+    }
+    return null;
+}
+
+function _applyShapeState(target, item) {
+    if (!target || !item) return;
+
+    const geometry = _getSelectionGeometry();
+    if (item.state && geometry) {
+        geometry.restoreState(target, item.state);
+    } else if (item.bounds) {
+        target.x = item.bounds.x;
+        target.y = item.bounds.y;
+        target.width = item.bounds.width;
+        target.height = item.bounds.height;
+    }
+}
+
 class VexelHistory {
     constructor(vexel, options = {}) {
         this.vexel = vexel;
@@ -118,6 +151,15 @@ class VexelHistory {
                 }
                 break;
 
+            case 'transform-shapes':
+                if (Array.isArray(action.previousShapes)) {
+                    for (const item of action.previousShapes) {
+                        const target = this.vexel.shapes.find(s => s.id === item.id);
+                        if (target) _applyShapeState(target, item);
+                    }
+                }
+                break;
+
             case 'style-change':
                 const styleShape = this.vexel.shapes.find(s => s.id === action.shapeId);
                 if (styleShape && action.previousStyle) {
@@ -178,6 +220,15 @@ class VexelHistory {
                 const shape = this.vexel.shapes.find(s => s.id === action.shapeId);
                 if (shape && action.newState) {
                     Object.assign(shape, action.newState);
+                }
+                break;
+
+            case 'transform-shapes':
+                if (Array.isArray(action.shapes)) {
+                    for (const item of action.shapes) {
+                        const target = this.vexel.shapes.find(s => s.id === item.id);
+                        if (target) _applyShapeState(target, item);
+                    }
                 }
                 break;
 
