@@ -47,7 +47,14 @@ class ZidooCoordinator(DataUpdateCoordinator[None]):
         self._audio_tracks = []
         self._subtitle_tracks = []
         self._zoom_modes = {}
+        # Identity of the media whose metadata/tracks are currently loaded.
         self._last_media_id = None
+        self._last_media_uri = None
+        # Identity for which the track/zoom lists were (re)loaded, plus the
+        # number of retries while those lists came back empty.
+        self._tracks_media_id = None
+        self._track_attempts = 0
+        self._max_track_attempts = 3
 
         super().__init__(
             hass,
@@ -75,6 +82,83 @@ class ZidooCoordinator(DataUpdateCoordinator[None]):
             for key in sources:
                 self._source_list.append(key)
 
+    def _reset_media(self) -> None:
+        """Drop all media-bound state (metadata, tracks and zoom)."""
+        self._media_info = {}
+        self._media_type = MediaType.APP
+        self._source = None
+        self._audio_tracks = []
+        self._subtitle_tracks = []
+        self._zoom_modes = {}
+        self._last_media_id = None
+        self._last_media_uri = None
+        self._tracks_media_id = None
+        self._track_attempts = 0
+        # No position belongs to the current media until a fresh one arrives.
+        self._last_update = None
+
+    def _media_changed(self, media_info: dict) -> bool:
+        """Return True when the path or media id differs from the loaded one."""
+        current_uri = media_info.get("uri")
+        current_media_id = media_info.get("id")
+        if current_uri is not None:
+            return current_uri != self._last_media_uri
+        # Some sources do not report a path: fall back to the media id.
+        return current_media_id != self._last_media_id
+
+    def _clear_old_media_metadata(self, media_info: dict) -> dict:
+        """Remove cached poster/aggregation fields that belong to the old media."""
+        stale_keys = (
+            "movie_name",
+            "tag",
+            "date",
+            "tmdb_id",
+            "imdb_id",
+            "episode",
+            "episode_name",
+            "season",
+            "season_name",
+            "series_name",
+            "type",
+        )
+        return {
+            key: value
+            for key, value in media_info.items()
+            if key not in stale_keys
+        }
+
+    async def _async_refresh_tracks(self, media_id: Any) -> None:
+        """Load audio, subtitle and zoom lists for the current media.
+
+        The lists must never be populated from a previous media. They are
+        cleared first and only filled with data fetched for this media.
+        Transient empty responses are retried a limited number of times.
+        """
+        if self._tracks_media_id == media_id and self._track_attempts >= self._max_track_attempts:
+            return
+
+        self._audio_tracks = []
+        self._subtitle_tracks = []
+        self._zoom_modes = {}
+        self._tracks_media_id = media_id
+
+        audio_tracks = await self.player.get_audio_list(log_errors=False)
+        subtitle_tracks = await self.player.get_subtitle_list(log_errors=False)
+        zoom_modes = await self.player.get_zoom_list()
+        if audio_tracks:
+            self._audio_tracks = audio_tracks
+        if subtitle_tracks:
+            self._subtitle_tracks = subtitle_tracks
+        if zoom_modes:
+            self._zoom_modes = zoom_modes
+
+        if audio_tracks or subtitle_tracks or zoom_modes:
+            # Lists loaded for this media: stop refetching on later polls.
+            self._track_attempts = self._max_track_attempts
+        else:
+            # Transient empty response: retry the next few polls.
+            self._track_attempts += 1
+
     async def _async_update_data(self) -> None:
         """Update data callback."""
         if not self.player.is_connected():
@@ -93,59 +177,96 @@ class ZidooCoordinator(DataUpdateCoordinator[None]):
                 await self.async_refresh_channels(force=False)
                 self._source = await self.player.get_source()
                 playing_info = await self.player.get_playing_info()
-                self._media_info = {}
                 if playing_info is None or not playing_info:
-                    # If the polling fails but the library says to keep the old data, keep previous state and media info. Otherwise, reset to default values.
+                    # The request failed (empty response or timeout).
                     if self.player._should_keep_stale_media():
+                        # Transient error: keep the last media and state for the
+                        # grace period. Its identity is unchanged, so the track
+                        # lists are still valid and must not be reassigned.
                         _LOGGER.debug("Keeping zidoo metadata for transient network error.")
                         if self._last_state in (MediaPlayerState.PLAYING, MediaPlayerState.PAUSED):
                             state = self._last_state
                         else:
                             state = MediaPlayerState.IDLE
                     else:
-                        self._media_info = {}
-                        self._media_type = MediaType.APP
+                        # Grace period elapsed: go idle and clear media info.
+                        self._reset_media()
                         state = MediaPlayerState.IDLE
-                        self._last_media_id = None
-                        self._source = None
-                        self._audio_tracks = []
-                        self._subtitle_tracks = []
-                        self._zoom_modes = {}
                 else:
-                    self._media_info = playing_info
-                    status = playing_info.get("status")
-                    if status and status is not None:
-                        if status == ZSTATE_PLAYING or status is True:
-                            state = MediaPlayerState.PLAYING
+                    if playing_info.get("status") in (ZSTATE_PLAYING, True):
+                        state = MediaPlayerState.PLAYING
+
                     mediatype = playing_info.get("source")
-                    if mediatype and mediatype is not None:
-                        if mediatype == "video":
-                            item_type = self._media_info.get("type")
-                            if item_type is not None and item_type == "tv":
-                                self._media_type = MediaType.TVSHOW
-                            else:
-                                self._media_type = MediaType.MOVIE
-                            self._source = ZCONTENT_VIDEO
+                    media_changed = self._media_changed(playing_info)
+                    current_media_id = playing_info.get("id")
+                    had_previous_media = (
+                        self._last_media_uri is not None
+                        or self._last_media_id is not None
+                    )
 
-                            current_media_id = self._media_info.get("id")
-                            if current_media_id != self._last_media_id:
-                                # Only fetch tracks if the media has changed
-                                self._audio_tracks = await self.player.get_audio_list(log_errors=False)
-                                self._subtitle_tracks = await self.player.get_subtitle_list(log_errors=False)
-                                self._zoom_modes = await self.player.get_zoom_list()
-                                self._last_media_id = current_media_id
-
+                    if mediatype == "video":
+                        item_type = playing_info.get("type")
+                        if item_type is not None and item_type == "tv":
+                            self._media_type = MediaType.TVSHOW
                         else:
-                            self._media_type = MediaType.MUSIC
-                            self._source = ZCONTENT_MUSIC
+                            self._media_type = MediaType.MOVIE
+                        self._source = ZCONTENT_VIDEO
 
-                            # Reset arrays if content is music
+                        if media_changed and had_previous_media:
+                            # Converge immediately: the previous media's
+                            # metadata, tracks and zoom mode no longer apply.
+                            # On the first load there is nothing to scrub.
+                            _LOGGER.debug(
+                                "Media changed (id %s -> %s); clearing previous media data.",
+                                self._last_media_id,
+                                current_media_id,
+                            )
+                            playing_info = self._clear_old_media_metadata(playing_info)
                             self._audio_tracks = []
                             self._subtitle_tracks = []
-                            self._last_media_id = None
+                            self._zoom_modes = {}
+                            self._tracks_media_id = None
+                            self._track_attempts = 0
+                            # Do not reuse the old media's position timestamp:
+                            # wait until this media reports its own position.
+                            self._last_update = None
+
+                        self._media_info = playing_info
+                        self._last_media_uri = playing_info.get("uri")
+                        self._last_media_id = current_media_id
+
+                        # Only (re)fetch tracks for the media currently playing;
+                        # empty responses are retried, never back-filled.
+                        await self._async_refresh_tracks(current_media_id)
+
+                    elif mediatype:
+                        self._media_type = MediaType.MUSIC
+                        self._source = ZCONTENT_MUSIC
+
+                        if media_changed and had_previous_media:
+                            # Music has no video tracks; drop any stale lists.
+                            self._audio_tracks = []
+                            self._subtitle_tracks = []
+                            self._zoom_modes = {}
+                            self._tracks_media_id = None
+                            self._track_attempts = 0
+                            self._last_update = None
+
+                        self._media_info = playing_info
+                        self._last_media_uri = playing_info.get("uri")
+                        self._last_media_id = current_media_id
                     else:
                         self._media_type = MediaType.APP
-                    self._last_update = utcnow()
+                        self._media_info = playing_info
+                        self._last_media_uri = playing_info.get("uri")
+                        self._last_media_id = current_media_id
+
+                    # A switched media without a position must not inherit the
+                    # previous media's timestamp; stamp only when this media
+                    # reports a position of its own (the switch block already
+                    # cleared _last_update when needed).
+                    if playing_info.get("position"):
+                        self._last_update = utcnow()
 
         except Exception as ex:  # noqa: BLE001
             _LOGGER.debug("update error: {%s}", str(ex))

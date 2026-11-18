@@ -397,6 +397,7 @@ class ZidooRC:
         self._music_type = -1
         self._last_video_path = None
         self._movie_info = {}
+        self._movie_info_uri = None
         self._current_subtitle = 0
         self._current_audio = 0
         self._current_zoom: int = 0
@@ -674,7 +675,13 @@ class ZidooRC:
             return_value["source"] = "video"
             self._current_source = ZCONTENT_VIDEO
             self._last_update = datetime.now(timezone.utc)
-            self._last_media_info = {**return_value, **self._movie_info}
+            # Only merge cached poster data that was looked up for this exact
+            # path; otherwise the previous media's metadata would be returned
+            # for the new media before its own lookup completes.
+            if self._movie_info and self._movie_info_uri == return_value.get("uri"):
+                self._last_media_info = {**return_value, **self._movie_info}
+            else:
+                self._last_media_info = dict(return_value)
             return self._last_media_info
 
         if self._audio_output_list:
@@ -692,7 +699,15 @@ class ZidooRC:
             return return_value
 
         if not return_value and self._should_keep_stale_media():
-            return self._last_media_info
+            # Transient failure within the grace period: signal that the player
+            # could not be reached without handing back the old media as if it
+            # were the current one. The coordinator retains state itself.
+            _LOGGER.debug("Playing info request failed; retaining stale state via grace period.")
+        else:
+            # No media playing or the grace period elapsed: drop cached media.
+            self._last_media_info = {}
+            self._movie_info = {}
+            self._movie_info_uri = None
 
         self._current_source = ZCONTENT_NONE
         return return_value
@@ -737,17 +752,22 @@ class ZidooRC:
                         # Clear movie info if the current URI has changed since the last lookup
                         if current_uri != self._last_video_path:
                             self._movie_info = {}
-                            
+                            self._movie_info_uri = None
+
                         self._last_video_path = current_uri
                         self._last_video_id_lookup = time.time()
                         self._video_id = await self._get_id_from_uri(self._last_video_path)
-                    
+
                     return_value["id"] = self._video_id
                     return return_value
             elif response.get("status") == 806:
                 # No video is playing (resource does not exist).
-                # Reset the stale timer.
+                # Reset the stale timer and any cached media metadata.
                 self._last_update = None
+                self._last_media_info = {}
+                self._movie_info = {}
+                self._movie_info_uri = None
+                self._video_id = -1
         # _LOGGER.debug("video play info: %s", str(response))
         return None
 
@@ -757,7 +777,6 @@ class ZidooRC:
         movie_info = {}
 
         response = await self._req_json(f"{ZidooEndpoints.POSTER_AGGREGATION_FILE}?path={urllib.parse.quote(uri)}")
-
         if response:
             movie_info["type"] = response.get("type")
             result = response.get("movie")
@@ -795,6 +814,9 @@ class ZidooRC:
 
             self._movie_info = movie_info
 
+        # Record which path this metadata belongs to so it is never merged
+        # onto a different video after a media switch.
+        self._movie_info_uri = uri
         _LOGGER.debug("new media detected (%s): %s", str(movie_id), str(movie_info))
         return movie_id
 
