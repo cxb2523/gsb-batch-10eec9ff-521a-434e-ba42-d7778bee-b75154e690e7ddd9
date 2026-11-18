@@ -154,7 +154,7 @@ Use ids of 1000 or more (the game uses up to 999). The compiler refuses an id th
 - **Commands** (`do`): `say`, `switch`, `variable` (`op`: set/add/sub), `self`, `gold`, `item`, `transfer`, `wait`, `se`, `bgm`, `common`, `plugin` (any plugin command, e.g. `"CallEvent 2, Page 2"`), `script`, `comment`, `fade`, `erase`, and `if`/`then`/`else`.
   `say` text is written to `languages/en/<mod>_map<ID>.yml` and shown with the game's own `ShowMessage`.
 - **Sprites**: use a game sprite name (`FA_KEL`) or add your own PNG at `files/img/characters/NAME.png` (works with no atlas step; `!`/`$` name prefixes keep their normal meaning).
-- The build **warns** about: touch events on blocked tiles, unknown sprites, transfers to maps that do not exist, unknown common events and out-of-range switches.
+- The build **warns** about: event pages whose trigger needs the player to step onto the event tile (`touch` / `event-touch`, unless the page is `through`) while that tile is blocked — naming the event and page, and flagging the whole event only when no page is reachable — plus unknown sprites, transfers to maps that do not exist, unknown common events and out-of-range switches. `mod map show` marks the same blocked pages in its event legend.
   It **fails** (and writes nothing) for bad ids, sizes, stamp rectangles, events outside the map and page conditions RPG Maker cannot express.
 - `examples/story-demo` is a complete working example; `test/story-demo.ts` plays it in a real browser.
 

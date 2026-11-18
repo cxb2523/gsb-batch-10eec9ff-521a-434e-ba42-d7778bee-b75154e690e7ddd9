@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { buildMaps, previewMap, type GameSource, type MapSpec } from './mapkit.ts';
+import { buildMaps, eventPageReach, pageNeedsStep, previewMap, type GameSource, type MapSpec } from './mapkit.ts';
 
 const layer = (name: string, w: number, h: number, data?: number[]) => ({ type: 'tilelayer', name, width: w, height: h, data: data ?? new Array(w * h).fill(0), opacity: 1, visible: true, x: 0, y: 0 });
 // Source map 1: collision tileset first (gid 1), art tileset "A" at gid 25. Source map 2 has a different tileset order.
@@ -102,6 +102,109 @@ describe('mapkit', () => {
         const p = previewMap(t, [{ x: 0, y: 0, name: 'door' }, { x: 2, y: 2, name: 'npc' }]);
         expect(p).toContain('A door (0,0)  [on a blocked tile]');
         expect(p).toContain('B npc (2,2)');
+    });
+
+    test('page reachability: only touch / event-touch without through needs the player to step on the tile', () => {
+        expect(pageNeedsStep('action', false)).toBe(false);
+        expect(pageNeedsStep('auto', false)).toBe(false);
+        expect(pageNeedsStep('parallel', false)).toBe(false);
+        expect(pageNeedsStep('touch', false)).toBe(true);
+        expect(pageNeedsStep('event-touch', false)).toBe(true);
+        expect(pageNeedsStep('touch', true)).toBe(false);       // through pages do not require the tile
+        expect(pageNeedsStep(1, false)).toBe(true);            // numeric RPG Maker trigger codes work too
+        expect(pageNeedsStep(3, false)).toBe(false);
+    });
+
+    test('eventPageReach judges each page against the collision layer', () => {
+        const t = parse(buildMaps('m', [spec({ blocked: ['#'] })], src()), 'files/maps/map1001.json');
+        const reach = eventPageReach(t, 0, 0, [
+            { trigger: 1, through: false },   // touch on the blocked tile
+            { trigger: 0, through: false },   // action: never tile-dependent
+            { trigger: 3, through: false },   // auto: runs without the player
+            { trigger: 1, through: true },    // touch but through
+        ]);
+        expect(reach.map(r => [r.index, r.trigger, r.needsStep, r.blocked, r.reachable])).toEqual([
+            [1, 'touch', true, true, false],
+            [2, 'action', false, false, true],
+            [3, 'auto', false, false, true],
+            [4, 'touch', false, false, true],
+        ]);
+        const open = eventPageReach(t, 2, 2, [{ trigger: 1, through: false }]);
+        expect(open[0]).toMatchObject({ needsStep: true, blocked: false, reachable: true });
+    });
+
+    test('multi-page events warn per page and never report the whole event while a page is reachable', () => {
+        // Event at (0,0) sits on a blocked tile (blocked: ['#'] blocks column 0): page 1 touch
+        // is unreachable, page 2 action can still be triggered, so the event itself is not "unreachable".
+        const b = buildMaps('m', [spec({ blocked: ['#'], events: [{
+            name: 'moody', x: 0, y: 0,
+            pages: [{ trigger: 'touch', do: [] }, { trigger: 'action', do: [] }],
+        }] })], src());
+        const w = b.warnings.join('\n');
+        expect(w).toMatch(/moody.*page 1 \(touch\).*blocked tile/);
+        expect(w).not.toMatch(/moody.*unreachable/);
+        // An event whose only other page is auto: the auto page runs, so the event stays reachable.
+        const auto = buildMaps('m', [spec({ blocked: ['#'], events: [{
+            name: 'guard', x: 0, y: 0,
+            pages: [{ trigger: 'touch', do: [] }, { trigger: 'auto', do: [] }],
+        }] })], src()).warnings.join('\n');
+        expect(auto).toMatch(/guard.*page 1 \(touch\).*blocked tile/);
+        expect(auto).not.toMatch(/guard.*unreachable/);
+    });
+
+    test('all step-dependent pages blocked: each page is named and the event is flagged unreachable', () => {
+        const b = buildMaps('m', [spec({ blocked: ['#'], events: [{
+            name: 'trapdoor', x: 0, y: 0,
+            pages: [{ trigger: 'touch', do: [] }, { trigger: 'event-touch', do: [] }],
+        }] })], src());
+        const w = b.warnings;
+        expect(w.some(m => /trapdoor.*page 1 \(touch\).*blocked tile/.test(m))).toBe(true);
+        expect(w.some(m => /trapdoor.*page 2 \(event-touch\).*blocked tile/.test(m))).toBe(true);
+        expect(w.some(m => /trapdoor.*is unreachable: every page/.test(m))).toBe(true);
+    });
+
+    test('through pages and auto/parallel pages never count as blocked', () => {
+        const b = buildMaps('m', [spec({ blocked: ['#'], events: [
+            { name: 'ghost', x: 0, y: 0, trigger: 'touch', through: true, do: [] },
+            { name: 'cutscene', x: 0, y: 0, trigger: 'parallel', do: [] },
+        ] })], src());
+        expect(b.warnings.filter(m => /ghost|cutscene/.test(m))).toEqual([]);
+        // A blocked touch page plus a through touch page: the through page keeps the event reachable.
+        const mixed = buildMaps('m', [spec({ blocked: ['#'], events: [{
+            name: 'halfway', x: 0, y: 0,
+            pages: [{ trigger: 'touch', do: [] }, { trigger: 'touch', through: true, do: [] }],
+        }] })], src()).warnings.join('\n');
+        expect(mixed).toMatch(/halfway.*page 1 \(touch\).*blocked tile/);
+        expect(mixed).not.toMatch(/halfway.*unreachable/);
+    });
+
+    test('single-page events keep the original warning wording', () => {
+        const b = buildMaps('m', [spec({ blocked: ['#'], events: [
+            { name: 'door', x: 0, y: 0, trigger: 'touch', do: [] },
+        ] })], src());
+        expect(b.warnings).toContain('map 1001: event "door" at (0,0) is on a blocked tile, so the player can never step on it (use "map show" to find an open tile)');
+    });
+
+    test('preview legend names the blocked pages of a multi-page event', () => {
+        const built = buildMaps('m', [spec({ blocked: ['#'], events: [{
+            name: 'moody', x: 0, y: 0,
+            pages: [{ trigger: 'touch', do: [] }, { trigger: 'action', do: [] }],
+        }] })], src());
+        const t = parse(built, 'files/maps/map1001.json');
+        const d = parse(built, 'files/data/Map1001.json');
+        const ev = d.events[1];
+        const p = previewMap(t, [{ x: ev.x, y: ev.y, name: ev.name, pages: ev.pages.map((pg: any) => ({ trigger: pg.trigger, through: pg.through })) }]);
+        expect(p).toContain('A moody (0,0)  [page 1 touch blocked]');
+        expect(p).not.toContain('event unreachable');
+        // Same shape as the CLI: every step-dependent page blocked adds the event-level marker.
+        const all = buildMaps('m', [spec({ blocked: ['#'], events: [{
+            name: 'trapdoor', x: 0, y: 0,
+            pages: [{ trigger: 'touch', do: [] }, { trigger: 'event-touch', do: [] }],
+        }] })], src());
+        const t2 = parse(all, 'files/maps/map1001.json');
+        const e2 = parse(all, 'files/data/Map1001.json').events[1];
+        const p2 = previewMap(t2, [{ x: e2.x, y: e2.y, name: e2.name, pages: e2.pages.map((pg: any) => ({ trigger: pg.trigger, through: pg.through })) }]);
+        expect(p2).toContain('[page 1 touch blocked; page 2 event-touch blocked]  [event unreachable]');
     });
 
     test('custom tilesets: json is generated from the PNG size and paint uses it', () => {

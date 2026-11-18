@@ -78,7 +78,10 @@ function show(args: string[]) {
     if (gi >= 0) { // preview a map of the real game, with its events
         const id = Number(args[gi + 1]);
         const t = src.tiledMap(id);
-        const ev = (src.mapData(id).events as any[]).filter(Boolean).map(e => ({ x: e.x, y: e.y, name: e.name }));
+        const ev = (src.mapData(id).events as any[]).filter(Boolean).map(e => ({
+            x: e.x, y: e.y, name: e.name,
+            pages: (e.pages as any[] | undefined)?.map(p => ({ trigger: p.trigger, through: !!p.through })) ?? [],
+        }));
         console.log(`map ${id}: ${src.mapInfos()[id]?.name ?? '?'}\n${previewMap(t, ev)}`);
         return;
     }
@@ -87,7 +90,10 @@ function show(args: string[]) {
     const dir = modDirOf(modArg), id = Number(idArg);
     const t = JSON.parse(readFileSync(join(dir, `files/maps/map${id}.json`), 'utf8'));
     const d = JSON.parse(readFileSync(join(dir, `files/data/Map${id}.json`), 'utf8'));
-    console.log(previewMap(t, (d.events as any[]).filter(Boolean).map(e => ({ x: e.x, y: e.y, name: e.name }))));
+    console.log(previewMap(t, (d.events as any[]).filter(Boolean).map((e: any) => ({
+        x: e.x, y: e.y, name: e.name,
+        pages: (e.pages as any[]).map(p => ({ trigger: p.trigger, through: !!p.through })),
+    }))));
 }
 
 function create(args: string[]) {

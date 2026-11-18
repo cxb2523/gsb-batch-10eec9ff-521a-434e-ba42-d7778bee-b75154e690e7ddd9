@@ -229,6 +229,39 @@ function pageOf(p: PageSpec, ev: EventSpec, ctx: Ctx, sys: ReturnType<GameSource
 
 const yamlStr = (s: string) => JSON.stringify(s);
 
+// ------------------------------------------------------------------ page reachability
+// Shared by the build warnings and the `map show` preview, so both answer "can the player ever
+// trigger this page?" with the same rule. Only the RPG Maker trigger mapping above decides which
+// triggers need the player to step onto the event's tile.
+const TRIGGER_NAMES: Record<number, keyof typeof TRIGGERS> = Object.fromEntries(Object.entries(TRIGGERS).map(([name, code]) => [code, name])) as Record<number, keyof typeof TRIGGERS>;
+const STEP_TRIGGERS = new Set<number>([TRIGGERS.touch, TRIGGERS['event-touch']]);
+
+/** A page the player must trigger by stepping onto the event tile: touch / event-touch, unless through. */
+export function pageNeedsStep(trigger: keyof typeof TRIGGERS | number, through: boolean): boolean {
+    const code = typeof trigger === 'number' ? trigger : TRIGGERS[trigger];
+    return STEP_TRIGGERS.has(code) && !through;
+}
+
+export interface ReachPage { trigger: number; through: boolean }
+export interface PageReach {
+    index: number;                 // 1-based page number, as shown to authors
+    trigger: keyof typeof TRIGGERS;
+    needsStep: boolean;            // the player must stand on the event's tile to trigger it
+    blocked: boolean;             // needsStep and that tile is on the collision layer
+    reachable: boolean;           // !blocked: auto/parallel/action/through pages never depend on the tile
+}
+
+/** Per-page reachability for one event, straight from the collision layer the compiler built. */
+export function eventPageReach(tiled: any, x: number, y: number, pages: ReachPage[]): PageReach[] {
+    const w = tiled.width as number;
+    const blockedHere = !!(tiled.layers as any[]).find(isCollisionLayer)?.data[y * w + x];
+    return pages.map((p, i) => {
+        const needsStep = pageNeedsStep(p.trigger, p.through);
+        const blocked = needsStep && blockedHere;
+        return { index: i + 1, trigger: TRIGGER_NAMES[p.trigger] ?? 'action', needsStep, blocked, reachable: !blocked };
+    });
+}
+
 // ------------------------------------------------------------------ build
 export function validateSpec(spec: MapSpec, fail: (m: string) => void) {
     if (!Number.isInteger(spec.id) || spec.id < 1) fail('id must be a positive integer');
@@ -321,9 +354,13 @@ export function buildMaps(modId: string, specs: MapSpec[], src0: GameSource): Bu
         (spec.events ?? []).forEach(ev => {
             if (ev.x < 0 || ev.y < 0 || ev.x >= w || ev.y >= h) err(`event "${ev.name}" at (${ev.x},${ev.y}) is outside the ${w}x${h} map`);
             const pages = (ev.pages?.length ? ev.pages : [ev]).map(p => pageOf(p, ev, ctx, sys));
-            const blockedHere = (tiled.layers as any[]).find(isCollisionLayer)?.data[ev.y * w + ev.x];
-            const reach = pages.some(p => p.trigger === 1 || p.trigger === 2) && !pages.every(p => p.through);
-            if (blockedHere && reach) warn(`event "${ev.name}" at (${ev.x},${ev.y}) is on a blocked tile, so the player can never step on it (use "map show" to find an open tile)`);
+            // Same reachability rule as the `map show` preview: judge every page, not just the event's tile.
+            const reach = eventPageReach(tiled, ev.x, ev.y, pages.map(p => ({ trigger: p.trigger, through: p.through })));
+            const blockedPages = reach.filter(r => r.blocked);
+            blockedPages.forEach(r => warn(`event "${ev.name}" page ${r.index} (${r.trigger}) at (${ev.x},${ev.y}) is on a blocked tile, so the player can never step on it`));
+            if (blockedPages.length && !reach.some(r => r.reachable)) warn(reach.length === 1
+                ? `event "${ev.name}" at (${ev.x},${ev.y}) is on a blocked tile, so the player can never step on it (use "map show" to find an open tile)`
+                : `event "${ev.name}" at (${ev.x},${ev.y}) is unreachable: every page that needs the player to step on it is on a blocked tile (use "map show" to find an open tile)`);
             events.push({ id: events.length, name: ev.name, note: ev.note ?? '', pages, x: ev.x, y: ev.y });
         });
 
@@ -358,7 +395,15 @@ export function buildMaps(modId: string, specs: MapSpec[], src0: GameSource): Bu
 
 // ------------------------------------------------------------------ preview
 /** ASCII picture of a Tiled map: '#' blocked, '.' open and drawn, ' ' open and empty, letters for events. */
-export function previewMap(tiled: any, events: { x: number; y: number; name: string }[] = []): string {
+export interface PreviewEvent { x: number; y: number; name: string; pages?: ReachPage[] }
+
+/**
+ * Pure ASCII preview. When an event carries its compiled pages, the legend marks each page whose
+ * trigger needs the player to step onto a blocked tile (same eventPageReach rule as the build), and
+ * flags the whole event only when none of its pages are reachable that way. Events without pages
+ * keep the plain tile-level marker.
+ */
+export function previewMap(tiled: any, events: PreviewEvent[] = []): string {
     const w = tiled.width as number, h = tiled.height as number;
     const col = (tiled.layers as any[]).find(isCollisionLayer);
     const drawn = (tiled.layers as any[]).filter(l => l.type === 'tilelayer' && !isCollisionLayer(l));
@@ -375,7 +420,17 @@ export function previewMap(tiled: any, events: { x: number; y: number; name: str
     events.forEach((e, n) => {
         const ch = n < 26 ? String.fromCharCode(65 + n) : '*';
         if (grid[e.y]?.[e.x] !== undefined) grid[e.y]![e.x] = ch;
-        legend.push(`${ch} ${e.name} (${e.x},${e.y})${col?.data[e.y * w + e.x] ? '  [on a blocked tile]' : ''}`);
+        let note = '';
+        if (e.pages?.length) {
+            const reach = eventPageReach(tiled, e.x, e.y, e.pages);
+            const blocked = reach.filter(r => r.blocked);
+            if (blocked.length) {
+                note = `  [${blocked.map(r => `page ${r.index} ${r.trigger} blocked`).join('; ')}]`;
+                if (!reach.some(r => r.reachable)) note += '  [event unreachable]';
+            }
+        }
+        else if (col?.data[e.y * w + e.x]) note = '  [on a blocked tile]';
+        legend.push(`${ch} ${e.name} (${e.x},${e.y})${note}`);
     });
     const ruler = '    ' + Array.from({ length: w }, (_, x) => (x % 10 === 0 ? String((x / 10) % 10) : ' ')).join('');
     const ones = '    ' + Array.from({ length: w }, (_, x) => String(x % 10)).join('');
