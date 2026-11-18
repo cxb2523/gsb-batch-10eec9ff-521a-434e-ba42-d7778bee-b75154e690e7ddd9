@@ -1,10 +1,12 @@
 import { useAtom } from 'jotai';
 import { RefreshCw, Home, Maximize, Minimize } from 'lucide-react';
 import { audioManager } from './lib/audio';
+import { keyStateManager } from './lib/keyState';
 import { screenAtom } from './atoms/gameAtoms';
 import GameContainer from './components/GameContainer';
 import { useGameLogic } from './hooks/useGameLogic';
 import { useGlobalAudio } from './hooks/useGlobalAudio';
+import { useKeyboardInput } from './hooks/useKeyboardInput';
 import { useEffect, useState } from 'react';
 import TouchOverlay from './components/TouchOverlay';
 import { useScreenOrientation } from './hooks/useScreenOrientation';
@@ -14,6 +16,7 @@ const isTouchDevice = () => 'ontouchstart' in window || navigator.maxTouchPoints
 
 function App() {
   useGlobalAudio(); // Mount the global audio handler
+  useKeyboardInput(); // Feed real keyboard events into the key state manager
   const { isFullscreen, toggleFullscreen } = useFullscreen();
   const { lockOrientation, unlockOrientation } = useScreenOrientation();
   const [screen, setScreen] = useAtom(screenAtom);
@@ -25,6 +28,7 @@ function App() {
   }, []);
 
   const handleBackToMenu = () => {
+    keyStateManager.reset(); // Clear every input source (keyboard + touches)
     audioManager.releaseAll();
     unlockOrientation();
     setScreen('levelSelect');

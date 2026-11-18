@@ -12,6 +12,7 @@ import {
 } from '../atoms/gameAtoms';
 import { useEffect, useCallback } from 'react';
 import { audioManager } from '../lib/audio';
+import { keyStateManager } from '../lib/keyState';
 import { useFullscreen } from '../hooks/useFullscreen';
 import { useScreenOrientation } from '../hooks/useScreenOrientation';
 
@@ -98,6 +99,7 @@ function ResultScreen() {
   }
 
   const handleBackToMenu = () => {
+    keyStateManager.reset(); // Clear every input source (keyboard + touches)
     audioManager.releaseAll();
     unlockOrientation();
     // Reset game state when going back to menu

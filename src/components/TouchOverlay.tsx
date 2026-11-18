@@ -1,19 +1,13 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-
-const KEY_MAP: Record<number, string> = {
-  0: 'KeyA', 1: 'KeyS', 2: 'KeyD', 3: 'KeyF',
-  4: 'KeyJ', 5: 'KeyK', 6: 'KeyL', 7: 'Semicolon',
-  8: 'Space',
-};
-
-function dispatchKeyEvent(code: string, type: 'keydown' | 'keyup') {
-  window.dispatchEvent(new KeyboardEvent(type, { code, bubbles: true }));
-}
+import { keyStateManager, TouchKeyTracker } from '../lib/keyState';
 
 function TouchOverlay() {
-  const [pressedZones, setPressedZones] = useState(Array(9).fill(false));
+  // Each touch point becomes its own source in the shared key state
+  // manager, so a key stays pressed until every finger (and the keyboard)
+  // holding it has been released.
+  const [tracker] = useState(() => new TouchKeyTracker(keyStateManager));
+  const [pressedZones, setPressedZones] = useState<boolean[]>(Array(9).fill(false));
   const zoneRefs = useRef<(HTMLDivElement | null)[]>([]);
-  const touchToZoneMap = useRef<Map<number, number>>(new Map());
   const overlayRef = useRef<HTMLDivElement>(null);
 
   const getZoneIndexFromCoordinates = useCallback((x: number, y: number) => {
@@ -29,69 +23,42 @@ function TouchOverlay() {
     return -1;
   }, []);
 
+  const syncPressedZones = useCallback(() => {
+    setPressedZones(Array.from({ length: 9 }, (_, i) => tracker.isZoneTouched(i)));
+  }, [tracker]);
+
   useEffect(() => {
     const overlayNode = overlayRef.current;
     if (!overlayNode) return;
 
     const handleTouchStart = (e: TouchEvent) => {
       e.preventDefault();
-      setPressedZones(currentPressed => {
-        const nextPressed = [...currentPressed];
-        for (const touch of Array.from(e.changedTouches)) {
-          const zoneIndex = getZoneIndexFromCoordinates(touch.clientX, touch.clientY);
-          if (zoneIndex !== -1 && !touchToZoneMap.current.has(touch.identifier)) {
-            touchToZoneMap.current.set(touch.identifier, zoneIndex);
-            dispatchKeyEvent(KEY_MAP[zoneIndex], 'keydown');
-            nextPressed[zoneIndex] = true;
-          }
-        }
-        return nextPressed;
-      });
+      for (const touch of Array.from(e.changedTouches)) {
+        tracker.touchStart(
+          touch.identifier,
+          getZoneIndexFromCoordinates(touch.clientX, touch.clientY),
+        );
+      }
+      syncPressedZones();
     };
 
     const handleTouchMove = (e: TouchEvent) => {
       e.preventDefault();
-      setPressedZones(currentPressed => {
-        const nextPressed = [...currentPressed];
-        for (const touch of Array.from(e.changedTouches)) {
-          const oldZoneIndex = touchToZoneMap.current.get(touch.identifier);
-          const newZoneIndex = getZoneIndexFromCoordinates(touch.clientX, touch.clientY);
-
-          if (oldZoneIndex !== newZoneIndex) {
-            // Release the old key
-            if (oldZoneIndex !== undefined) {
-              dispatchKeyEvent(KEY_MAP[oldZoneIndex], 'keyup');
-              nextPressed[oldZoneIndex] = false;
-            }
-            // Press the new key
-            if (newZoneIndex !== -1) {
-              touchToZoneMap.current.set(touch.identifier, newZoneIndex);
-              dispatchKeyEvent(KEY_MAP[newZoneIndex], 'keydown');
-              nextPressed[newZoneIndex] = true;
-            } else {
-              // Finger moved out of any valid zone
-              touchToZoneMap.current.delete(touch.identifier);
-            }
-          }
-        }
-        return nextPressed;
-      });
+      for (const touch of Array.from(e.changedTouches)) {
+        tracker.touchMove(
+          touch.identifier,
+          getZoneIndexFromCoordinates(touch.clientX, touch.clientY),
+        );
+      }
+      syncPressedZones();
     };
 
     const handleTouchEndOrCancel = (e: TouchEvent) => {
       e.preventDefault();
-      setPressedZones(currentPressed => {
-        const nextPressed = [...currentPressed];
-        for (const touch of Array.from(e.changedTouches)) {
-          const zoneIndex = touchToZoneMap.current.get(touch.identifier);
-          if (zoneIndex !== undefined) {
-            touchToZoneMap.current.delete(touch.identifier);
-            dispatchKeyEvent(KEY_MAP[zoneIndex], 'keyup');
-            nextPressed[zoneIndex] = false;
-          }
-        }
-        return nextPressed;
-      });
+      for (const touch of Array.from(e.changedTouches)) {
+        tracker.touchEnd(touch.identifier);
+      }
+      syncPressedZones();
     };
 
     overlayNode.addEventListener('touchstart', handleTouchStart as EventListener, { passive: false });
@@ -104,8 +71,19 @@ function TouchOverlay() {
       overlayNode.removeEventListener('touchmove', handleTouchMove as EventListener);
       overlayNode.removeEventListener('touchend', handleTouchEndOrCancel as EventListener);
       overlayNode.removeEventListener('touchcancel', handleTouchEndOrCancel as EventListener);
+      // Release every key still held by a touch point when the overlay goes away.
+      tracker.reset();
     };
-  }, [getZoneIndexFromCoordinates]);
+  }, [getZoneIndexFromCoordinates, tracker, syncPressedZones]);
+
+  // Drop any leftover touches when the game state is reset
+  // (level restart, back to menu, level complete).
+  useEffect(() => {
+    return keyStateManager.onReset(() => {
+      tracker.reset();
+      setPressedZones(Array(9).fill(false));
+    });
+  }, [tracker]);
 
   return (
     <div

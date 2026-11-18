@@ -10,21 +10,9 @@ import {
   gameActiveAtom,
 } from '../atoms/gameAtoms';
 import { audioManager } from '../lib/audio';
-
-const CODE_MAP: Record<string, { index: number, key: string }> = {
-  'KeyA': { index: 0, key: 'a' },
-  'KeyS': { index: 1, key: 's' },
-  'KeyD': { index: 2, key: 'd' },
-  'KeyF': { index: 3, key: 'f' },
-  'Space': { index: 4, key: ' ' },
-  'KeyJ': { index: 5, key: 'j' },
-  'KeyK': { index: 6, key: 'k' },
-  'KeyL': { index: 7, key: 'l' },
-  'Semicolon': { index: 8, key: ';' },
-};
+import { KEY_CODE_MAP, keyStateManager } from '../lib/keyState';
 
 export function useGameLogic() {
-  const pressedKeys = useRef(new Set<string>());
   const setScreen = useSetAtom(screenAtom);
   const currentLevel = useAtomValue(currentLevelAtom);
   const setPlayerState = useSetAtom(playerStateAtom);
@@ -52,8 +40,8 @@ export function useGameLogic() {
   }, [currentLevel, currentStep, startTime, gameActive]);
 
   const resetGameState = useCallback(() => {
+    keyStateManager.reset(); // Clear every input source (keyboard + touches)
     audioManager.releaseAll();
-    pressedKeys.current.clear();
     setPlayerState([0, 0, 0, 0, 0, 0, 0, 0, 0]);
     setCurrentStep(0);
     setStartTime(0);
@@ -70,8 +58,8 @@ export function useGameLogic() {
       if (step < level.patterns.length - 1) {
         setCurrentStep(step + 1);
       } else {
+        keyStateManager.reset();
         audioManager.releaseAll();
-        pressedKeys.current.clear();
         setPlayerState([0, 0, 0, 0, 0, 0, 0, 0, 0]);
         const endTime = Date.now();
         setFinalTime(endTime - time);
@@ -81,12 +69,9 @@ export function useGameLogic() {
   }, [setCurrentStep, setFinalTime, setScreen, setPlayerState]);
 
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const keyInfo = CODE_MAP[e.code];
-      if (keyInfo === undefined || !stateRef.current.gameActive || pressedKeys.current.has(e.code)) return;
-
-      e.preventDefault();
-      pressedKeys.current.add(e.code);
+    const handlePress = (code: string) => {
+      const keyInfo = KEY_CODE_MAP[code];
+      if (keyInfo === undefined || !stateRef.current.gameActive) return;
 
       setStartTime((prevStartTime) => {
         if (prevStartTime === 0) {
@@ -94,7 +79,7 @@ export function useGameLogic() {
         }
         return prevStartTime;
       });
-      
+
       setPlayerState(prevPlayerState => {
         const newState = [...prevPlayerState];
         newState[keyInfo.index] = 1;
@@ -103,12 +88,9 @@ export function useGameLogic() {
       });
     };
 
-    const handleKeyUp = (e: KeyboardEvent) => {
-      const keyInfo = CODE_MAP[e.code];
+    const handleRelease = (code: string) => {
+      const keyInfo = KEY_CODE_MAP[code];
       if (keyInfo === undefined || !stateRef.current.gameActive) return;
-
-      e.preventDefault();
-      pressedKeys.current.delete(e.code);
 
       setPlayerState(prevPlayerState => {
         const newState = [...prevPlayerState];
@@ -118,12 +100,12 @@ export function useGameLogic() {
       });
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
+    const unsubscribePress = keyStateManager.onPress(handlePress);
+    const unsubscribeRelease = keyStateManager.onRelease(handleRelease);
 
     return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
+      unsubscribePress();
+      unsubscribeRelease();
     };
   }, [checkWinCondition, setPlayerState, setStartTime]); // Dependencies are now stable
 
