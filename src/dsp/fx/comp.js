@@ -34,7 +34,10 @@ export class Comp {
     this.ms = 0; this.pk = 0; this.grFast = 0; this.grSlow = 0; this.gain = 1; this.reduction = 0; this.amt = 0;
   }
 
-  tailActive() { return false; }
+  // Unreleased gain reduction is a tail: if the synth's idle bypass froze the detector here, the
+  // release would stop mid-flight and the next note would start with the stale attenuation. The
+  // 0.05 dB floor is the inaudible-residual point where the chain may finally go idle.
+  tailActive() { return this.grFast < -0.05 || this.grSlow < -0.05; }
 
   /** Current gain reduction in dB (≤ 0), for meters. */
   getReduction() { return this.reduction; }
@@ -53,7 +56,8 @@ export class Comp {
     this.amt += (tA - this.amt) * (1 - Math.exp(-n / (0.05 * this.sr)));
     if (tA <= 0 && this.amt < 1e-4) {
       this.amt = 0;
-      if (this.gain !== 1) { this.gain = 1; this.grFast = this.grSlow = 0; }
+      // Off = exact bypass with no lingering state: tailActive() must go false so the chain can idle.
+      this.gain = 1; this.grFast = this.grSlow = 0;
       this.reduction = 0;
       return;
     }

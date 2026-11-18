@@ -222,7 +222,7 @@ Each effect is its own class/file (`drive.js chorus.js phaser.js delay.js reverb
 * delay: `sync` ≠ off → time from bpm; else `time`. Feedback path with `tone` (LP/HP band limiting, darker as tone → 0), `pingpong` (cross-feed amount), `wobble` (tape wow/flutter), soft saturation in loop, smooth time changes (no zipper; pitch-glide like tape is fine).
 * reverb: high-quality **FDN** (8+ lines, Hadamard/Householder mixing, modulated delay lines, frequency-dependent decay for `decay` T60 and `damp`), input diffusion allpasses, `size` scales delay lengths, `predelay`, `width`, `shimmer` (+12 st pitch shifter in the feedback path, blended by shimmer — lush, not metallic), `mix`. This is a centrepiece: must sound lush, smooth, no metallic ringing, no flutter.
 * eq: low shelf 120 Hz, peaking at `eq.midfreq` (Q≈0.9), high shelf 8 kHz (RBJ biquads).
-* comp (`comp.amount`): gentle stereo-linked bus glue compressor (ratio ~2–4 rising with amount, auto makeup).
+* comp (`comp.amount`): gentle stereo-linked bus glue compressor (ratio ~2–4 rising with amount, auto makeup). Unreleased gain reduction counts as a tail: `tailActive()` stays true until the reduction has released to ≈0, so the synth's idle bypass never freezes the release mid-flight (which would duck the next note's onset with stale attenuation).
 * limiter (always on, after master.volume): lookahead ~1.5 ms, ceiling −0.3 dBFS, never outputs > 1.0 or NaN. Clean when not limiting.
 
 ## 8. UI (src/ui/, css/)

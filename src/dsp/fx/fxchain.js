@@ -81,6 +81,12 @@ export class FxChain {
   /** True while any effect still has internal state that can produce output (e.g. delay/reverb tails). */
   tailActive() {
     if (this.delay.tailActive() || this.reverb.tailActive()) return true;
+    // The glue compressor works on input level, so a silent input means "no tail" for every other
+    // effect — but its gain reduction is still releasing. Bypassing now would freeze that release
+    // and the next note would start with stale attenuation, so keep the chain alive until the
+    // reduction has returned to (inaudible) zero. Not gated by inQuiet: silence is exactly when
+    // the release must keep running.
+    if (this.comp.tailActive()) return true;
     const mod = this.drive.tailActive() || this.chorus.tailActive() || this.phaser.tailActive();
     return mod && this.inQuiet < this.quietLimit;
   }

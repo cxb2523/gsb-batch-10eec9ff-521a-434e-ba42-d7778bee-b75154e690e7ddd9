@@ -989,6 +989,62 @@ async function jobFxTailAndCpu() {
   return rows;
 }
 
+// Glue comp vs the synth idle bypass: unreleased gain reduction is a tail — the chain must stay
+// awake until it has released (else the next note starts with stale attenuation), and must still
+// go idle once the release is done (or when the comp is off).
+async function jobFxCompIdle() {
+  const M = await synthMod();
+  if (!M?.renderOffline) return [row('fx', 'comp idle bypass', 'SKIP', 'synth.js unavailable')];
+  const sr = 48000;
+  const base = {
+    'drive.on': false, 'chorus.on': false, 'phaser.on': false, 'delay.on': false, 'reverb.on': false,
+    'eq.low': 0, 'eq.mid': 0, 'eq.high': 0, 'filter.on': false,
+    'aenv.a': 0.002, 'aenv.d': 0.1, 'aenv.s': 1, 'aenv.r': 0.02,
+    'amp.level': 6, 'master.volume': 0,
+  };
+  const note = [{ time: 0, type: 'on', note: 60, vel: 1 }, { time: 0.4, type: 'off', note: 60 }];
+  const onset = r => peakOf(r.L, r.R, 0, Math.round(0.03 * sr));
+  const run = (amt, silence) => {
+    const patch = { params: { ...base, 'comp.amount': amt }, macros: [] };
+    const r1 = M.renderOffline(patch, note, 0.4 + silence, sr); // note, then silence
+    const s = r1.synth;
+    const st = { gr: s.fx.getCompReduction(), tail: s.fx.tailActive(), idle: s.idleSamples >= s.idleAfter, p1: onset(r1) };
+    const r2 = M.renderOffline(null, note, 0.5, sr, { synth: s }); // second note on the same synth
+    st.ratio = onset(r2) / st.p1;
+    return st;
+  };
+  const rows = [];
+  { // 0.5 s silence with heavy comp: release must keep running (no idle bypass), no stale ducking
+    const t = run(1, 0.5);
+    const probs = [];
+    if (t.idle) probs.push('chain entered idle bypass with unreleased gain reduction');
+    if (!t.tail) probs.push('tailActive() false while reduction unreleased');
+    if (!(t.gr > -5)) probs.push(`release froze at ${t.gr.toFixed(1)} dB`);
+    if (!(t.ratio > 0.9)) probs.push(`second note onset ducked (peak ratio ${t.ratio.toFixed(2)})`);
+    rows.push(row('fx', 'comp keeps chain awake until release (0.5 s gap)', probs.length ? 'FAIL' : 'PASS',
+      [`reduction ${t.gr.toFixed(1)} dB after the gap · onset ratio ${t.ratio.toFixed(2)} · idle bypass ${t.idle ? 'ON' : 'off'}`, ...probs.map(p => `✗ ${p}`)].join('\n')));
+  }
+  { // comp off: nothing to release → idle bypass must still engage
+    const t = run(0, 0.5);
+    const probs = [];
+    if (t.tail) probs.push('tailActive() true with comp off');
+    if (!t.idle) probs.push('idle bypass never engaged with comp off');
+    rows.push(row('fx', 'comp off → idle bypass still engages', probs.length ? 'FAIL' : 'PASS',
+      [`tailActive ${t.tail} · idle bypass ${t.idle ? 'on' : 'OFF'}`, ...probs.map(p => `✗ ${p}`)].join('\n')));
+  }
+  { // 8 s silence (≫ 0.9 s slow release): release completes → bypass engages, next note clean
+    const t = run(1, 8);
+    const probs = [];
+    if (t.tail) probs.push(`tailActive() still true after 8 s (reduction ${t.gr.toFixed(2)} dB)`);
+    if (!t.idle) probs.push('idle bypass never engaged after full release');
+    if (!(t.gr > -0.5)) probs.push(`residual reduction ${t.gr.toFixed(2)} dB after 8 s`);
+    if (!(t.ratio > 0.9)) probs.push(`note after full release ducked (peak ratio ${t.ratio.toFixed(2)})`);
+    rows.push(row('fx', 'comp release completes → idle bypass resumes (8 s gap)', probs.length ? 'FAIL' : 'PASS',
+      [`reduction ${t.gr.toFixed(2)} dB after 8 s · onset ratio ${t.ratio.toFixed(2)} · idle bypass ${t.idle ? 'on' : 'OFF'}`, ...probs.map(p => `✗ ${p}`)].join('\n')));
+  }
+  return rows;
+}
+
 // ───────────────────────── Synth jobs ─────────────────────────
 async function synthMod() {
   const m = await tryLoad('src/dsp/synth.js');
@@ -2263,7 +2319,7 @@ async function jobCompat({ part, mode }) {
 // ───────────────────────── Job dispatch ─────────────────────────
 const JOBS = {
   engineConfig: jobEngineConfig, engineQuality: jobEngineQuality, filter: jobFilter, filterResponse: jobFilterResponse,
-  fx: jobFx, fxTail: jobFxTailAndCpu, synthApi: jobSynthApi, synthStress: jobSynthStress, synthAlloc: jobSynthAlloc, preset: jobPreset, presetPlaying: jobPresetPlaying, worklet: jobWorklet,
+  fx: jobFx, fxTail: jobFxTailAndCpu, fxCompIdle: jobFxCompIdle, synthApi: jobSynthApi, synthStress: jobSynthStress, synthAlloc: jobSynthAlloc, preset: jobPreset, presetPlaying: jobPresetPlaying, worklet: jobWorklet,
   songlib: jobSonglib, songRender: jobSongRender, ensemble: jobEnsemble, songWorklet: jobSongWorklet, magic: jobMagic,
   compat: jobCompat, ui: jobUi,
 };
@@ -2311,6 +2367,7 @@ async function buildJobs(suites, mode, presetFilter) {
     jobs.push({ suite: 'fx', kind: 'fx', name: 'toggle effects on/off every 21 ms', weight: 1, args: { name: 'toggle effects on/off every 21 ms', values: allOn, srs: [48000], toggle: true } });
     jobs.push({ suite: 'fx', kind: 'fx', name: 'random FX params every block', weight: 1, args: { name: 'random FX params every block', values: allOn, srs: [48000], sweep: true } });
     jobs.push({ suite: 'fx', kind: 'fxTail', weight: 3, args: {} });
+    jobs.push({ suite: 'fx', kind: 'fxCompIdle', weight: 2, args: {} });
   }
   if (suites.has('synth')) {
     jobs.push({ suite: 'synth', kind: 'synthApi', weight: 4, args: {} });
