@@ -183,6 +183,8 @@ Pass the VTT URL, the slider loads it once and preloads the sprite sheets on the
 
 The VTT file and images must be reachable from the page (same origin or CORS enabled for the VTT file).
 
+If the VTT file fails to load (network error, non-2xx response or no cues inside), the hover tooltip falls back to `getPreviewScreenUrl` when it is provided; without the callback it still shows the hovered time and the time code label. While a VTT file is loading, no preview frame is shown, and switching `previewThumbnails` to another URL never displays frames of the previous URL. Loaded URLs are cached, so switching back to one shows its thumbnails immediately without a new request.
+
 ### Generating thumbnails
 
 The package includes a CLI that generates sprite sheets and the VTT file. It requires [ffmpeg](https://ffmpeg.org/) (`ffmpeg` and `ffprobe` in `PATH`):
