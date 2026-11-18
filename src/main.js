@@ -892,33 +892,45 @@ function setFrame(dir, step, running = false) {
 // walls/roofs behind it). If something is in front, it occludes normally.
 // Every sprite pixel uses the depth of the FEET (pulled slightly forward):
 // whatever is in front of the feet covers the whole body; whatever is behind never cuts it.
-sprite.renderOrder = 10;
-const feetUniforms = { uFeet: { value: new THREE.Vector3() } };
-sprite.material.depthTest = true;
-sprite.material.depthWrite = true;
-sprite.material.onBeforeCompile = (shader) => {
-  shader.uniforms.uFeet = feetUniforms.uFeet;
-  shader.vertexShader = shader.vertexShader
-    .replace("#include <common>", "#include <common>\nuniform vec3 uFeet;")
-    .replace(
-      "#include <project_vertex>",
-      `#include <project_vertex>
+//
+// The same shader is installed on the local sprite and on every remote trainer
+// (each gets its own uFeet uniform), so other players are occluded by lamp
+// posts, houses and fences exactly like the local one.
+const FEET_MARGIN = 2.4; // 2.4: covers the body height seen from above (tops of
+// objects right behind are closer to the camera than the feet). Smaller = objects
+// behind cut the head; larger = the sprite draws over things in front of it.
+// The returned uniform { value } is updated every frame with the sprite's feet.
+function applyFeetDepth(mesh) {
+  const uFeet = { value: new THREE.Vector3() };
+  mesh.renderOrder = 10;
+  mesh.material.depthTest = true;
+  mesh.material.depthWrite = true;
+  mesh.material.onBeforeCompile = (shader) => {
+    shader.uniforms.uFeet = uFeet;
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nuniform vec3 uFeet;")
+      .replace(
+        "#include <project_vertex>",
+        `#include <project_vertex>
 vec4 feetClip = projectionMatrix * viewMatrix * vec4(uFeet, 1.0);
 gl_Position.z = (feetClip.z / feetClip.w) * gl_Position.w;`,
-    );
-};
-function updateOcclusion() {
-  // reference point: the feet, pulled a bit toward the camera
-  const feet = new THREE.Vector3(pos.x, pos.y + 0.2, pos.z);
-  // 2.4: covers the body height seen from above (tops of objects right behind
-  // are closer to the camera than the feet). Smaller = objects behind cut the head;
-  // larger = the sprite starts drawing over things that are in front of it.
+      );
+  };
+  return uFeet;
+}
+// Feet reference point for a mesh standing at (x, y, z), pulled toward the camera.
+function feetPoint(x, y, z) {
+  const feet = new THREE.Vector3(x, y + 0.2, z);
   const toCam = camera.position
     .clone()
     .sub(feet)
     .normalize()
-    .multiplyScalar(2.4);
-  feetUniforms.uFeet.value.copy(feet.add(toCam));
+    .multiplyScalar(FEET_MARGIN);
+  return feet.add(toCam);
+}
+const localFeetUniform = applyFeetDepth(sprite);
+function updateOcclusion() {
+  localFeetUniform.value.copy(feetPoint(pos.x, pos.y, pos.z));
 }
 
 // ---- Movement ----
@@ -1038,7 +1050,7 @@ elName.addEventListener("click", () => {
   });
   inp.addEventListener("blur", () => inp.isConnected && close(true));
 });
-const others = new Map(); // id -> { mesh, tex, cfg, target, dir, step, name }
+const others = new Map(); // id -> { mesh, tex, cfg, target, dir, step, name, feetUniform }
 let myId = null;
 let ws = null;
 
@@ -1050,27 +1062,57 @@ function setFrameTex(tex, cfg, d, step) {
   tex.offset.set(x / img.width, 1 - (y + h) / img.height);
 }
 
+// Every remote trainer keeps its OWN crop config (a copy), so switching one
+// player's look or falling back to the grid never changes another player's.
+const cloneCfg = (cfg) => ({ ...cfg, rows: { ...cfg.rows }, origin: [...cfg.origin] });
+
 function createOther(p) {
   const g = p.gender === "female" ? "female" : "male";
   const available = sheetAvailable(g);
+  // Build the character object first, so the (asynchronous) texture callbacks
+  // always close over THIS character instead of an unassigned local variable.
+  // Each remote trainer gets an independent texture and crop configuration:
+  // several players of the same gender never share or overwrite each other's.
+  const o = {
+    mesh: null,
+    tex: null,
+    cfg: cloneCfg(available ? CROP[g] : GRID),
+    target: new THREE.Vector3(p.x, 0, p.z),
+    dir: p.dir || "down",
+    step: p.step || 0,
+    name: p.name,
+    feetUniform: null,
+  };
   const tex = available
     ? texLoader.load(
         SHEETS[g],
+        // success: this sheet belongs to character `o` only
         () => {
-          removeBackground(tex, CROP[g]);
-          setFrameTex(tex, CROP[g], o.dir, o.step);
+          // a gender switch / leave may have replaced this character before the
+          // sheet finished loading; don't touch a texture that is gone or reused
+          if (others.get(p.id) !== o) return;
+          tex.magFilter = tex.minFilter = THREE.NearestFilter;
+          tex.colorSpace = THREE.SRGBColorSpace;
+          removeBackground(tex, o.cfg); // make the sheet background transparent
+          setFrameTex(tex, o.cfg, o.dir, o.step); // initial frame from its own crop
         },
         undefined,
+        // failure: fall back to the code-generated original trainer
         () => {
-          failedSheets.add(g);
-          o.cfg = GRID;
+          if (others.get(p.id) !== o) return;
+          failedSheets.add(g); // remember the bad sheet, don't request it again
+          o.cfg = cloneCfg(GRID); // the original trainer uses the 4x4 grid layout
           tex.image = generateOriginalTrainer(g);
+          tex.magFilter = tex.minFilter = THREE.NearestFilter;
+          tex.colorSpace = THREE.SRGBColorSpace;
           tex.needsUpdate = true;
+          setFrameTex(tex, o.cfg, o.dir, o.step);
         },
       )
     : new THREE.CanvasTexture(generateOriginalTrainer(g));
   tex.magFilter = tex.minFilter = THREE.NearestFilter;
   tex.colorSpace = THREE.SRGBColorSpace;
+  o.tex = tex;
   const mesh = new THREE.Mesh(
     characterGeo,
     new THREE.MeshLambertMaterial({
@@ -1090,18 +1132,15 @@ function createOther(p) {
   });
   mesh.castShadow = true;
   mesh.scale.copy(sprite.scale);
+  // the whole remote sprite takes the depth of its feet, exactly like the local
+  // sprite, so lamp posts/houses in front of the feet cover the whole body
+  o.feetUniform = applyFeetDepth(mesh);
   scene.add(mesh);
-  const o = {
-    mesh,
-    tex,
-    cfg: available ? CROP[g] : GRID,
-    target: new THREE.Vector3(p.x, 0, p.z),
-    dir: p.dir || "down",
-    step: p.step || 0,
-    name: p.name,
-  };
+  o.mesh = mesh;
   mesh.position.copy(o.target);
   others.set(p.id, o);
+  // the generated fallback already has an image: show the first frame at once
+  if (!available) setFrameTex(tex, o.cfg, o.dir, o.step);
   updateCount();
   return o;
 }
@@ -1137,13 +1176,14 @@ function connect() {
       const o = others.get(m.id);
       if (o) o.name = m.name;
     } else if (m.t === "gender") {
-      // recreate the character with the other gender's look, keeping the position
+      // recreate the character with the other gender's look, keeping the current
+      // position (the interpolated mesh position), facing, walk step and name
       const o = others.get(m.id);
       if (o) {
         const p = {
           id: m.id,
-          x: o.target.x,
-          z: o.target.z,
+          x: o.mesh.position.x,
+          z: o.mesh.position.z,
           dir: o.dir,
           step: o.step,
           name: o.name,
@@ -1201,6 +1241,12 @@ function updateOthers(dt) {
     );
     m.position.y = topHeight(m.position.x, m.position.z);
     m.rotation.copy(sprite.rotation);
+    // whole sprite takes the depth of its own feet, like the local trainer:
+    // objects in front of the feet cover the whole body, nothing behind cuts it
+    if (o.feetUniform)
+      o.feetUniform.value.copy(
+        feetPoint(m.position.x, m.position.y, m.position.z),
+      );
     setFrameTex(o.tex, o.cfg, o.dir, o.step);
   }
 }
@@ -1392,3 +1438,4 @@ function loop() {
   requestAnimationFrame(loop);
 }
 loop();
+
