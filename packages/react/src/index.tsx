@@ -140,7 +140,12 @@ export const Kawarp = forwardRef<KawarpRef, KawarpProps>(function Kawarp(
   const initializedRef = useRef(false);
   const currentSrcRef = useRef<string | undefined>(undefined);
   const lastVideoRef = useRef<HTMLVideoElement | null | undefined>(undefined);
-  const posterVideoRef = useRef<HTMLVideoElement | null | undefined>(undefined);
+  // Whether the canvas currently shows a video frame rather than an image.
+  // Every image load clears it and the first video frame sets it; it is not
+  // reset when the video element changes because the on-screen content has
+  // not changed until a new frame actually arrives.
+  const screenShowsVideoRef = useRef(false);
+  const frameCallbackIdRef = useRef<number | null>(null);
   const onLoadRef = useRef(onLoad);
   const onErrorRef = useRef(onError);
   const videoFailedRef = useRef(false);
@@ -197,7 +202,7 @@ export const Kawarp = forwardRef<KawarpRef, KawarpProps>(function Kawarp(
     // Load initial image if provided; with a video it shows until the first frame
     if (src) {
       currentSrcRef.current = src;
-      posterVideoRef.current = video;
+      screenShowsVideoRef.current = false;
       kawarp
         .loadImage(src)
         .then(() => {
@@ -242,7 +247,7 @@ export const Kawarp = forwardRef<KawarpRef, KawarpProps>(function Kawarp(
       ? srcChanged && (video !== previousVideo || videoFailedRef.current)
       : srcChanged || (leavingVideo && !videoFailedRef.current);
     if (src && shouldLoad) {
-      posterVideoRef.current = video;
+      screenShowsVideoRef.current = false;
       kawarp
         .loadImage(src)
         .then(() => onLoad?.())
@@ -263,10 +268,35 @@ export const Kawarp = forwardRef<KawarpRef, KawarpProps>(function Kawarp(
     if (video && autoPlay) kawarpRef.current?.start();
   }, [video]);
 
+  // Mark the on-screen content as video once the current element presents a
+  // frame. A failure before that point leaves the poster visible or loading,
+  // so the fallback must not reload that same src (which would duplicate the
+  // load and its onLoad event). Options-only re-runs keep the flag instead of
+  // resetting the video's progress, and switching elements keeps whatever is
+  // still on screen until a new frame arrives.
+  useEffect(() => {
+    const kawarp = kawarpRef.current;
+    if (!video || !kawarp || screenShowsVideoRef.current) return;
+    if (video.readyState >= video.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+      screenShowsVideoRef.current = true;
+      return;
+    }
+    if (typeof video.requestVideoFrameCallback !== "function") return;
+    frameCallbackIdRef.current = video.requestVideoFrameCallback(() => {
+      frameCallbackIdRef.current = null;
+      screenShowsVideoRef.current = true;
+    });
+    return () => {
+      if (frameCallbackIdRef.current !== null) {
+        video.cancelVideoFrameCallback(frameCallbackIdRef.current);
+        frameCallbackIdRef.current = null;
+      }
+    };
+  }, [video]);
+
   useEffect(() => {
     const kawarp = kawarpRef.current;
     if (!kawarp || !video || videoFailedRef.current) return;
-    let loadingVideo = true;
     const reportVideoError = (error: unknown) => {
       videoFailedRef.current = true;
       onErrorRef.current?.(
@@ -274,8 +304,12 @@ export const Kawarp = forwardRef<KawarpRef, KawarpProps>(function Kawarp(
       );
       const fallbackSrc = currentSrcRef.current;
       if (!fallbackSrc || kawarpRef.current !== kawarp) return;
-      // A failure on the first frame leaves the poster requested in this commit on screen
-      if (loadingVideo && posterVideoRef.current === video) return;
+      // No video frame has replaced the poster, so it is still visible or its
+      // in-flight load will show it: reloading src now would duplicate the
+      // load and its onLoad event
+      if (!screenShowsVideoRef.current) {
+        return;
+      }
       kawarp
         .loadImage(fallbackSrc)
         .then(() => onLoadRef.current?.())
@@ -292,7 +326,6 @@ export const Kawarp = forwardRef<KawarpRef, KawarpProps>(function Kawarp(
     } catch (error) {
       reportVideoError(error);
     }
-    loadingVideo = false;
   }, [
     video,
     videoOptions?.sampleWidth,

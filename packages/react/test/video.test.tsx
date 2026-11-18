@@ -1,3 +1,4 @@
+import { Kawarp as KawarpCore } from "@kawarp/core";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -73,6 +74,44 @@ const videoWithoutFrameCallbacks = (): HTMLVideoElement => {
     value: undefined,
   });
   return video;
+};
+
+/**
+ * A video element with a controllable requestVideoFrameCallback. Frame
+ * callbacks stay queued until flushFrameCallbacks() runs, so tests decide
+ * exactly when the component learns a frame reached the screen.
+ */
+const controllableVideo = (): {
+  video: HTMLVideoElement;
+  flushFrameCallbacks: () => void;
+} => {
+  const video = document.createElement("video");
+  const frameCallbacks = new Map<number, VideoFrameRequestCallback>();
+  let nextCallbackId = 1;
+  video.requestVideoFrameCallback = (callback) => {
+    const id = nextCallbackId++;
+    frameCallbacks.set(id, callback);
+    return id;
+  };
+  video.cancelVideoFrameCallback = (id) => {
+    frameCallbacks.delete(id);
+  };
+  return {
+    video,
+    flushFrameCallbacks: () => {
+      for (const callback of frameCallbacks.values()) {
+        callback(performance.now(), {
+          presentationTime: performance.now(),
+          expectedDisplayTime: performance.now(),
+          width: 32,
+          height: 32,
+          mediaTime: 0,
+          presentedFrames: 1,
+        });
+      }
+      frameCallbacks.clear();
+    },
+  };
 };
 
 const mount = () => {
@@ -221,6 +260,109 @@ describe("Kawarp video prop", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(onLoad).toHaveBeenCalledTimes(1);
+  });
+
+  it("loads src only once when a video fails asynchronously before its first frame", async () => {
+    const onLoad = vi.fn();
+    const onError = vi.fn();
+    const src = solidImageUrl(BLUE);
+    const { container, root } = mount();
+    await act(async () => {
+      root.render(
+        <Kawarp
+          {...COLOR_FAITHFUL}
+          src={src}
+          onLoad={onLoad}
+          onError={onError}
+        />,
+      );
+    });
+    await waitForColor(container, BLUE, 3);
+    onLoad.mockClear();
+
+    // A video that accepts loadVideo but never delivers a frame callback, so
+    // the failure surfaces through the core onError before the first frame
+    const { video } = controllableVideo();
+    let reportFailure: ((error: unknown) => void) | undefined;
+    const loadVideoSpy = vi.spyOn(KawarpCore.prototype, "loadVideo");
+    loadVideoSpy.mockImplementation((_element, options) => {
+      reportFailure = options?.onError;
+    });
+    try {
+      await act(async () => {
+        root.render(
+          <Kawarp
+            {...COLOR_FAITHFUL}
+            src={src}
+            video={video}
+            onLoad={onLoad}
+            onError={onError}
+          />,
+        );
+      });
+      await act(async () => {
+        reportFailure?.(new Error("frame upload failed"));
+      });
+    } finally {
+      loadVideoSpy.mockRestore();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onLoad).not.toHaveBeenCalled();
+    // The poster was never replaced by the failed video
+    expect(colorDistance(centerPixel(container), BLUE)).toBeLessThan(3);
+  });
+
+  it("falls back to src once when a video fails after showing a frame", async () => {
+    const onLoad = vi.fn();
+    const onError = vi.fn();
+    const src = solidImageUrl(BLUE);
+    const { container, root } = mount();
+    await act(async () => {
+      root.render(
+        <Kawarp
+          {...COLOR_FAITHFUL}
+          src={src}
+          onLoad={onLoad}
+          onError={onError}
+        />,
+      );
+    });
+    await waitForColor(container, BLUE, 3);
+    onLoad.mockClear();
+
+    // Frame callbacks fire on demand, so the component's frame-tracking flag
+    // is set deterministically before the failure
+    const { video, flushFrameCallbacks } = controllableVideo();
+
+    let reportFailure: ((error: unknown) => void) | undefined;
+    const loadVideoSpy = vi.spyOn(KawarpCore.prototype, "loadVideo");
+    loadVideoSpy.mockImplementation((_element, options) => {
+      reportFailure = options?.onError;
+    });
+    try {
+      await act(async () => {
+        root.render(
+          <Kawarp
+            {...COLOR_FAITHFUL}
+            src={src}
+            video={video}
+            onLoad={onLoad}
+            onError={onError}
+          />,
+        );
+      });
+      await act(async () => {
+        // A frame reached the screen, then the video fails on a later upload
+        flushFrameCallbacks();
+        reportFailure?.(new Error("mid-stream upload failed"));
+      });
+    } finally {
+      loadVideoSpy.mockRestore();
+    }
+    await vi.waitFor(() => expect(onLoad).toHaveBeenCalledTimes(1));
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(colorDistance(centerPixel(container), BLUE)).toBeLessThan(3);
   });
 
   it("loads src changes after the video has failed", async () => {

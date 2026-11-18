@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   Kawarp,
   type KawarpContextOptions,
@@ -373,6 +373,91 @@ describe("unloading and replacing video", () => {
     }
     lateVideo.pause();
     expect(darkest).toBeGreaterThan(20);
+    // Zero duration replaces the poster outright: no NaN blend and the video
+    // color is fully on screen instead of lingering on the poster
+    const finalColor = centerPixel(canvas);
+    expect(Number.isNaN(finalColor[0])).toBe(false);
+    expect(colorDistance(finalColor, CORAL)).toBeLessThan(DECODE_TOLERANCE);
+  });
+
+  it("keeps the poster visible while a playing video waits for its first frame", async () => {
+    const source = await createVideo(paintSolid(CORAL));
+    const { instance, canvas } = createKawarp({ transitionDuration: 400 });
+    instance.loadImageElement(createSolidCanvas(BLUE));
+    instance.start();
+    const lateVideo = document.createElement("video");
+    lateVideo.muted = true;
+    instance.loadVideo(lateVideo);
+
+    // The video has no decoded data yet, so every rendered frame stays on the poster
+    for (let frame = 0; frame < 5; frame++) {
+      await nextAnimationFrame();
+      expect(colorDistance(centerPixel(canvas), BLUE)).toBeLessThan(3);
+    }
+
+    lateVideo.srcObject = source.video.srcObject;
+    await lateVideo.play();
+    await settleVideo(lateVideo);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    // After the first frame the crossfade completes and the video takes over
+    expect(colorDistance(centerPixel(canvas), CORAL)).toBeLessThan(
+      DECODE_TOLERANCE,
+    );
+  });
+
+  it("crossfades from the poster to the video and settles on the video color", async () => {
+    const { video } = await createVideo(paintSolid(CORAL));
+    const { instance, canvas } = createKawarp({ transitionDuration: 300 });
+    instance.loadImageElement(createSolidCanvas(BLUE));
+    instance.start();
+    instance.loadVideo(video);
+    await nextAnimationFrame();
+    const midColor = centerPixel(canvas);
+    expect(colorDistance(midColor, BLUE)).toBeLessThan(
+      colorDistance(midColor, CORAL),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    await nextAnimationFrame();
+    expect(colorDistance(centerPixel(canvas), CORAL)).toBeLessThan(
+      DECODE_TOLERANCE,
+    );
+  });
+
+  it("reports a first-frame upload error via onError and keeps the poster", () => {
+    const { instance, canvas } = createKawarp({});
+    instance.loadImageElement(createSolidCanvas(BLUE));
+    const video = document.createElement("video");
+    Object.defineProperty(video, "readyState", {
+      configurable: true,
+      value: video.HAVE_CURRENT_DATA,
+    });
+    Object.defineProperty(video, "videoWidth", {
+      configurable: true,
+      value: 32,
+    });
+    Object.defineProperty(video, "videoHeight", {
+      configurable: true,
+      value: 32,
+    });
+
+    const gl = canvas.getContext("webgl");
+    if (!gl) throw new Error("webgl unavailable");
+    const originalUpload = gl.texImage2D;
+    gl.texImage2D = function (this: WebGLRenderingContext, ...args: unknown[]) {
+      if (args.includes(video)) throw new Error("upload failed");
+      return originalUpload.apply(this, args as never);
+    } as typeof gl.texImage2D;
+
+    const onError = vi.fn();
+    try {
+      instance.loadVideo(video, { onError });
+    } finally {
+      gl.texImage2D = originalUpload;
+    }
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+    instance.renderFrame(1);
+    expect(colorDistance(centerPixel(canvas), BLUE)).toBeLessThan(3);
   });
 
   it("shows an image as the poster of a newer video after an older video's frame appeared mid-load", async () => {
