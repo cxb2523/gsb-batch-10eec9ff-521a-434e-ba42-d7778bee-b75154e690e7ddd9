@@ -16,6 +16,7 @@ import { WebGLComparisonRenderer } from '../../lib/webgl/WebGLComparisonRenderer
 import { getComparisonModeInfo } from '../../lib/webgl/comparison-shaders'
 import { useOptimizedClipSync } from '../../hooks/useOptimizedVideoSync'
 import { computeMetricsFromWebGLCanvas } from '../../lib/webgl/metricsComputation'
+import { isValidROI, normalizeROI } from '../../lib/webgl/roi'
 import { BarChart3, Ruler, FlipHorizontal, ZoomIn, ZoomOut, RotateCcw, Crosshair, Camera, Copy, Scan, X, LineChart, FileText, Palette, AlertTriangle, Activity, Image, Video } from 'lucide-react'
 import type { ROIRect } from '../../types'
 import { TemporalDiffGraph } from './TemporalDiffGraph'
@@ -386,6 +387,14 @@ export function WebGLComparison() {
     }
   }, [render])
 
+  // WEBGL-004 / WEBGL-008: Reset the metrics throttle whenever the ROI or the
+  // A/B orientation changes so the panel reflects the new sampling region (or
+  // the full frame after clearing the ROI) on the next animation frame instead
+  // of waiting up to 500ms.
+  useEffect(() => {
+    lastMetricsTimeRef.current = 0
+  }, [webglComparisonSettings.roi, webglComparisonSettings.flipAB])
+
   // WEBGL-001: Compute metrics periodically (every 500ms)
   // Uses stable media sources and respects flipAB for correct A/B mapping
   useEffect(() => {
@@ -456,7 +465,7 @@ export function WebGLComparison() {
         cancelAnimationFrame(metricsTimerRef.current)
       }
     }
-  }, [webglComparisonSettings.showMetricsOverlay, webglComparisonSettings.threshold, webglComparisonSettings.roi, stableMediaA, stableMediaB, imagesLoaded, setWebGLAnalysisMetrics])
+  }, [webglComparisonSettings.showMetricsOverlay, webglComparisonSettings.threshold, webglComparisonSettings.roi, webglComparisonSettings.flipAB, stableMediaA, stableMediaB, imagesLoaded, setWebGLAnalysisMetrics])
 
   // Handle mouse move for interactive modes
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -467,13 +476,12 @@ export function WebGLComparison() {
     setMousePos({ x, y })
     setScreenMousePos({ x: e.clientX - rect.left, y: e.clientY - rect.top })
 
-    // WEBGL-004: Handle ROI drawing
+    // WEBGL-004: Handle ROI drawing.
+    // ROI coordinates are recorded in screen orientation (top-left origin, y
+    // downward) so the overlay and the pixel sampling share one convention;
+    // the WebGL-flipped `y` above must NOT be used for the ROI.
     if (isDrawingROI) {
-      const roiX = Math.min(roiStart.x, x)
-      const roiY = Math.min(roiStart.y, yScreen)
-      const roiWidth = Math.abs(x - roiStart.x)
-      const roiHeight = Math.abs(yScreen - roiStart.y)
-      setTempROI({ x: roiX, y: roiY, width: roiWidth, height: roiHeight })
+      setTempROI(normalizeROI(roiStart.x, roiStart.y, x, yScreen))
       return
     }
 
@@ -566,10 +574,11 @@ export function WebGLComparison() {
 
   // WEBGL-007: Handle mouse up / WEBGL-004: Commit ROI
   const handleMouseUp = useCallback(() => {
-    // WEBGL-004: Commit ROI if drawing
+    // WEBGL-004: Commit ROI if drawing. The 1% minimum-size rule is enforced
+    // here for immediate feedback and again inside the metrics computation, so
+    // an undersized ROI never changes the (full-frame) metrics.
     if (isDrawingROI && tempROI) {
-      // Only set ROI if it has a reasonable size (more than 1% in each dimension)
-      if (tempROI.width > 0.01 && tempROI.height > 0.01) {
+      if (isValidROI(tempROI)) {
         setROI(tempROI)
       }
       setIsDrawingROI(false)

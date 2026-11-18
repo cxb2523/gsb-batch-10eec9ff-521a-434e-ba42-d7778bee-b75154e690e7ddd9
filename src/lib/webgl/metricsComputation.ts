@@ -2,13 +2,35 @@
  * WebGL Analysis Metrics Computation
  * WEBGL-001: Compute SSIM, Delta E, pixel difference stats from image data
  * WEBGL-004: Support ROI (Region of Interest) for localized analysis
+ *
+ * Sampling contract:
+ * - ROI normalized coordinates use the screen/2D-canvas orientation (top-left
+ *   origin, y grows downward), identical to how the ROI overlay is drawn.
+ * - When a valid ROI (>= 1% of the frame in both dimensions) is supplied, every
+ *   metric is computed from the SAME set of sampled pixels inside that ROI.
+ * - With no/invalid ROI, sampling covers the full frame.
  */
 
 import type { WebGLAnalysisMetrics, ROIRect } from '../../types'
+import { getROIPixelBounds, isValidROI } from './roi.ts'
+
+export interface RGB {
+  r: number
+  g: number
+  b: number
+}
 
 /**
- * Sample pixels from image data at regular intervals for performance
- * WEBGL-004: Support ROI region for localized sampling
+ * Sample pixels from image data at regular intervals.
+ *
+ * The ROI is resolved to integer pixel bounds via {@link getROIPixelBounds},
+ * which enforces the top-left-origin / positive-size contract and the 1%
+ * minimum size. A and B are always sampled at the identical (x, y) positions so
+ * every downstream metric shares one sample set.
+ *
+ * When a ROI is so small that the regular stride would skip it entirely, the
+ * stride collapses to 1 within that dimension instead of returning zero
+ * samples (which would otherwise produce misleading zeroed metrics).
  */
 function samplePixels(
   data: Uint8ClampedArray,
@@ -16,17 +38,21 @@ function samplePixels(
   height: number,
   sampleRate: number = 4,
   roi?: ROIRect | null
-): { r: number; g: number; b: number }[] {
-  const samples: { r: number; g: number; b: number }[] = []
+): RGB[] {
+  const samples: RGB[] = []
 
-  // Calculate actual pixel bounds from ROI (normalized 0-1 coords)
-  const startX = roi ? Math.floor(roi.x * width) : 0
-  const startY = roi ? Math.floor(roi.y * height) : 0
-  const endX = roi ? Math.floor((roi.x + roi.width) * width) : width
-  const endY = roi ? Math.floor((roi.y + roi.height) * height) : height
+  const bounds = getROIPixelBounds(roi ?? null, width, height)
+  const startX = bounds ? bounds.startX : 0
+  const startY = bounds ? bounds.startY : 0
+  const endX = bounds ? bounds.endX : width
+  const endY = bounds ? bounds.endY : height
 
-  for (let y = startY; y < endY; y += sampleRate) {
-    for (let x = startX; x < endX; x += sampleRate) {
+  // Ensure a small ROI still contributes samples instead of being skipped.
+  const stepX = bounds && bounds.endX - bounds.startX < sampleRate ? 1 : sampleRate
+  const stepY = bounds && bounds.endY - bounds.startY < sampleRate ? 1 : sampleRate
+
+  for (let y = startY; y < endY; y += stepY) {
+    for (let x = startX; x < endX; x += stepX) {
       const i = (y * width + x) * 4
       samples.push({
         r: data[i],
@@ -104,8 +130,8 @@ function deltaE94(lab1: { L: number; a: number; b: number }, lab2: { L: number; 
  * Calculate simplified SSIM for a window of pixels
  */
 function calculateSSIM(
-  pixelsA: { r: number; g: number; b: number }[],
-  pixelsB: { r: number; g: number; b: number }[]
+  pixelsA: RGB[],
+  pixelsB: RGB[]
 ): number {
   if (pixelsA.length !== pixelsB.length || pixelsA.length === 0) {
     return 0
@@ -148,6 +174,20 @@ function calculateSSIM(
   return numerator / denominator
 }
 
+function emptyMetrics(): WebGLAnalysisMetrics {
+  return {
+    ssim: 0,
+    deltaE: 0,
+    diffPixelPercent: 0,
+    peakDifference: 0,
+    meanDifference: 0,
+    timestamp: Date.now(),
+    passPixelCount: 0,
+    failPixelCount: 0,
+    totalPixelCount: 0
+  }
+}
+
 /**
  * Compute all WebGL analysis metrics from two canvases
  * @param canvasA - Canvas containing image A
@@ -165,17 +205,7 @@ export function computeWebGLMetrics(
   const ctxB = canvasB.getContext('2d')
 
   if (!ctxA || !ctxB) {
-    return {
-      ssim: 0,
-      deltaE: 0,
-      diffPixelPercent: 0,
-      peakDifference: 0,
-      meanDifference: 0,
-      timestamp: Date.now(),
-      passPixelCount: 0,
-      failPixelCount: 0,
-      totalPixelCount: 0
-    }
+    return emptyMetrics()
   }
 
   const width = Math.min(canvasA.width, canvasB.width)
@@ -188,8 +218,12 @@ export function computeWebGLMetrics(
 }
 
 /**
- * Compute metrics directly from image data
- * WEBGL-004: Support ROI region for localized analysis
+ * Compute metrics directly from image data.
+ *
+ * WEBGL-004: When a valid ROI is supplied, SSIM, Delta E, diff-pixel ratio,
+ * peak/mean difference and the pass/fail counts are ALL derived from the same
+ * ROI sample set. An invalid/too-small ROI (or null) falls back to the whole
+ * frame.
  */
 export function computeMetricsFromImageData(
   imageDataA: ImageData,
@@ -202,15 +236,18 @@ export function computeMetricsFromImageData(
   const dataA = imageDataA.data
   const dataB = imageDataB.data
 
-  // Sample pixels for performance (every 4th pixel)
-  const sampleRate = 4
-  const pixelsA = samplePixels(dataA, width, height, sampleRate, roi)
-  const pixelsB = samplePixels(dataB, width, height, sampleRate, roi)
+  // Centralize the 1% rule: a ROI that does not qualify means full-frame.
+  const effectiveROI = isValidROI(roi ?? null) ? roi ?? null : null
 
-  // Calculate SSIM
+  // One shared sample set for every metric (same x/y positions in A and B).
+  const sampleRate = 4
+  const pixelsA = samplePixels(dataA, width, height, sampleRate, effectiveROI)
+  const pixelsB = samplePixels(dataB, width, height, sampleRate, effectiveROI)
+
+  // Calculate SSIM over the shared sample set
   const ssim = calculateSSIM(pixelsA, pixelsB)
 
-  // Calculate Delta E and pixel differences
+  // Calculate Delta E and pixel differences over the same sample set
   let totalDeltaE = 0
   let diffPixelCount = 0
   let peakDiff = 0
@@ -251,7 +288,7 @@ export function computeMetricsFromImageData(
     peakDifference: peakDiff,
     meanDifference: numSamples > 0 ? totalDiff / numSamples : 0,
     timestamp: Date.now(),
-    // WEBGL-006: Threshold pass/fail stats
+    // WEBGL-006: Threshold pass/fail stats (same sample set)
     passPixelCount,
     failPixelCount: diffPixelCount,
     totalPixelCount: numSamples
@@ -289,20 +326,11 @@ export function computeMetricsFromWebGLCanvas(
   const ctxB = canvasB.getContext('2d')
 
   if (!ctxA || !ctxB) {
-    return {
-      ssim: 0,
-      deltaE: 0,
-      diffPixelPercent: 0,
-      peakDifference: 0,
-      meanDifference: 0,
-      timestamp: Date.now(),
-      passPixelCount: 0,
-      failPixelCount: 0,
-      totalPixelCount: 0
-    }
+    return emptyMetrics()
   }
 
-  // Draw video frames to canvases
+  // Draw video frames to canvases. Both frames share the same dimensions so the
+  // ROI (normalized 0-1) maps to identical pixel regions in A and B.
   ctxA.drawImage(videoA, 0, 0, sampleWidth, sampleHeight)
   ctxB.drawImage(videoB, 0, 0, sampleWidth, sampleHeight)
 
