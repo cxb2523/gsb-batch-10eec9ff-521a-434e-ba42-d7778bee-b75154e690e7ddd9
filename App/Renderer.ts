@@ -16,24 +16,46 @@ export default class Renderer {
 	}
 
 	render(mode: Mode, readings: Reading[], access_point: AccessPoint | null): void {
+		// fewer than three readings cannot form a triangle; clear out any stale heat map
+		if (readings.length < 3) {
+			this.clear();
+			return;
+		}
+
 		const triangulation = new Triangulation(mode, readings, access_point);
 		if (triangulation.vertex_coordinates.length === 0 || triangulation.vertex_coordinates.length % 6 !== 0
-			|| triangulation.vertex_color_parts.length === 0 || triangulation.vertex_color_parts.length % 12 !== 0)
+			|| triangulation.vertex_color_parts.length === 0 || triangulation.vertex_color_parts.length % 12 !== 0) {
+			this.clear();
 			return;
+		}
 
-		this.setOffset(this.canvas, this.gl, this.shader_program);
+		// clear first so a previous heat map never shows through the new, partially-transparent triangles
+		this.clear();
+		this.setOffset();
 		this.setCoords(triangulation);
 		this.setColors(triangulation);
 		this.gl.drawArrays(this.gl.TRIANGLES, 0, triangulation.vertex_coordinates.length / 2);
 	}
 
-	clear(): void {
-		this.gl.clear(this.gl.DEPTH_BUFFER_BIT);
+	resize(width: number, height: number): void {
+		this.canvas.width = width;
+		this.canvas.height = height;
+
+		this.setOffset();
 	}
 
-	private setOffset(canvas: HTMLCanvasElement, gl: WebGL2RenderingContext, shader_program: WebGLProgram): void {
-		const offset_uniform = gl.getUniformLocation(shader_program, "u_offset");
-		gl.uniform2f(offset_uniform, canvas.clientWidth, canvas.clientHeight);
+	clear(): void {
+		this.gl.clear(this.gl.COLOR_BUFFER_BIT | this.gl.DEPTH_BUFFER_BIT);
+	}
+
+	private setOffset(): void {
+		// the pixel size is kept in sync with the displayed size by resize(); fall back to the displayed size
+		// when the canvas has not been sized yet
+		const width = this.canvas.width || this.canvas.clientWidth;
+		const height = this.canvas.height || this.canvas.clientHeight;
+
+		const offset_uniform = this.gl.getUniformLocation(this.shader_program, "u_offset");
+		this.gl.uniform2f(offset_uniform, width, height);
 	}
 
 	private setCoords(triangulation: Triangulation): void {

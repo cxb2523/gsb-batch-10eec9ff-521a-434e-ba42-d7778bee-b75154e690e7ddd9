@@ -37,14 +37,6 @@ export default defineComponent({
 			return this.signal_service?.lastUpdated ?? "";
 		}
 	},
-	watch: {
-		mode(): void {
-			this.refresh();
-		},
-		selected(): void {
-			this.refresh();
-		}
-	},
 	async mounted(): void {
 		this.background_parser = this.background_parser_factory();
 
@@ -55,11 +47,6 @@ export default defineComponent({
 		this.renderer = this.renderer_factory(canvas);
 
 		await start;
-	},
-	methods: {
-		refresh(): void {
-			this.renderer?.render(this.mode, this.readings, this.selected);
-		}
 	}
 });
 </script>

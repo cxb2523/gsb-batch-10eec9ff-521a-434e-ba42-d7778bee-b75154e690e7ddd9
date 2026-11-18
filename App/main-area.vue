@@ -33,15 +33,17 @@ export default defineComponent({
 		enabled: Boolean
 	},
 	data: () => ({
-		state: SharedState
+		state: SharedState,
+		resize_handler: null as (() => void) | null
 	}),
 	mounted(): void {
-		const canvas = document.getElementById("webglcanvas") as HTMLCanvasElement;
-		if (canvas != null) {
-			canvas.width = canvas.clientWidth;
-			canvas.height = canvas.clientHeight;
-		}
-		window.addEventListener("resize", this.refresh);
+		this.resize_handler = () => this.resize();
+		window.addEventListener("resize", this.resize_handler);
+		this.resize();
+	},
+	beforeUnmount(): void {
+		if (this.resize_handler != null)
+			window.removeEventListener("resize", this.resize_handler);
 	},
 	methods: {
 		add(e: MouseEvent): void {
@@ -56,8 +58,23 @@ export default defineComponent({
 			this.state.readings.push(reading);
 			this.refresh();
 		},
+		resize(): void {
+			const canvas = document.getElementById("webglcanvas") as HTMLCanvasElement | null;
+			if (canvas == null) {
+				this.refresh();
+				return;
+			}
+
+			// keep the canvas pixel size in sync with its displayed size so the heat map is not stretched or offset
+			const width = canvas.clientWidth;
+			const height = canvas.clientHeight;
+			canvas.width = width;
+			canvas.height = height;
+
+			this.state.resize(width, height);
+		},
 		refresh(): void {
-			this.state.renderer?.render(this.state.mode, this.state.readings, this.state.selected);
+			this.state.refresh();
 		}
 	}
 });
