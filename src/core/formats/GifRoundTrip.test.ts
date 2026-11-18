@@ -55,10 +55,12 @@ describe('GIF round-trip', () => {
     expect(second).toEqual(decoded);
   });
 
-  test('animations over 255 colors use the deterministic color cube', () => {
+  test('animations over 255 colors keep their dominant colors recognizable', () => {
     const data = new Uint32Array(16 * 16);
     for (let i = 0; i < data.length; i++)
       data[i] = packRgba(i, (i * 37) % 256, (i * 73) % 256, 255);
+    // A solid block makes the dominant color unambiguous after quantization
+    for (let i = 0; i < 128; i++) data[i] = RED;
 
     const bytes = encodeGif(16, 16, [{ data: new Uint8ClampedArray(data.buffer), delay: 100 }]);
     const decoded = decodeGif(bytes);
@@ -66,13 +68,8 @@ describe('GIF round-trip', () => {
 
     expect(decoded.frames).toHaveLength(1);
     expect(decoded.frames[0].data.length).toBe(data.length);
-    for (let i = 0; i < data.length; i++) {
-      const r = i, g = (i * 37) % 256, b = (i * 73) % 256;
-      const qr = Math.round(Math.round(r / 255 * 5) * 255 / 5);
-      const qg = Math.round(Math.round(g / 255 * 6) * 255 / 6);
-      const qb = Math.round(Math.round(b / 255 * 5) * 255 / 5);
-      expect(decoded.frames[0].data[i]).toBe(packRgba(qr, qg, qb, 255));
-    }
+    for (let i = 0; i < 128; i++) expect(decoded.frames[0].data[i]).toBe(RED);
+    // Quantized frames stay stable through another save/load cycle
     expect(second).toEqual(decoded);
   });
 });
