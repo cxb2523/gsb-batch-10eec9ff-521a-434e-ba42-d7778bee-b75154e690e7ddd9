@@ -154,7 +154,19 @@ class Game {
     };
     $('btn-rematch').onclick = () => {
       this._click();
-      if (this._isNet) { this.net?.send({ type: 'cmd', cmd: 'rematch' }); return; }   // 双方都会收到回声并各自重开
+      if (this._isNet) {
+        if (this.netRole === 'host') {
+          // 主机权威：先本地重开，再把重赛命令转发给客机（与 start 命令的主机流程对称）
+          this.net?.send({ type: 'cmd', cmd: 'rematch' });
+          this.ui.hide('screen-result');
+          this.score = [0, 0]; this.round = 1;
+          this.startMatch(this.picks[0], this.picks[1]);
+        } else {
+          // 客机仅请求，收到主机回声后在 onStart 里重开
+          this.net?.send({ type: 'cmd', cmd: 'rematch' });
+        }
+        return;
+      }
       this.ui.hide('screen-result');
       this.score = [0, 0]; this.round = 1;
       this.startMatch(this.picks[0], this.picks[1]);
@@ -463,6 +475,7 @@ class Game {
     // 舞台轮换（可用 &stage=night|forest|sunset 固定）
     const order = ['sunset', 'night', 'forest'];
     const stageId = this._stageParam || order[(this._stageSeq++) % order.length];
+    this._stageId = stageId;
     this.stageRef?.dispose();
     this.stageRef = buildStage(this.scene, stageId);
     this.round = 1; this.score = [0, 0];
@@ -525,15 +538,21 @@ class Game {
       f.comboCount = 0;
       f.meter = Math.min(f.meter, 100);   // 能量跨回合保留
       f.renderX = null;
+      f.resetRoundVisual();               // 清掉上一回合残留的攻击片段/必杀/姿势/倒地旋转
     }
     this.timer = GAME.roundTime;
     this.subPhase = 'intro'; this.subT = 0;
     this.world.timeScale = 1;
     this.world.hitstop = 0;
+    this._koLoserIdx = null;
+    this._camSnap = true;                 // 新回合开局相机立即收敛到标准取景
     this.ui.setTimer(this.timer);
-    this.ui.announce(`ROUND ${this.round}`, { dur: 1.0 });
-    SFX.roundBell();
-    if (this._isNet) this.netEvt({ k: 'round', n: this.round });   // 转发给客机
+    // 联机时由主机统一播报并转发 round 事件，客机只在事件处理里播报（避免双重公告）
+    if (this.mode !== 'net-guest') {
+      this.ui.announce(`ROUND ${this.round}`, { dur: 1.0 });
+      SFX.roundBell();
+      if (this._isNet) this.netEvt({ k: 'round', n: this.round });   // 转发给客机
+    }
   }
 
   _onFighterEvent(type, data) {
@@ -679,9 +698,11 @@ class Game {
     if (this.subPhase === 'intro') {
       if (this.subT >= 1.15 && !this._fightAnnounced) {
         this._fightAnnounced = true;
-        this.ui.announce('开打！', { dur: 0.8, size: 'clamp(64px,11vw,150px)' });
-        SFX.roundBell();
-        if (this._isNet) this.netEvt({ k: 'fight' });
+        if (this.mode !== 'net-guest') {
+          this.ui.announce('开打！', { dur: 0.8, size: 'clamp(64px,11vw,150px)' });
+          SFX.roundBell();
+          if (this._isNet) this.netEvt({ k: 'fight' });
+        }
       }
       if (this.subT >= 1.7) { this.subPhase = 'live'; this.subT = 0; this._fightAnnounced = false; }
     } else if (this.subPhase === 'live') {
@@ -799,6 +820,7 @@ class Game {
       phase: this.phase, sub: this.subPhase,
       t: +this.timer.toFixed(2), round: this.round,
       score: [...this.score],
+      stage: this._stageId,   // 权威舞台 ID：客机据此重建，避免两端各自随机导致舞台不一致
       f: [a.serialize(), b.serialize()],
       evts: this._pendingNetEvts.splice(0, this._pendingNetEvts.length),
     };
@@ -806,19 +828,51 @@ class Game {
 
   netEvt(o) { if (this._isNet) this._pendingNetEvts.push(o); }
 
-  /** 客机：应用主机快照 */
+  /** 客机：应用主机快照 —— 数值、子阶段、界面阶段全部向主机收敛 */
   _applyNetState(snap) {
     if (!this.fighters.length || !snap || !snap.f) return;
     this._netLatest = snap;
+
+    // 0) 舞台以主机为准：客机不自行随机，快照里的舞台变化时重建场景（不动斗士对象）
+    if (snap.stage && snap.stage !== this._stageId) {
+      this._stageId = snap.stage;
+      this.stageRef?.dispose();
+      this.stageRef = buildStage(this.scene, snap.stage);
+      this._camSnap = true;
+    }
+
+    // 1) 子阶段切换：同步姿态与相机取景（intro/live/koSlow/roundend）
+    const subChanged = snap.sub && snap.sub !== this.subPhase;
+    if (subChanged) {
+      this.subPhase = snap.sub;
+      this.subT = 0;
+      if (snap.sub === 'intro') this._camSnap = true;          // 新回合开场：相机立刻回到标准取景
+      if (snap.sub === 'koSlow' && this._koLoserIdx == null) { // 事件丢失时的兜底定位
+        const idx = this.fighters[0].state === 'ko' ? 0 : (this.fighters[1].state === 'ko' ? 1 : null);
+        this._koLoserIdx = idx;
+      }
+    }
+
+    // 2) 木偶数值/姿态（内部按状态变化重建攻击与必杀片段）
     for (let i = 0; i < 2; i++) this.fighters[i].applySnapshot(snap.f[i]);
     this.timer = snap.t; this.round = snap.round; this.score = snap.score;
+
+    // 3) 主机转发的事件（特效/音效/公告/回合清理）
     if (snap.evts?.length) this._playNetEvts(snap.evts);
+
+    // 4) 界面阶段收敛
     if (snap.phase === 'result' && this.phase === 'fight') {
+      // 主机进入结算：客机退出战斗画面并展示结算（胜利姿势由快照 state='win' 驱动）
       this.phase = 'result';
       const wIdx = snap.score[0] >= GAME.roundsToWin ? 0 : 1;
+      this._winnerIdx = wIdx;
       const w = this.fighters[wIdx];
-      if (w.state !== 'win') { w.state = 'win'; this._poseState = 'win'; w.model.setPose({ armL: [-0.25, 0, 2.35], foreL: [-0.4, 0, 0], armR: [-0.25, 0, -2.35], foreR: [-0.4, 0, 0], head: [-0.15, 0, 0] }); }
       this.ui.showResult(w.char.name, w.isP1 ? 'P1' : 'P2', snap.score[0], snap.score[1]);
+    } else if (snap.phase === 'fight' && this.phase === 'result') {
+      // 主机已重赛（cmd 丢失/乱序兜底）：客机退出结算界面，回到战斗 HUD
+      this.phase = 'fight';
+      this.ui.hide('screen-result');
+      this.ui.showOnly(['hud', 'ctrl-hint']);
     }
   }
 
@@ -841,12 +895,18 @@ class Game {
           break;
         }
         case 'ko':
+          this._koLoserIdx = ev.slot;   // 慢动作期间相机聚焦败者
           SFX.ko();
           this.fx.flash(0.55);
           this.fx.ring(new THREE.Vector3(this.fighters[ev.slot].x, 1.3, 0), 0xffd76b, 2.4, 0.55);
           this.ui.announce('K.O.', { dur: 1.6, size: 'clamp(90px,17vw,240px)' });
           break;
         case 'round':
+          // 新回合：清掉上一回合残留的姿势/特效/相机焦点，防止旧状态覆盖新回合
+          for (const f of this.fighters) f.resetRoundVisual();
+          this.fx.clear();
+          this._koLoserIdx = null;
+          this._camSnap = true;
           this.ui.announce(`ROUND ${ev.n}`, { dur: 1.0 });
           SFX.roundBell();
           break;
@@ -862,7 +922,7 @@ class Game {
     }
   }
 
-  /** 客机主循环：木偶渲染 + HUD 镜像 */
+  /** 客机主循环：木偶渲染 + HUD 镜像（纯渲染，不推进任何战斗逻辑） */
   _tickFightGuest(dt) {
     const [f1, f2] = this.fighters;
     // 自动驾驶（测试）：本地 AI 决策经输入通道上行到主机执行
@@ -873,7 +933,13 @@ class Game {
     }
     for (const f of this.fighters) f.puppetStep(dt);
     this.fx.update(dt);
-    this.fcam.update(dt, f1, f2, {});
+    // 相机取景随主机子阶段切换：KO 慢动作聚焦败者，新回合开场立即归位
+    const opts = {};
+    if (this.subPhase === 'koSlow' && this._koLoserIdx != null) {
+      opts.koFocus = this.fighters[this._koLoserIdx];
+    }
+    if (this._camSnap) { opts.snap = true; this._camSnap = false; }
+    this.fcam.update(dt, f1, f2, opts);
     this.ui.updateHud(f1, f2, dt);
     this.ui.setTimer(this.timer);
   }

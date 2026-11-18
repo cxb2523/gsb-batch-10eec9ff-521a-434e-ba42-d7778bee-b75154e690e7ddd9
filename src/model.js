@@ -4,6 +4,7 @@
  * 关节层级 + 姿态插值动画系统（攻击动画由招式数据驱动）
  */
 import * as THREE from 'three';
+import { SPECIAL_POSES } from './moves.js';
 
 // ---------- 共享材质工具 ----------
 let _furBump = null;
@@ -115,6 +116,27 @@ export function buildAttackClip(move) {
       { t: tEnd, p: move.poseGuard || {} },
     ],
   };
+}
+
+/**
+ * 必杀技动画片段 —— 主机 Fighter.startSpecial 与客机快照重建共用同一份构造逻辑，
+ * 保证两端必杀演出的关键帧姿态完全一致（客机不做任何战斗模拟）
+ */
+export function buildSpecialClip(sp) {
+  if (sp.kind === 'fly') {
+    return { dur: sp.startup, keys: [{ t: 0, p: {} }, { t: 0.6, p: { torso: [0.5, 0, 0], legL: [-0.7, 0, 0.1], legR: [-0.7, 0, -0.1] } }, { t: sp.startup, p: SPECIAL_POSES.flyStrike }] };
+  } else if (sp.kind === 'upper') {
+    return { dur: sp.startup + sp.active, keys: [{ t: 0, p: SPECIAL_POSES.upperWindup }, { t: sp.startup * 0.8, p: SPECIAL_POSES.upperWindup }, { t: sp.startup + sp.active * 0.6, p: SPECIAL_POSES.upperStrike }] };
+  } else if (sp.kind === 'rush') {
+    return { dur: sp.startup + sp.active, keys: [{ t: 0, p: { torso: [0.5, 0, 0], head: [-0.3, 0, 0], legL: [-0.4, 0, 0.1], legR: [-0.4, 0, -0.1] } }, { t: sp.startup + sp.active, p: {} }] };
+  } else if (sp.kind === 'coil') {
+    return { dur: sp.startup + sp.active, keys: [{ t: 0, p: {} }, { t: sp.startup * 0.8, p: SPECIAL_POSES.coilWindup }, { t: sp.startup + sp.active, p: SPECIAL_POSES.coilWindup }] };
+  } else if (sp.kind === 'storm') {
+    return { dur: sp.startup + sp.active, keys: [{ t: 0, p: {} }, { t: sp.startup, p: SPECIAL_POSES.stormRise }, { t: sp.startup + sp.active, p: SPECIAL_POSES.stormRise }] };
+  } else if (sp.kind === 'pack') {
+    return { dur: sp.startup + sp.active, keys: [{ t: 0, p: {} }, { t: sp.startup * 0.7, p: SPECIAL_POSES.packHowl }, { t: sp.startup + sp.active, p: SPECIAL_POSES.packHowl }] };
+  }
+  return { dur: sp.startup + sp.active + sp.recovery, keys: [{ t: 0, p: { torso: [0.3, 0, 0] } }, { t: sp.startup + sp.active, p: {} }] };
 }
 
 // =====================================================================

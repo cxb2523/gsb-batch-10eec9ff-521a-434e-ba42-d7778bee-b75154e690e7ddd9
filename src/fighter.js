@@ -4,8 +4,8 @@
  */
 import * as THREE from 'three';
 import { FighterModel } from './model.js';
-import { MOVES, SPECIALS, SPECIAL_POSES } from './moves.js';
-import { buildAttackClip } from './model.js';
+import { MOVES, SPECIALS } from './moves.js';
+import { buildAttackClip, buildSpecialClip } from './model.js';
 import { ARENA, PHYS, GAME } from './config.js';
 
 const V3 = new THREE.Vector3();
@@ -116,22 +116,8 @@ export class Fighter {
     this.lastHitTick = -9;   // 清除上一招的节拍残留，否则多段必杀后续段全部失效
     this.comboTick = 0;
     this.onEvent('special', { who: this, special: sp });
-    // 模型动画
-    if (sp.kind === 'fly') {
-      this.model.play({ dur: sp.startup, keys: [{ t: 0, p: {} }, { t: 0.6, p: { torso: [0.5, 0, 0], legL: [-0.7, 0, 0.1], legR: [-0.7, 0, -0.1] } }, { t: sp.startup, p: SPECIAL_POSES.flyStrike }] }, 1);
-    } else if (sp.kind === 'upper') {
-      this.model.play({ dur: sp.startup + sp.active, keys: [{ t: 0, p: SPECIAL_POSES.upperWindup }, { t: sp.startup * 0.8, p: SPECIAL_POSES.upperWindup }, { t: sp.startup + sp.active * 0.6, p: SPECIAL_POSES.upperStrike }] }, 1);
-    } else if (sp.kind === 'rush') {
-      this.model.play({ dur: sp.startup + sp.active, keys: [{ t: 0, p: { torso: [0.5, 0, 0], head: [-0.3, 0, 0], legL: [-0.4, 0, 0.1], legR: [-0.4, 0, -0.1] } }, { t: sp.startup + sp.active, p: {} }] }, 1);
-    } else if (sp.kind === 'coil') {
-      this.model.play({ dur: sp.startup + sp.active, keys: [{ t: 0, p: {} }, { t: sp.startup * 0.8, p: SPECIAL_POSES.coilWindup }, { t: sp.startup + sp.active, p: SPECIAL_POSES.coilWindup }] }, 1);
-    } else if (sp.kind === 'storm') {
-      this.model.play({ dur: sp.startup + sp.active, keys: [{ t: 0, p: {} }, { t: sp.startup, p: SPECIAL_POSES.stormRise }, { t: sp.startup + sp.active, p: SPECIAL_POSES.stormRise }] }, 1);
-    } else if (sp.kind === 'pack') {
-      this.model.play({ dur: sp.startup + sp.active, keys: [{ t: 0, p: {} }, { t: sp.startup * 0.7, p: SPECIAL_POSES.packHowl }, { t: sp.startup + sp.active, p: SPECIAL_POSES.packHowl }] }, 1);
-    } else {
-      this.model.play({ dur: sp.startup + sp.active + sp.recovery, keys: [{ t: 0, p: { torso: [0.3, 0, 0] } }, { t: sp.startup + sp.active, p: {} }] }, 1);
-    }
+    // 模型动画（与客机快照重建共用 buildSpecialClip，两端姿态关键帧一致）
+    this.model.play(buildSpecialClip(sp), 1);
   }
 
   // ---------------- 受击 ----------------
@@ -167,6 +153,7 @@ export class Fighter {
       this.vx = dir * Math.max(3.5, opts.knockback * 0.8);
       this.vy = Math.max(4.5, opts.launch || 4.5);
       this.move = null; this.special = null; this.armor = false;
+      this.model.stopClip();   // 停止出招片段，否则 KO 后模型定格在攻击末帧而非倒地
       this.onEvent('ko', { who: this, heavy: true });
       return 'ko';
     }
@@ -546,6 +533,21 @@ export class Fighter {
     };
   }
 
+  /**
+   * 回合切换时的视觉复位（主机 _beginRound / 客机收到 round 事件共用）：
+   * 清掉上一回合残留的攻击片段、必杀、保持型姿态与身体旋转，
+   * 让模型从下一快照/下一帧起重新收敛到主机的新回合姿态
+   */
+  resetRoundVisual() {
+    this.move = null;
+    this.special = null;
+    this.model.stopClip();
+    this.model.setPose({});
+    this._poseState = null;
+    this.flyRoll = 0;
+    this.model.body.rotation.set(0, 0, 0);
+  }
+
   applySnapshot(s) {
     if (this.renderX == null) { this.renderX = this.x; this.renderY = this.y; }
     else { this.renderX = this.x; this.renderY = this.y; }   // 以当前值作为插值起点
@@ -563,11 +565,22 @@ export class Fighter {
         this.model.play(buildAttackClip(mv), 1);
         this.model.clipTime = s.stateT;
       } else if (s.spKind) {
-        // 必杀由事件驱动演出，这里保底姿态
-      } else if (s.state === 'ko' || s.state === 'knockdown') {
-        this.model.stopClip();
+        // 必杀状态：用与主机同源的片段重建演出（纯视觉，客机不模拟必杀逻辑）
+        this.special = { ...SPECIALS[s.spKind], t: s.stateT };
+        this.model.play(buildSpecialClip(this.special), 1);
+        this.model.clipTime = s.stateT;
+      } else {
+        this.move = null;
+        this.special = null;
       }
+    } else if (s.spKind && !this.special) {
+      // 兜底：状态字符串相同但必杀引用缺失（如重连/首帧），同样重建片段
+      this.special = { ...SPECIALS[s.spKind], t: s.stateT };
+      this.model.play(buildSpecialClip(this.special), 1);
+      this.model.clipTime = s.stateT;
     }
+    // fly 必杀的翻滚角跟随主机状态时间，避免姿态定格
+    if (s.spKind === 'fly') this.flyRoll = s.stateT * 3.2;
     this._syncModel(1 / 60);
   }
 }
