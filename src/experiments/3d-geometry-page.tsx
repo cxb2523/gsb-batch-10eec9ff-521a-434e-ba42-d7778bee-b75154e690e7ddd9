@@ -160,6 +160,7 @@ export default function Geometry3DPage() {
           showVertices={showVertices}
           showEdges={showEdges}
           isPlaying={isPlaying}
+          resetTrigger={resetTrigger}
         />
       </ExperimentContainer>
 

@@ -1,9 +1,14 @@
 "use client";
 
-import { useRef, useMemo, useEffect, useState, useCallback } from "react";
+import { useRef, useMemo, useEffect, useLayoutEffect, useState, useCallback } from "react";
 import { useFrame } from "@react-three/fiber";
 import { Line } from "@react-three/drei";
 import * as THREE from "three";
+
+// useLayoutEffect warns during server rendering; the scene only hydrates
+// inside the Canvas, so fall back to useEffect on the server.
+const useIsomorphicLayoutEffect =
+  typeof window !== "undefined" ? useLayoutEffect : useEffect;
 
 export interface Geometry3DData {
   vertices: number;
@@ -20,6 +25,8 @@ export interface Geometry3DSceneProps {
   showVertices: boolean;
   showEdges: boolean;
   isPlaying: boolean;
+  /** Incremented by the parent when the user presses reset. */
+  resetTrigger?: number;
   onDataChange?: (data: Geometry3DData) => void;
 }
 
@@ -34,6 +41,7 @@ export function Geometry3DSceneComponent({
   showVertices,
   showEdges,
   isPlaying,
+  resetTrigger = 0,
   onDataChange
 }: Geometry3DSceneProps) {
   const meshRef = useRef<THREE.Mesh>(null);
@@ -118,17 +126,56 @@ export function Geometry3DSceneComponent({
     return lines;
   }, [geometry, showEdges]);
 
-  // Report data changes
-  useEffect(() => {
-    setCurrentRotation(rotationRef.current.y);
-    onDataChange?.({
+  // Last snapshot handed to the parent, used to skip redundant reports.
+  const lastPublishedRef = useRef<string | null>(null);
+
+  // Publish a snapshot that describes exactly what is on screen right now.
+  // Used for immediate (non-throttled) reports on shape change, pause and reset.
+  const publishData = useCallback(() => {
+    const rotation = rotationRef.current.y;
+    setCurrentRotation(rotation);
+
+    const payload: Geometry3DData = {
       ...geometryData,
       eulerCharacteristic: geometryData.vertices - geometryData.edges + geometryData.faces,
-      currentRotation: rotationRef.current.y,
-    });
+      currentRotation: rotation,
+    };
+
+    const signature = `${payload.vertices}|${payload.edges}|${payload.faces}|${payload.eulerCharacteristic}|${payload.currentRotation}`;
+    if (lastPublishedRef.current === signature) return;
+    lastPublishedRef.current = signature;
+
+    onDataChange?.(payload);
   }, [geometryData, onDataChange]);
 
+  // Shape switch (and initial mount) and play/pause transitions must be
+  // reflected in the data panel immediately, using the current rotation.
+  // Layout effect so the panel never paints one frame with the previous shape.
+  useIsomorphicLayoutEffect(() => {
+    publishData();
+  }, [publishData, isPlaying]);
+
+  // Track the last handled reset so shape changes / re-renders never rewind
+  // the rotation; only an explicit parent reset does.
+  const handledResetRef = useRef(resetTrigger);
+
+  // Reset: snap the orientation back to the initial pose and report it.
+  useIsomorphicLayoutEffect(() => {
+    if (handledResetRef.current === resetTrigger) return;
+    handledResetRef.current = resetTrigger;
+
+    rotationRef.current.x = 0;
+    rotationRef.current.y = 0;
+    if (meshRef.current) {
+      meshRef.current.rotation.x = 0;
+      meshRef.current.rotation.y = 0;
+    }
+    publishData();
+  }, [resetTrigger, publishData]);
+
   useFrame((_, delta) => {
+    // Paused: do not advance the rotation at all, so resuming continues
+    // from the frozen angle.
     if (!isPlaying) return;
 
     frameCountRef.current++;
@@ -143,12 +190,7 @@ export function Geometry3DSceneComponent({
 
     // Update React state every 8 frames
     if (frameCountRef.current % 8 === 0) {
-      setCurrentRotation(rotationRef.current.y);
-      onDataChange?.({
-        ...geometryData,
-        eulerCharacteristic: geometryData.vertices - geometryData.edges + geometryData.faces,
-        currentRotation: rotationRef.current.y,
-      });
+      publishData();
     }
   });
 
