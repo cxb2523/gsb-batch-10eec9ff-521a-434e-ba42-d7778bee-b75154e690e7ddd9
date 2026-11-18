@@ -9,6 +9,12 @@ import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import { Scene } from "@babylonjs/core/scene";
 import { assets } from "./assets";
 import {
+  applyCustomizationSnapshot,
+  type CustomBackgroundMode,
+  type WorldCustomizationView,
+} from "./customizationController";
+import { PlaneArtManager, type PlaneArtHandle } from "./PlaneArtManager";
+import {
   CUSTOMIZATION_DEFAULTS,
   type CustomizationSnapshot,
 } from "../../../shared/customization";
@@ -28,6 +34,9 @@ type GatePair = {
   bottomCap: Mesh;
   x: number;
   gapCenter: number;
+  /** Gap produced by difficulty scaling, before the player's opening multiplier. */
+  baseGapSize: number;
+  /** Live gap including the customization multiplier; used for collision and layout. */
   gapSize: number;
   scored: boolean;
   bodyMaterials: [StandardMaterial, StandardMaterial];
@@ -55,11 +64,14 @@ const COLORS = {
   cloudShadow: Color3.FromHexString("#dce7e5"),
 };
 
+const DEFAULT_CLEAR_COLOR = new Color4(0.49, 0.77, 0.89, 1);
+const TRANSPARENT_CLEAR_COLOR = new Color4(0, 0, 0, 0);
+
 /**
  * Framework-agnostic game owner for the AeroFlap scene.
  * It owns Babylon meshes, flight state, semantic input, scoring, and teardown.
  */
-export class GameWorld {
+export class GameWorld implements WorldCustomizationView {
   private readonly camera: FreeCamera;
   private readonly player: Mesh;
   private playerMaterial!: StandardMaterial;
@@ -70,9 +82,10 @@ export class GameWorld {
   private readonly canvas: HTMLCanvasElement;
   private readonly demoMode: boolean;
   private background: Mesh;
-  private customPlaneArt: Mesh | null = null;
-  private customPlaneMaterial: StandardMaterial | null = null;
-  private accentColor = Color3.FromHexString(CUSTOMIZATION_DEFAULTS.accentColor);
+  private readonly planeArt: PlaneArtManager;
+  private accentColor = Color3.FromHexString(
+    CUSTOMIZATION_DEFAULTS.accentColor
+  );
   private gateColor = Color3.FromHexString(CUSTOMIZATION_DEFAULTS.gateColor);
   private paceMultiplier = CUSTOMIZATION_DEFAULTS.pace;
   private gapMultiplier = CUSTOMIZATION_DEFAULTS.gateOpening;
@@ -99,7 +112,9 @@ export class GameWorld {
 
   private readonly onOverlayFlap = () => this.flap();
   private readonly onCustomization = (event: Event) => {
-    this.applyCustomization((event as CustomEvent<CustomizationSnapshot>).detail);
+    this.applyCustomization(
+      (event as CustomEvent<CustomizationSnapshot>).detail
+    );
   };
 
   constructor(scene: Scene, canvas: HTMLCanvasElement, camera: FreeCamera) {
@@ -111,6 +126,9 @@ export class GameWorld {
 
     this.background = this.createBackground();
     this.player = this.createPlayerFallback();
+    this.planeArt = new PlaneArtManager({
+      create: url => this.createCustomPlaneArt(url),
+    });
     this.createCloudLayers();
     this.resize();
     this.resetScene();
@@ -143,13 +161,19 @@ export class GameWorld {
 
     this.velocity += CONFIG.gravity * cappedDelta;
     this.playerY += this.velocity * cappedDelta;
-    this.speed = (Math.min(7.15, CONFIG.startingSpeed + this.score * 0.095) * this.paceMultiplier);
+    this.speed =
+      Math.min(7.15, CONFIG.startingSpeed + this.score * 0.095) *
+      this.paceMultiplier;
 
     for (const gate of this.gates) {
       gate.x -= this.speed * cappedDelta;
       this.positionGate(gate);
 
-      if (!gate.scored && gate.x + CONFIG.obstacleWidth / 2 < CONFIG.playerX - CONFIG.playerWidth / 2) {
+      if (
+        !gate.scored &&
+        gate.x + CONFIG.obstacleWidth / 2 <
+          CONFIG.playerX - CONFIG.playerWidth / 2
+      ) {
         gate.scored = true;
         this.score += 1;
         this.emitState();
@@ -169,7 +193,11 @@ export class GameWorld {
       this.spawnGate(this.viewportWidth / 2 + 3.25, this.score);
     }
 
-    if (this.playerY < CONFIG.minY || this.playerY > CONFIG.maxY || this.hasGateCollision()) {
+    if (
+      this.playerY < CONFIG.minY ||
+      this.playerY > CONFIG.maxY ||
+      this.hasGateCollision()
+    ) {
       this.crash();
     }
 
@@ -178,7 +206,10 @@ export class GameWorld {
 
   resize() {
     const engine = this.scene.getEngine();
-    const aspect = Math.max(0.5, engine.getRenderWidth() / Math.max(1, engine.getRenderHeight()));
+    const aspect = Math.max(
+      0.5,
+      engine.getRenderWidth() / Math.max(1, engine.getRenderHeight())
+    );
     this.viewportWidth = Math.max(11.5, 18 * aspect);
     this.camera.mode = Camera.ORTHOGRAPHIC_CAMERA;
     this.camera.orthoTop = 9;
@@ -197,7 +228,10 @@ export class GameWorld {
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("aeroflap:flap", this.onOverlayFlap);
     window.removeEventListener("aeroflap:customization", this.onCustomization);
-    this.materials.forEach((material) => material.dispose());
+    this.planeArt.dispose();
+    [...this.materials].forEach(material =>
+      this.disposeTexturedMaterial(material)
+    );
   }
 
   private createMaterial(name: string, color: Color3, alpha = 1) {
@@ -224,9 +258,29 @@ export class GameWorld {
     return material;
   }
 
+  /**
+   * Disposes a material together with its GPU texture. Babylon's material
+   * dispose does not free textures, so dropping a custom plane or background
+   * without this would leak the uploaded image in video memory.
+   */
+  private disposeTexturedMaterial(material: StandardMaterial) {
+    const diffuse = material.diffuseTexture;
+    const opacity = material.opacityTexture;
+    material.dispose();
+    if (diffuse) diffuse.dispose();
+    // When one texture drives both slots, disposing twice is a safe no-op.
+    if (opacity && opacity !== diffuse) opacity.dispose();
+    const index = this.materials.indexOf(material);
+    if (index >= 0) this.materials.splice(index, 1);
+  }
+
   private createBackground() {
     const material = this.createTexturedMaterial("sky-art", assets.sky);
-    const mesh = MeshBuilder.CreatePlane("sky-art-plane", { size: 2 }, this.scene);
+    const mesh = MeshBuilder.CreatePlane(
+      "sky-art-plane",
+      { size: 2 },
+      this.scene
+    );
     mesh.position.z = 4.5;
     mesh.material = material;
     return mesh;
@@ -237,7 +291,7 @@ export class GameWorld {
     const mesh = MeshBuilder.CreateDisc(
       "player-fallback",
       { radius: 0.74, tessellation: 3 },
-      this.scene,
+      this.scene
     );
     mesh.position = new Vector3(CONFIG.playerX, 0, 0.2);
     mesh.scaling = new Vector3(1.15, 0.78, 1);
@@ -253,7 +307,7 @@ export class GameWorld {
   }
 
   private resetScene() {
-    this.gates.splice(0).forEach((gate) => {
+    this.gates.splice(0).forEach(gate => {
       gate.top.dispose();
       gate.bottom.dispose();
       gate.topCap.dispose();
@@ -293,17 +347,48 @@ export class GameWorld {
     this.emitState();
   }
 
-  private spawnGate(startX: number, sequence: number, fixedCenter?: number, fixedGap?: number) {
-    const gapSize = (fixedGap ?? Math.max(6.25, 7.55 - this.score * 0.045)) * this.gapMultiplier;
+  private spawnGate(
+    startX: number,
+    sequence: number,
+    fixedCenter?: number,
+    fixedGap?: number
+  ) {
+    const baseGapSize = fixedGap ?? Math.max(6.25, 7.55 - this.score * 0.045);
+    const gapSize = baseGapSize * this.gapMultiplier;
     const sequenceAngle = sequence * 2.13 + 0.85;
     const gapCenter = fixedCenter ?? Math.sin(sequenceAngle) * 2.9;
-    const topMaterial = this.createMaterial(`gate-top-${sequence}`, this.gateColor);
-    const bottomMaterial = this.createMaterial(`gate-bottom-${sequence}`, this.gateColor);
-    const capMaterial = this.createMaterial(`gate-cap-${sequence}`, COLORS.ivory);
-    const top = MeshBuilder.CreateBox(`gate-top-${sequence}`, { width: CONFIG.obstacleWidth, height: 1, depth: 0.7 }, this.scene);
-    const bottom = MeshBuilder.CreateBox(`gate-bottom-${sequence}`, { width: CONFIG.obstacleWidth, height: 1, depth: 0.7 }, this.scene);
-    const topCap = MeshBuilder.CreateBox(`gate-top-cap-${sequence}`, { width: CONFIG.obstacleWidth + 0.16, height: 0.22, depth: 0.76 }, this.scene);
-    const bottomCap = MeshBuilder.CreateBox(`gate-bottom-cap-${sequence}`, { width: CONFIG.obstacleWidth + 0.16, height: 0.22, depth: 0.76 }, this.scene);
+    const topMaterial = this.createMaterial(
+      `gate-top-${sequence}`,
+      this.gateColor
+    );
+    const bottomMaterial = this.createMaterial(
+      `gate-bottom-${sequence}`,
+      this.gateColor
+    );
+    const capMaterial = this.createMaterial(
+      `gate-cap-${sequence}`,
+      COLORS.ivory
+    );
+    const top = MeshBuilder.CreateBox(
+      `gate-top-${sequence}`,
+      { width: CONFIG.obstacleWidth, height: 1, depth: 0.7 },
+      this.scene
+    );
+    const bottom = MeshBuilder.CreateBox(
+      `gate-bottom-${sequence}`,
+      { width: CONFIG.obstacleWidth, height: 1, depth: 0.7 },
+      this.scene
+    );
+    const topCap = MeshBuilder.CreateBox(
+      `gate-top-cap-${sequence}`,
+      { width: CONFIG.obstacleWidth + 0.16, height: 0.22, depth: 0.76 },
+      this.scene
+    );
+    const bottomCap = MeshBuilder.CreateBox(
+      `gate-bottom-cap-${sequence}`,
+      { width: CONFIG.obstacleWidth + 0.16, height: 0.22, depth: 0.76 },
+      this.scene
+    );
     top.material = topMaterial;
     bottom.material = bottomMaterial;
     topCap.material = capMaterial;
@@ -316,6 +401,7 @@ export class GameWorld {
       bottomCap,
       x: startX,
       gapCenter,
+      baseGapSize,
       gapSize,
       scored: false,
       bodyMaterials: [topMaterial, bottomMaterial],
@@ -337,7 +423,11 @@ export class GameWorld {
     gate.topCap.position = new Vector3(gate.x, topBottom + 0.11, 0.45);
 
     gate.bottom.scaling.y = bottomHeight;
-    gate.bottom.position = new Vector3(gate.x, bottomTop - bottomHeight / 2, 0.95);
+    gate.bottom.position = new Vector3(
+      gate.x,
+      bottomTop - bottomHeight / 2,
+      0.95
+    );
     gate.bottomCap.position = new Vector3(gate.x, bottomTop - 0.11, 0.45);
   }
 
@@ -347,7 +437,7 @@ export class GameWorld {
     const playerTop = this.playerY + CONFIG.playerHeight / 2;
     const playerBottom = this.playerY - CONFIG.playerHeight / 2;
 
-    return this.gates.some((gate) => {
+    return this.gates.some(gate => {
       const gateLeft = gate.x - CONFIG.obstacleWidth / 2;
       const gateRight = gate.x + CONFIG.obstacleWidth / 2;
       if (playerRight < gateLeft || playerLeft > gateRight) return false;
@@ -369,82 +459,122 @@ export class GameWorld {
   }
 
   private updatePlayerVisual() {
-    const idleBob = this.phase === "idle" ? Math.sin(this.elapsed * 2.2) * 0.18 : 0;
+    const idleBob =
+      this.phase === "idle" ? Math.sin(this.elapsed * 2.2) * 0.18 : 0;
     const visualY = this.playerY + idleBob;
-    const angle = this.phase === "gameover" ? -0.72 : Math.max(-0.52, Math.min(0.42, this.velocity * 0.055));
+    const angle =
+      this.phase === "gameover"
+        ? -0.72
+        : Math.max(-0.52, Math.min(0.42, this.velocity * 0.055));
     this.player.position.y = visualY;
     this.player.rotation.z = angle;
-    if (this.customPlaneArt) {
-      this.customPlaneArt.position.y = visualY;
-      this.customPlaneArt.rotation.z = angle;
-    }
+    this.planeArt.syncTransform(visualY, angle);
   }
 
   private applyCustomization(snapshot: CustomizationSnapshot) {
-    const { settings, assets: customAssets } = snapshot;
-    this.accentColor = Color3.FromHexString(settings.accentColor);
-    this.gateColor = Color3.FromHexString(settings.gateColor);
-    this.paceMultiplier = settings.pace;
-    this.gapMultiplier = settings.gateOpening;
-    this.playerMaterial.emissiveColor = this.accentColor;
-    this.playerMaterial.diffuseColor = this.accentColor;
-    this.gates.forEach((gate) => {
-      gate.bodyMaterials.forEach(material => {
-        material.emissiveColor = this.gateColor;
-        material.diffuseColor = this.gateColor;
-      });
-    });
-
-    const customPlaneUrl = customAssets.planeImage?.url;
-    if (customPlaneUrl) {
-      this.setCustomPlane(customPlaneUrl);
-    } else if (this.customPlaneArt) {
-      this.customPlaneArt.dispose();
-      this.customPlaneMaterial?.dispose();
-      this.customPlaneArt = null;
-      this.customPlaneMaterial = null;
-      this.player.isVisible = true;
-    }
-
-    const usesCustomBackground = settings.backgroundMode !== "default" &&
-      Boolean(
-        settings.backgroundMode === "image"
-          ? customAssets.backgroundImage?.url
-          : customAssets.backgroundVideo?.url,
-      );
-    this.background.isVisible = !usesCustomBackground;
-    this.scene.clearColor = usesCustomBackground
-      ? new Color4(0, 0, 0, 0)
-      : new Color4(0.49, 0.77, 0.89, 1);
+    applyCustomizationSnapshot(snapshot, this);
   }
 
-  private setCustomPlane(url: string) {
-    if (this.customPlaneArt?.metadata?.sourceUrl === url) return;
-    this.customPlaneArt?.dispose();
-    this.customPlaneMaterial?.dispose();
+  // --- WorldCustomizationView: visuals, never score or flight phase ---
+
+  setAccentColor(hexColor: string) {
+    this.accentColor = Color3.FromHexString(hexColor);
+    this.playerMaterial.emissiveColor = this.accentColor;
+    this.playerMaterial.diffuseColor = this.accentColor;
+  }
+
+  setPace(pace: number) {
+    this.paceMultiplier = pace;
+  }
+
+  reflowGates(gateColorHex: string, gateOpening: number) {
+    this.gateColor = Color3.FromHexString(gateColorHex);
+    this.gapMultiplier = gateOpening;
+    for (const gate of this.gates) {
+      gate.gapSize = gate.baseGapSize * gateOpening;
+      this.positionGate(gate);
+      for (const material of gate.bodyMaterials) {
+        material.emissiveColor = this.gateColor;
+        material.diffuseColor = this.gateColor;
+      }
+    }
+  }
+
+  showCustomPlane(imageUrl: string) {
+    this.planeArt.show(imageUrl, {
+      setVisible: visible => {
+        this.player.isVisible = visible;
+      },
+    });
+  }
+
+  clearCustomPlane() {
+    this.planeArt.clear({
+      setVisible: visible => {
+        this.player.isVisible = visible;
+      },
+    });
+  }
+
+  showDefaultBackground() {
+    // Default sky is the in-scene art plane; custom media lives in the DOM layer.
+    this.background.isVisible = true;
+    this.scene.clearColor = DEFAULT_CLEAR_COLOR;
+  }
+
+  showCustomBackground(_mode: CustomBackgroundMode) {
+    // The matching DOM image/video layer is rendered by GameCanvas; the canvas
+    // goes transparent so exactly one background is ever visible.
+    this.background.isVisible = false;
+    this.scene.clearColor = TRANSPARENT_CLEAR_COLOR;
+  }
+
+  private createCustomPlaneArt(url: string): PlaneArtHandle {
     const material = this.createTexturedMaterial("custom-plane-art", url);
-    const mesh = MeshBuilder.CreatePlane("custom-plane-art", { width: 1.65, height: 1.24 }, this.scene);
+    const mesh = MeshBuilder.CreatePlane(
+      "custom-plane-art",
+      { width: 1.65, height: 1.24 },
+      this.scene
+    );
     mesh.position = this.player.position.clone();
     mesh.position.z = -0.15;
-    mesh.metadata = { sourceUrl: url };
     mesh.material = material;
-    this.customPlaneArt = mesh;
-    this.customPlaneMaterial = material;
-    this.player.isVisible = false;
+    return {
+      sourceUrl: url,
+      syncTransform: (y, rotationZ) => {
+        mesh.position.x = this.player.position.x;
+        mesh.position.y = y;
+        mesh.rotation.z = rotationZ;
+      },
+      dispose: () => {
+        mesh.dispose();
+        this.disposeTexturedMaterial(material);
+      },
+    };
   }
 
   private runDemoPilot() {
     if (this.elapsed < this.demoStartDelay) return;
-    const nextGate = this.gates.find((gate) => gate.x + CONFIG.obstacleWidth / 2 > CONFIG.playerX - 0.3);
+    const nextGate = this.gates.find(
+      gate => gate.x + CONFIG.obstacleWidth / 2 > CONFIG.playerX - 0.3
+    );
     const desiredY = nextGate ? nextGate.gapCenter : 0;
-    if (this.playerY < desiredY - 0.32 || (this.velocity < -4.2 && this.playerY < desiredY + 1.3)) {
+    if (
+      this.playerY < desiredY - 0.32 ||
+      (this.velocity < -4.2 && this.playerY < desiredY + 1.3)
+    ) {
       this.velocity = CONFIG.flapVelocity;
     }
   }
 
   private readBestScore() {
     try {
-      return Number.parseInt(window.localStorage.getItem("aeroflap-best") ?? "0", 10) || 0;
+      return (
+        Number.parseInt(
+          window.localStorage.getItem("aeroflap-best") ?? "0",
+          10
+        ) || 0
+      );
     } catch {
       return 0;
     }
@@ -454,7 +584,7 @@ export class GameWorld {
     window.dispatchEvent(
       new CustomEvent<FlightState>("aeroflap:state", {
         detail: { score: this.score, best: this.best, phase: this.phase },
-      }),
+      })
     );
   }
 }

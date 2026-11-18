@@ -7,6 +7,7 @@ import { Engine } from "@babylonjs/core/Engines/engine";
 import { ArrowUp, Crosshair, Keyboard, Play, RotateCcw } from "lucide-react";
 import { createGameScene, type GameHandle } from "@/game/scene";
 import { assets } from "@/game/assets";
+import { AudioController } from "@/game/AudioController";
 import type { FlightState } from "@/game/GameWorld";
 import CustomizationStudio from "./CustomizationStudio";
 import {
@@ -24,9 +25,11 @@ export default function GameCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const startedRef = useRef(false);
   const [flight, setFlight] = useState<FlightState>(initialState);
-  const [customization, setCustomization] = useState<CustomizationSnapshot>(initialCustomization);
+  const [customization, setCustomization] =
+    useState<CustomizationSnapshot>(initialCustomization);
   const ambientAudioRef = useRef<HTMLAudioElement>(null);
   const flapAudioRef = useRef<HTMLAudioElement>(null);
+  const audioControllerRef = useRef<AudioController | null>(null);
 
   useEffect(() => {
     const onState = (event: Event) => {
@@ -40,39 +43,51 @@ export default function GameCanvas() {
     window.dispatchEvent(
       new CustomEvent<CustomizationSnapshot>("aeroflap:customization", {
         detail: customization,
-      }),
+      })
     );
   }, [customization]);
 
+  // One controller owns both <audio> channels for the component's lifetime.
   useEffect(() => {
     const ambient = ambientAudioRef.current;
     const flap = flapAudioRef.current;
-    if (ambient) {
-      ambient.volume = customization.settings.volume;
-      ambient.muted = customization.settings.muted;
-    }
-    if (flap) {
-      flap.volume = customization.settings.volume;
-      flap.muted = customization.settings.muted;
-    }
+    if (!ambient || !flap) return;
+    const controller = new AudioController(ambient, flap);
+    audioControllerRef.current = controller;
+    return () => {
+      controller.dispose();
+      audioControllerRef.current = null;
+    };
+  }, []);
+
+  // Gain and mute apply immediately on both channels.
+  useEffect(() => {
+    audioControllerRef.current?.applySettings(
+      customization.settings.volume,
+      customization.settings.muted
+    );
   }, [customization.settings.muted, customization.settings.volume]);
+
+  // Source swaps stop and unload the previous track before arming the new one.
+  useEffect(() => {
+    audioControllerRef.current?.setAmbientSource(
+      customization.assets.ambientAudio?.url
+    );
+  }, [customization.assets.ambientAudio?.url]);
+
+  useEffect(() => {
+    audioControllerRef.current?.setFlapSource(
+      customization.assets.flapAudio?.url
+    );
+  }, [customization.assets.flapAudio?.url]);
 
   useEffect(() => {
     const onFlap = () => {
-      if (customization.settings.muted) return;
-      const ambient = ambientAudioRef.current;
-      if (ambient && customization.assets.ambientAudio?.url) {
-        void ambient.play().catch(() => undefined);
-      }
-      const flap = flapAudioRef.current;
-      if (flap && customization.assets.flapAudio?.url) {
-        flap.currentTime = 0;
-        void flap.play().catch(() => undefined);
-      }
+      audioControllerRef.current?.onFlap();
     };
     window.addEventListener("aeroflap:flap", onFlap);
     return () => window.removeEventListener("aeroflap:flap", onFlap);
-  }, [customization]);
+  }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -87,7 +102,7 @@ export default function GameCanvas() {
 
     let handle: GameHandle | null = null;
     let active = true;
-    createGameScene(engine, canvas).then((gameHandle) => {
+    createGameScene(engine, canvas).then(gameHandle => {
       if (!active) {
         gameHandle.dispose();
         return;
@@ -120,8 +135,16 @@ export default function GameCanvas() {
 
   const statusCopy =
     flight.phase === "idle"
-      ? { eyebrow: "Flight path 01", title: "Clear the clouds.\nKeep the line.", action: "Launch flight" }
-      : { eyebrow: "Flight log complete", title: "Air current lost.\nTry the line again.", action: "Fly again" };
+      ? {
+          eyebrow: "Flight path 01",
+          title: "Clear the clouds.\nKeep the line.",
+          action: "Launch flight",
+        }
+      : {
+          eyebrow: "Flight log complete",
+          title: "Air current lost.\nTry the line again.",
+          action: "Fly again",
+        };
 
   const hasImageBackground =
     customization.settings.backgroundMode === "image" &&
@@ -135,7 +158,9 @@ export default function GameCanvas() {
       {hasImageBackground && (
         <div
           className="custom-media-background custom-image-background"
-          style={{ backgroundImage: `url(${customization.assets.backgroundImage?.url})` }}
+          style={{
+            backgroundImage: `url(${customization.assets.backgroundImage?.url})`,
+          }}
           aria-hidden="true"
         />
       )}
@@ -160,7 +185,9 @@ export default function GameCanvas() {
 
       <section className="flight-overlay" aria-live="polite">
         <header className="flight-brand">
-          <span className="brand-mark" aria-hidden="true"><img src={assets.wingMark} alt="" /></span>
+          <span className="brand-mark" aria-hidden="true">
+            <img src={assets.wingMark} alt="" />
+          </span>
           <div>
             <p className="brand-kicker">Endless aviation test</p>
             <h1>AeroFlap</h1>
@@ -180,25 +207,48 @@ export default function GameCanvas() {
           </div>
         </aside>
 
-        <div className="score-dial" aria-label={`Current score ${flight.score}`}>
+        <div
+          className="score-dial"
+          aria-label={`Current score ${flight.score}`}
+        >
           <span>Altitude cleared</span>
           <strong>{String(flight.score).padStart(2, "0")}</strong>
           <i />
         </div>
 
         {flight.phase !== "playing" && (
-          <div className={`flight-prompt ${flight.phase === "gameover" ? "is-gameover" : ""}`}>
+          <div
+            className={`flight-prompt ${flight.phase === "gameover" ? "is-gameover" : ""}`}
+          >
             <p className="prompt-eyebrow">{statusCopy.eyebrow}</p>
-            <h2>{statusCopy.title.split("\n").map((line) => <span key={line}>{line}</span>)}</h2>
+            <h2>
+              {statusCopy.title.split("\n").map(line => (
+                <span key={line}>{line}</span>
+              ))}
+            </h2>
             {flight.phase === "gameover" && (
-              <p className="run-summary">You cleared <strong>{flight.score}</strong> {flight.score === 1 ? "gate" : "gates"} this run.</p>
+              <p className="run-summary">
+                You cleared <strong>{flight.score}</strong>{" "}
+                {flight.score === 1 ? "gate" : "gates"} this run.
+              </p>
             )}
-            <button data-aeroflap-control type="button" onClick={requestFlap} className="flight-action">
-              {flight.phase === "idle" ? <Play size={16} fill="currentColor" aria-hidden="true" /> : <RotateCcw size={17} aria-hidden="true" />}
+            <button
+              data-aeroflap-control
+              type="button"
+              onClick={requestFlap}
+              className="flight-action"
+            >
+              {flight.phase === "idle" ? (
+                <Play size={16} fill="currentColor" aria-hidden="true" />
+              ) : (
+                <RotateCcw size={17} aria-hidden="true" />
+              )}
               <span>{statusCopy.action}</span>
             </button>
             <p className="control-hint">
-              <Keyboard size={15} aria-hidden="true" /> <span>or tap anywhere to lift</span> <ArrowUp size={15} aria-hidden="true" />
+              <Keyboard size={15} aria-hidden="true" />{" "}
+              <span>or tap anywhere to lift</span>{" "}
+              <ArrowUp size={15} aria-hidden="true" />
             </p>
           </div>
         )}
@@ -209,8 +259,9 @@ export default function GameCanvas() {
           <span>stay inside the skyway</span>
         </footer>
       </section>
-      <audio ref={ambientAudioRef} src={customization.assets.ambientAudio?.url} loop preload="metadata" />
-      <audio ref={flapAudioRef} src={customization.assets.flapAudio?.url} preload="auto" />
+      {/* Sources are owned by AudioController so swaps can unload the old track. */}
+      <audio ref={ambientAudioRef} loop preload="metadata" />
+      <audio ref={flapAudioRef} preload="auto" />
       <CustomizationStudio onChange={setCustomization} />
     </main>
   );
