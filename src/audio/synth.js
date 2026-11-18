@@ -218,11 +218,23 @@ export function audibleAmps(amps, norms, freqs, contactRatio = 3, refHz = 0) {
 
 /**
  * A single loudness reference for one drum: the total drive of the hardest
- * available strike, taken at the fundamental's own peak.
+ * strike anywhere on the head.
  *
  * The renderer scales by this instead of per-strike normalising, so a strike near
  * the rim stays quieter than one in the middle - that difference is information
  * the physics is trying to convey - while nothing ever reaches the limiter.
+ *
+ * This used to look only at the node where the *fundamental* peaks and evaluate
+ * one strike there. That is the loudest place for mode 1 alone, but it is not in
+ * general the loudest strike on the drum: an off-centre hit drives the higher
+ * modes as well, and their combined l1 drive can be substantially larger. On a
+ * disk the true maximum sits off centre and the single-node estimate understated
+ * it by roughly 40%; on other built-in shapes by 25-60%. A headroom that is too
+ * small is an over-large gain, so edge and eccentric strikes were being scaled
+ * straight into the limiter. The sweep below evaluates every mesh node under the
+ * same audibleAmps parameters the renderer uses, so the reference covers the
+ * strongest strike the whole head can produce. It is O(nodes^2 * modes) but runs
+ * once per (drum, mallet); the app caches it in headroom().
  */
 export function strikeHeadroom(
   mesh,
@@ -234,28 +246,22 @@ export function strikeHeadroom(
   contactRatio = 3,
   refHz = 0,
 ) {
-  const phi1 = modes[0];
   let best = 0;
-  let node = 0;
-  for (let i = 0; i < phi1.length; i++) {
-    const a = Math.abs(phi1[i]);
-    if (a > best) {
-      best = a;
-      node = i;
-    }
+  for (let i = 0; i < mesh.nodeCount; i++) {
+    const amps = strikeAmplitudes(
+      mesh,
+      modes,
+      mesh.nodes[i * 2],
+      mesh.nodes[i * 2 + 1],
+      radius,
+      weights,
+    );
+    const heard = audibleAmps(amps, norms, freqs, contactRatio, refHz);
+    let l1 = 0;
+    for (let k = 0; k < heard.length; k++) l1 += Math.abs(heard[k]);
+    if (l1 > best) best = l1;
   }
-  const amps = strikeAmplitudes(
-    mesh,
-    modes,
-    mesh.nodes[node * 2],
-    mesh.nodes[node * 2 + 1],
-    radius,
-    weights,
-  );
-  const heard = audibleAmps(amps, norms, freqs, contactRatio, refHz);
-  let l1 = 0;
-  for (let k = 0; k < heard.length; k++) l1 += Math.abs(heard[k]);
-  return l1 > 1e-12 ? l1 : 1;
+  return best > 1e-12 ? best : 1;
 }
 
 /**
@@ -296,19 +302,18 @@ export function decayTimes(freqs, baseSeconds = 1.7, brightness = 0.5, refHz = 0
 }
 
 /**
- * Renders a strike into a mono Float32Array.
+ * Renders one strike's raw modal sum into a mono Float32Array, with NO limiter
+ * and NO fade. Shared by `renderStrike` (single voice, its own safety limiter)
+ * and `renderBus` (many voices summed before one shared limiter), so the two
+ * paths cannot drift in how a strike is synthesised.
  *
  * Sums the decaying sinusoids directly. A struck membrane starts flat and
  * moving, so each mode starts at zero displacement - hence sine rather than
  * cosine, and no click at onset.
  *
- * `gain` is the caller's job to set so the sum lands near full scale. The tanh
- * below is a safety net and nothing more: it used to be doing real work, because
- * a fixed gain of 3.2 drove sixteen modes to a pre-limiter peak of about 11, and
- * two thirds of the first 300 ms of every strike came out of the limiter hard
- * clipped. See `strikeHeadroom`.
+ * `gain` is the caller's job to set so the sum lands near full scale.
  */
-export function renderStrike({
+function renderRawStrike({
   freqs,
   amps,
   taus,
@@ -356,18 +361,125 @@ export function renderStrike({
       env *= decay;
     }
   }
+  return out;
+}
 
+/** The soft limiter shared by the single-voice and bus paths: one tanh per sample. */
+function applySoftLimiter(samples) {
+  for (let n = 0; n < samples.length; n++) samples[n] = Math.tanh(samples[n]);
+  return samples;
+}
+
+/** Linear fade over the final 12 ms so truncating the decay cannot click. */
+function applyTailFade(samples, sampleRate) {
+  const length = samples.length;
+  const fade = Math.min(length, Math.floor(0.012 * sampleRate));
+  for (let i = 0; i < fade; i++) {
+    samples[length - fade + i] *= 1 - i / fade;
+  }
+  return samples;
+}
+
+/**
+ * Renders a strike into a mono Float32Array.
+ *
+ * A struck membrane starts flat and moving, so each mode starts at zero
+ * displacement - hence sine rather than cosine, and no click at onset. The first
+ * sample is therefore exactly zero and the tail is faded out.
+ *
+ * `gain` is the caller's job to set so the sum lands near full scale. The tanh
+ * below is a safety net and nothing more: it used to be doing real work, because
+ * a fixed gain of 3.2 drove sixteen modes to a pre-limiter peak of about 11, and
+ * two thirds of the first 300 ms of every strike came out of the limiter hard
+ * clipped. See `strikeHeadroom`.
+ *
+ * For overlapping strikes the limiter belongs on the shared bus, not per voice:
+ * see `renderBus`. This function keeps its own limiter so a single rendered
+ * strike is bounded exactly as it always was.
+ */
+export function renderStrike(opts) {
+  const out = renderRawStrike(opts);
   // Soft limiter rather than peak normalisation: a strike near the rim really is
   // quieter than one in the middle, and flattening that would throw away
   // information the physics is trying to tell you.
-  for (let n = 0; n < length; n++) out[n] = Math.tanh(out[n]);
-
-  // Short fade-out so truncation cannot click.
-  const fade = Math.min(length, Math.floor(0.012 * sampleRate));
-  for (let i = 0; i < fade; i++) {
-    out[length - fade + i] *= 1 - i / fade;
-  }
+  applySoftLimiter(out);
+  applyTailFade(out, opts.sampleRate ?? 48000);
   return out;
+}
+
+/**
+ * Raw, unlimited samples for one strike (no tanh, no fade). The bus-level
+ * counterpart of `renderStrike`: feed the result, with an offset, into
+ * `renderBus` so the shared limiter sees every voice together.
+ */
+export function renderStrikeVoice(opts) {
+  return renderRawStrike(opts);
+}
+
+/**
+ * Mixes several already-rendered strike voices onto one shared bus and limits
+ * the SUM once, instead of tanh-limiting each voice on its own and then adding.
+ *
+ * Per-voice tanh is the failure mode this replaces. Each voice is scaled to its
+ * own peak and limited against its own peak, so each one looks fine alone; but
+ * fast taps overlap while they are still ringing, and the limited voices simply
+ * add at the destination. Six taps 30 ms apart reach a summed peak above full
+ * scale, where the output stage hard-clamps - the flat ceiling that made rapid
+ * drumming sound muffled and distorted. Limiting the raw (unlimited) voices
+ * together means the knee sees the actual combined waveform exactly once, and no
+ * individual voice's timbre or relative loudness is touched before the mix: the
+ * pre-limiter sum is linear, so a lone voice keeps the same tone and level it
+ * has in any other mixture.
+ *
+ * Each entry is either a raw mono sample array (the output of
+ * `renderStrikeVoice`) with an optional sample `offset`, or a strike spec in the
+ * `renderStrike` argument shape plus an optional `offset`. Every voice is added
+ * with the SAME `gain` (the bus-level loudness scale), and one tanh is applied
+ * to the whole mix. A voice truncated by the buffer's end is faded first, so
+ * truncation cannot click even when it stops in the middle of the bus.
+ *
+ * An empty voice list renders to an empty Float32Array, never NaN.
+ */
+export function renderBus(voices, { sampleRate = 48000, gain = 1 } = {}) {
+  if (!voices || voices.length === 0) return new Float32Array(0);
+
+  const normalized = voices.map((voice) => {
+    const offset = Math.max(0, Math.floor(voice.offset ?? 0));
+    const raw = voice.samples
+      ? Float32Array.from(voice.samples)
+      : renderRawStrike(voice);
+    return { raw, offset };
+  });
+
+  // One voice, starting at the bus origin: the shared path and the single-voice
+  // path are then the same computation, so renderBus([v]) is sample-for-sample
+  // what renderStrike produces (including tanh-before-fade), only re-gained.
+  if (normalized.length === 1 && normalized[0].offset === 0) {
+    const only = normalized[0].raw;
+    if (gain !== 1) for (let n = 0; n < only.length; n++) only[n] *= gain;
+    applySoftLimiter(only);
+    applyTailFade(only, sampleRate);
+    return only;
+  }
+
+  let length = 0;
+  for (const { raw, offset } of normalized) {
+    length = Math.max(length, offset + raw.length);
+  }
+  const mix = new Float32Array(length);
+  for (const { raw, offset } of normalized) {
+    // Fade before the sum: this is the per-voice truncation guard, applied to the
+    // raw waveform so it scales linearly instead of being baked into a limited
+    // one. It does not touch any sample that continues past the buffer's end.
+    applyTailFade(raw, sampleRate);
+    for (let n = 0; n < raw.length; n++) mix[offset + n] += raw[n] * gain;
+  }
+
+  // One shared soft limiter over the complete mix.
+  applySoftLimiter(mix);
+  // Safety fade at the bus's own end in case the last voice fills it exactly.
+  applyTailFade(mix, sampleRate);
+  return mix;
 }
 
 /** Displacement field at time t, for animating the drumhead as it rings. */

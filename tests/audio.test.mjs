@@ -19,7 +19,9 @@ import {
   frequencies,
   modeNorms,
   nodeWeights,
+  renderBus,
   renderStrike,
+  renderStrikeVoice,
   strikeAmplitudes,
   strikeHeadroom,
 } from '../src/audio/synth.js';
@@ -229,18 +231,12 @@ test('a physically scaled strike never reaches the soft limiter', () => {
   assert.ok(peak > 0.1, `pre-limiter peak was only ${peak}; the strike would be inaudible`);
 });
 
-test('overlapping voices can exceed full scale even though a single strike never does', () => {
-  // main.js caps a fast series of taps at MAX_VOICES = 6, each independently
-  // scaled so its OWN peak sits near TARGET_PEAK = 0.72 and tanh-limited on its
-  // own. Nothing in that per-voice math looks at what else is ringing, so voices
-  // simply sum at the destination. This reproduces that summation directly - no
-  // AudioContext needed, since it is pure arithmetic - to pin the fact that
-  // motivates routing every voice through one shared limiter (`masterBus` in
-  // main.js) rather than trusting the per-voice tanh alone.
-  // Unit area, because main.js always normalises before solving. A radius-1 disk
-  // has area pi, so now that the pitch follows the shape it would sound about a
-  // fifth lower than anything the app can actually produce, and whether six taps
-  // 30 ms apart happen to align is a question about the frequency.
+test('six taps 30 ms apart stay inside full scale and audible through the shared bus', () => {
+  // The fast-tap failure mode: main.js caps a quick series at MAX_VOICES = 6, and
+  // each voice used to be tanh-limited on its OWN peak before the limited voices
+  // simply added at the destination. renderBus instead sums the raw (unlimited)
+  // voices with one shared gain and applies a single tanh to the complete mix.
+  // Unit area, because main.js always normalises before solving.
   const { mesh, modes, eigenvalues } = solveDrum(regularPolygon(160, 1 / Math.sqrt(Math.PI)), {
     modes: 16,
     targetNodes: 2200,
@@ -264,25 +260,161 @@ test('overlapping voices can exceed full scale even though a single strike never
     CONTACT_RATIO,
     130,
   );
-  const voice = renderStrike({ freqs, amps, taus, sampleRate: SR, gain });
-
-  let singlePeak = 0;
-  for (const v of voice) singlePeak = Math.max(singlePeak, Math.abs(v * OUT_GAIN));
-  assert.ok(singlePeak < 0.95, `a single voice should sit well under full scale, got ${singlePeak}`);
-
-  // Six taps 30ms apart is a fast but ordinary tapping cadence, not an
-  // adversarial one.
   const interval = Math.round(0.03 * SR);
-  const sum = new Float64Array(voice.length + interval * (MAX_VOICES - 1));
+
+  const voices = [];
   for (let v = 0; v < MAX_VOICES; v++) {
-    const offset = v * interval;
-    for (let n = 0; n < voice.length; n++) sum[offset + n] += voice[n] * OUT_GAIN;
+    voices.push({
+      samples: renderStrikeVoice({ freqs, amps, taus, sampleRate: SR, gain }),
+      offset: v * interval,
+    });
   }
-  let stackedPeak = 0;
-  for (const s of sum) stackedPeak = Math.max(stackedPeak, Math.abs(s));
+  const bus = renderBus(voices, { sampleRate: SR, gain: OUT_GAIN });
+
+  // The whole sequence, including every overlap, fits in one buffer.
+  const voice = renderStrike({ freqs, amps, taus, sampleRate: SR, gain });
+  assert.equal(bus.length, voice.length + interval * (MAX_VOICES - 1));
+
+  let peak = 0;
+  for (const s of bus) {
+    assert.ok(Number.isFinite(s), 'the shared limiter must not produce NaN or infinities');
+    peak = Math.max(peak, Math.abs(s));
+  }
+  assert.ok(peak <= 1, `shared bus must never exceed full scale, got peak ${peak}`);
+  assert.ok(peak > 0.1, `the mixed sequence must stay clearly audible, peak was only ${peak}`);
+});
+
+test('the shared bus actually limits a raw mix that would otherwise clip', () => {
+  // The previous test's production gain happens to stay under full scale, which
+  // would let a no-op "limiter" pass. This drives the voices hard enough that the
+  // raw sum genuinely exceeds 1, and pins that the one shared tanh is what pulls
+  // it back while the signal stays loud rather than being squashed to silence.
+  const { mesh, modes, eigenvalues } = solveDrum(regularPolygon(160, 1 / Math.sqrt(Math.PI)), {
+    modes: 16,
+    targetNodes: 2200,
+  });
+  const freqs = frequencies(eigenvalues, 130);
+  const w = nodeWeights(mesh);
+  const norms = modeNorms(mesh, modes, w);
+  const taus = decayTimes(freqs, 1.7, 0.5, 130);
+  const CONTACT_RATIO = 2.2;
+  const SR = 48000;
+  const MAX_VOICES = 6;
+
+  const head = strikeHeadroom(mesh, modes, norms, freqs, w, 0.09, CONTACT_RATIO, 130);
+  const gain = 2 / head; // deliberately hot: a single voice already reaches ~2
+  const amps = audibleAmps(
+    strikeAmplitudes(mesh, modes, 0.22, 0, 0.09, w),
+    norms,
+    freqs,
+    CONTACT_RATIO,
+    130,
+  );
+  const interval = Math.round(0.03 * SR);
+
+  const voices = [];
+  let rawLength = 0;
+  for (let v = 0; v < MAX_VOICES; v++) {
+    const samples = renderStrikeVoice({ freqs, amps, taus, sampleRate: SR, gain });
+    voices.push({ samples, offset: v * interval });
+    rawLength = Math.max(rawLength, v * interval + samples.length);
+  }
+  const raw = new Float64Array(rawLength);
+  for (const { samples, offset } of voices) {
+    for (let n = 0; n < samples.length; n++) raw[offset + n] += samples[n];
+  }
+  let rawPeak = 0;
+  for (const s of raw) rawPeak = Math.max(rawPeak, Math.abs(s));
+  assert.ok(rawPeak > 1, `sanity: the unlimited mix must exceed full scale, got ${rawPeak}`);
+
+  const bus = renderBus(voices, { sampleRate: SR });
+  let peak = 0;
+  let energy = 0;
+  for (const s of bus) {
+    assert.ok(Number.isFinite(s));
+    peak = Math.max(peak, Math.abs(s));
+    energy += s * s;
+  }
+  assert.ok(peak <= 1, `the shared limiter must cap the mix at full scale, got ${peak}`);
+  assert.ok(peak > 0.5, `limiting must leave a loud signal, not a squashed one, got ${peak}`);
+  assert.ok(Math.sqrt(energy / bus.length) > 0.1, 'the limited sequence must stay audible');
+});
+
+test('a single voice on the shared bus is sample-for-sample the renderStrike output', () => {
+  // renderStrike keeps its exact historical single-strike behaviour (first sample
+  // silent, tail faded, its own safety tanh). Routing that same lone strike
+  // through the shared bus must not alter a single sample, so the two rendering
+  // paths cannot drift apart.
+  const { mesh, modes, eigenvalues } = circle();
+  const freqs = frequencies(eigenvalues, 130);
+  const amps = strikeAmplitudes(mesh, modes, 0.1, 0.1, 0.09);
+  const taus = decayTimes(freqs, 1.7, 0.5);
+  const SR = 24000;
+
+  const direct = renderStrike({ freqs, amps, taus, sampleRate: SR, gain: 1.7 });
+  const viaBus = renderBus(
+    [{ samples: renderStrikeVoice({ freqs, amps, taus, sampleRate: SR, gain: 1.7 }) }],
+    { sampleRate: SR },
+  );
+  assert.equal(viaBus.length, direct.length);
+  for (let n = 0; n < direct.length; n++) {
+    assert.ok(
+      Object.is(viaBus[n], direct[n]),
+      `single-voice bus diverged from renderStrike at sample ${n}: ${viaBus[n]} vs ${direct[n]}`,
+    );
+  }
+  assert.equal(direct[0], 0, 'a struck membrane starts at rest, so the first sample is silent');
+});
+
+test('the shared bus renders an empty input to an empty buffer, not NaN', () => {
+  const a = renderBus([], { sampleRate: 48000 });
+  const b = renderBus(undefined, { sampleRate: 48000 });
+  assert.ok(a instanceof Float32Array && b instanceof Float32Array);
+  assert.equal(a.length, 0);
+  assert.equal(b.length, 0);
+});
+
+test('strikeHeadroom covers the strongest strike anywhere on the whole head', () => {
+  // The old reference evaluated one strike at the fundamental's peak node. On a
+  // disk that is the centre, but an off-centre strike drives the higher modes too
+  // and reaches a larger total l1 drive, so the centre-only estimate understated
+  // the true maximum by roughly 40% - which is an over-large gain that pushed
+  // edge and eccentric strikes into the limiter. The swept reference must be at
+  // least as large as the drive found at every individual node.
+  const { mesh, modes, eigenvalues } = solveDrum(regularPolygon(160, 1 / Math.sqrt(Math.PI)), {
+    modes: 16,
+    targetNodes: 2200,
+  });
+  const freqs = frequencies(eigenvalues, 130);
+  const w = nodeWeights(mesh);
+  const norms = modeNorms(mesh, modes, w);
+  const radius = 0.09;
+  const headroom = strikeHeadroom(mesh, modes, norms, freqs, w, radius, 2.2, 130);
+
+  let strongestSeen = 0;
+  let centreDrive = 0;
+  for (let i = 0; i < mesh.nodeCount; i++) {
+    const heard = audibleAmps(
+      strikeAmplitudes(mesh, modes, mesh.nodes[i * 2], mesh.nodes[i * 2 + 1], radius, w),
+      norms,
+      freqs,
+      2.2,
+      130,
+    );
+    let drive = 0;
+    for (let k = 0; k < heard.length; k++) drive += Math.abs(heard[k]);
+    strongestSeen = Math.max(strongestSeen, drive);
+    if (Math.abs(mesh.nodes[i * 2]) < 1e-9 && Math.abs(mesh.nodes[i * 2 + 1]) < 1e-9) {
+      centreDrive = drive;
+    }
+  }
   assert.ok(
-    stackedPeak > 1,
-    `expected overlapping voices to exceed full scale without a shared limiter, got ${stackedPeak}`,
+    Math.abs(headroom - strongestSeen) <= 1e-12 * Math.max(1, strongestSeen),
+    `headroom ${headroom} must equal the strongest strike on the head, ${strongestSeen}`,
+  );
+  assert.ok(
+    headroom > centreDrive,
+    'the strongest strike is off centre, so a centre-only estimate must be an underestimate',
   );
 });
 
