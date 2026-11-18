@@ -26,7 +26,16 @@ export default function App() {
   const [activeHistoricalId, setActiveHistoricalId] = useState<string | null>(null);
   const activeHistoricalScenario = useMemo(() => activeHistoricalId ? getHistoricalScenario(activeHistoricalId) : null, [activeHistoricalId]);
   const activeHistoricalEclipse = useMemo(() => activeHistoricalId ? HISTORICAL_ECLIPSES.find((eclipse) => eclipse.id === activeHistoricalId) ?? null : null, [activeHistoricalId]);
-  const activeStations = useMemo(() => activeHistoricalScenario?.stations ?? OBSERVATION_STATIONS, [activeHistoricalScenario]);
+  // Use the historical station list exactly as authored — including an empty one.
+  // Falling back with `??` would only help for null/undefined, so branch explicitly instead.
+  const activeStations = useMemo(
+    () => (activeHistoricalScenario ? activeHistoricalScenario.stations : OBSERVATION_STATIONS),
+    [activeHistoricalScenario],
+  );
+  const activeWaypoints = useMemo(
+    () => (activeHistoricalScenario ? activeHistoricalScenario.waypoints : undefined),
+    [activeHistoricalScenario],
+  );
 
   // Selection & Camera State
   const [selectedStation, setSelectedStation] = useState<ObservationStation | null>(() => getAutoTrackingStation(DEFAULT_START_SECONDS));
@@ -72,11 +81,27 @@ export default function App() {
     if (trackingMode !== 'auto') return;
 
     const autoStation = getAutoTrackingStation(currentTimestamp, activeStations);
-    if (autoStation && (!selectedStation || selectedStation.id !== autoStation.id || selectedStation.isCustom)) {
+    if (!autoStation) {
+      // Active scene has no stations (or none usable): drop any inherited selection.
+      setCustomStation(null);
+      setSelectedStation(null);
+      return;
+    }
+    if (!selectedStation || selectedStation.id !== autoStation.id || selectedStation.isCustom) {
       setCustomStation(null);
       setSelectedStation(autoStation);
     }
   }, [activeStations, currentTimestamp, trackingMode, selectedStation]);
+
+  // Guard against cross-scene leakage: a station selected in a previous replay must never
+  // survive into a different replay (or back into the 2026 default scene).
+  useEffect(() => {
+    if (!selectedStation || selectedStation.isCustom || customStation) return;
+    if (activeStations.some((station) => station.id === selectedStation.id)) return;
+
+    const fallback = getAutoTrackingStation(currentTimestamp, activeStations);
+    setSelectedStation(fallback ?? (trackingMode === 'auto' ? null : activeStations[0] ?? null));
+  }, [activeStations, currentTimestamp, customStation, selectedStation, trackingMode]);
 
   // Compute live telemetry for selected station
   const activeStation = useMemo(() => customStation || selectedStation, [customStation, selectedStation]);
@@ -148,12 +173,32 @@ export default function App() {
     if (!scenario) return;
     setActiveHistoricalId(id);
     setCustomStation(null);
+    // Historical scenes can legitimately have no stations; keep the UI in a defined
+    // "no station" state instead of carrying over the previous scene's selection.
     setSelectedStation(scenario.stations[0] ?? null);
     setCurrentTimestamp(scenario.start);
     setIsPlaying(true);
     setIsArchiveOpen(false);
     setTrackingMode('manual');
-    setCameraMode('free');
+    // Frame the historical route immediately: the camera follows this scene's own umbra
+    // instead of lingering on the previous scene's viewport.
+    setCameraMode('follow-shadow');
+    // Drop any manual camera override left over from the previous scene so the focus applies.
+    setCameraResetTrigger((prev) => prev + 1);
+  }, []);
+
+  // Restore the untouched 2026 default simulation. Every piece of replay-scoped state
+  // (date, path, stations, selection, tracking, camera, timeline bounds) must be re-derived
+  // from the default 2026 scene so no historical leftovers survive the transition.
+  const handleExitHistoricalReplay = useCallback(() => {
+    setActiveHistoricalId(null);
+    setCurrentTimestamp(DEFAULT_START_SECONDS);
+    setIsPlaying(true);
+    setCustomStation(null);
+    setSelectedStation(getAutoTrackingStation(DEFAULT_START_SECONDS, OBSERVATION_STATIONS));
+    setTrackingMode('auto');
+    setCameraMode('follow-shadow');
+    setCameraResetTrigger((prev) => prev + 1);
   }, []);
 
   const handleSelectStation = useCallback((station: ObservationStation) => {
@@ -248,7 +293,8 @@ export default function App() {
           <Earth3D
             currentTimestamp={currentTimestamp}
             selectedStation={activeStation}
-            umbraPath={activeHistoricalScenario?.waypoints}
+            stations={activeStations}
+            umbraPath={activeWaypoints}
             onSelectStation={handleSelectStation}
             cameraMode={cameraMode}
             showPathLine={showPathLine}
@@ -281,7 +327,7 @@ export default function App() {
               eclipse={activeHistoricalEclipse}
               scenario={activeHistoricalScenario}
               currentTimestamp={currentTimestamp}
-              onExit={() => { setActiveHistoricalId(null); setCurrentTimestamp(DEFAULT_START_SECONDS); setIsPlaying(true); }}
+              onExit={handleExitHistoricalReplay}
             /> : <PathTimelinePanel
               scenario={activeHistoricalScenario}
               currentTimestamp={currentTimestamp}
@@ -429,6 +475,7 @@ export default function App() {
             )}
             {mobileTab === 'timeline' && (
               <PathTimelinePanel
+                scenario={activeHistoricalScenario}
                 currentTimestamp={currentTimestamp}
                 onSelectMilestone={handleJumpToMilestone}
               />

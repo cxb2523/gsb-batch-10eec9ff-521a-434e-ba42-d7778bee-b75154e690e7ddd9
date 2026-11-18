@@ -112,7 +112,7 @@ export const TelemetryPanel: React.FC<TelemetryPanelProps> = ({
           <div className="flex items-baseline gap-2.5 mb-1">
             <span className="text-2xl lg:text-3xl leading-none">{getFlagEmoji(selectedStation.countryCode)}</span>
             <span className="text-xl lg:text-2xl font-extrabold text-white tracking-tight uppercase">
-              {selectedStation.country === 'Ocean' ? 'Custom Point' : selectedStation.country}
+              {selectedStation.isCustom ? 'Custom Point' : selectedStation.country}
             </span>
           </div>
           <div className="text-sm lg:text-base font-mono text-cyan-300 font-bold tracking-wide pl-9 lg:pl-10">

@@ -13,7 +13,34 @@ export const SkyViewPanel: React.FC<SkyViewPanelProps> = ({
   telemetry,
   currentTimestamp
 }) => {
-  if (!selectedStation) return null;
+  if (!selectedStation) {
+    return (
+      <div className="w-full md:w-88 lg:w-96 xl:w-[410px] bg-[#050505]/95 backdrop-blur-2xl border border-white/20 rounded overflow-hidden shadow-2xl flex flex-col shrink-0 font-sans select-none">
+        <div className="flex items-center justify-between px-4 py-3 lg:px-6 lg:py-3.5 border-b border-white/20 bg-black/60">
+          <div className="flex items-center gap-2.5">
+            <span className="w-2.5 h-2.5 rounded-full bg-slate-600" />
+            <span className="text-xs lg:text-[13px] font-mono tracking-[0.2em] uppercase text-slate-400 font-bold">
+              GROUND SKY VIEW
+            </span>
+          </div>
+          <span className="font-mono text-xs lg:text-[13px] text-slate-500">ALT --</span>
+        </div>
+        <div className="relative w-full h-48 sm:h-56 lg:h-64 flex items-center justify-center bg-black/80">
+          <span className="font-mono text-xs uppercase tracking-widest text-slate-500">No observation point</span>
+        </div>
+        <div className="px-4 py-3 lg:px-6 lg:py-3.5 bg-black/80 border-t border-white/20 flex flex-col gap-2.5">
+          <div className="flex items-center justify-between font-mono text-xs lg:text-sm">
+            <span className="text-slate-400 tracking-wider uppercase text-[11px] lg:text-xs font-medium">Phase</span>
+            <span className="text-white font-bold tracking-widest uppercase">No Data</span>
+          </div>
+          <div className="flex items-center justify-between font-mono text-xs lg:text-sm">
+            <span className="text-slate-400 tracking-wider uppercase text-[11px] lg:text-xs font-medium">Obscuration</span>
+            <span className="text-amber-400 font-extrabold tracking-widest">--</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const { obscurationPercentage, currentPhase, sunAltitudeDegrees } = telemetry;
   const isTotality = currentPhase === 'TOTALITY!';

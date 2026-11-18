@@ -40,6 +40,7 @@ export const PathTimelinePanel: React.FC<PathTimelinePanelProps> = ({
         timeUTC: `${Math.floor(waypoint.time / 60)}m ${waypoint.time % 60}s`,
         timeSeconds: waypoint.time,
         label: waypoint.name ?? `Route checkpoint ${index + 1}`,
+        // Only link a milestone to a station when that station actually exists in this scene.
         stationId: scenario.stations[index]?.id,
       }))
     : PATH_MILESTONES;

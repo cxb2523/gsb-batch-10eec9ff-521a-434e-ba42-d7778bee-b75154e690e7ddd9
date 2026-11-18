@@ -363,7 +363,14 @@ export function calculateTelemetry(
  * the upcoming/current station, and a short while after the eclipse totality passes that station,
  * we automatically pin to the next city/station along the path.
  */
-export function getAutoTrackingStation(currentTimestamp: number, stations = OBSERVATION_STATIONS): ObservationStation {
+export function getAutoTrackingStation(
+  currentTimestamp: number,
+  stations: ObservationStation[] = OBSERVATION_STATIONS,
+): ObservationStation | null {
+  // Historical scenes may legitimately expose an empty station list.
+  // Never index into an empty array or run reduce without a seed.
+  if (!stations.length) return null;
+
   if (stations !== OBSERVATION_STATIONS) {
     const parse = (value: string) => {
       const [h, m, s] = value.split(':').map(Number);

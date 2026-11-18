@@ -118,8 +118,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           <div className="relative flex-1 flex items-center h-4">
             <input
               type="range"
-              min={SIMULATION_START_SECONDS}
-              max={SIMULATION_END_SECONDS}
+              min={startSeconds}
+              max={endSeconds}
               step={5}
               value={currentTimestamp}
               onChange={(e) => onTimeChange(Number(e.target.value))}

@@ -8,6 +8,7 @@ import { getUmbraPosition, getSubSolarPoint, latLonToVector3 } from '../utils/as
 interface Earth3DProps {
   currentTimestamp: number;
   selectedStation: ObservationStation | null;
+  stations?: ObservationStation[];
   umbraPath?: { time: number; coords: LatLon; name?: string }[];
   onSelectStation: (station: ObservationStation) => void;
   cameraMode: 'free' | 'follow-shadow' | 'focused-station' | 'top-down' | 'spain-fixed';
@@ -115,6 +116,24 @@ const getPathPosition = (path: { time: number; coords: LatLon }[], timestamp: nu
   return path[path.length - 1].coords;
 };
 
+// Sample the visible route into a polyline that hugs the globe surface.
+// Returns an empty list for scenes without a route so the line renders as nothing.
+const buildPathPoints = (path: { time: number; coords: LatLon }[]): THREE.Vector3[] => {
+  if (!path.length) return [];
+  const routeStart = path[0].time;
+  const routeEnd = path[path.length - 1].time;
+  const points: THREE.Vector3[] = [];
+  const step = Math.max(15, (routeEnd - routeStart) / 360);
+  for (let t = routeStart; t <= routeEnd; t += step) {
+    const pos = getPathPosition(path, t);
+    if (pos) points.push(new THREE.Vector3(...latLonToVector3(pos.lat, pos.lon, EARTH_RADIUS * 1.004)));
+  }
+  // Ensure the final waypoint is always included when the loop step overshoots it.
+  const last = path[path.length - 1].coords;
+  points.push(new THREE.Vector3(...latLonToVector3(last.lat, last.lon, EARTH_RADIUS * 1.004)));
+  return points;
+};
+
 const generateGreatCircleArc = (coord1: LatLon, coord2: LatLon, radius: number, segments = 40): THREE.Vector3[] => {
   const v1 = new THREE.Vector3(...latLonToVector3(coord1.lat, coord1.lon, 1)).normalize();
   const v2 = new THREE.Vector3(...latLonToVector3(coord2.lat, coord2.lon, 1)).normalize();
@@ -146,6 +165,7 @@ const generateGreatCircleArc = (coord1: LatLon, coord2: LatLon, radius: number, 
 export const Earth3D: React.FC<Earth3DProps> = ({
   currentTimestamp,
   selectedStation,
+  stations = OBSERVATION_STATIONS,
   umbraPath = UMBRA_PATH_WAYPOINTS,
   onSelectStation,
   cameraMode,
@@ -658,17 +678,7 @@ export const Earth3D: React.FC<Earth3DProps> = ({
 
     // 3. Path of Totality Line (Semantic Solar Gold / Amber accent line)
     // Sample the 3D Geodesic Slerp astronomical trajectory every 15 seconds for a mathematically pristine curve on the sphere
-    const curvePoints: THREE.Vector3[] = [];
-    const routeStart = umbraPath[0]?.time ?? 61200;
-    const routeEnd = umbraPath[umbraPath.length - 1]?.time ?? 66720;
-    for (let t = routeStart; t <= routeEnd; t += Math.max(15, (routeEnd - routeStart) / 360)) {
-      const pos = getPathPosition(umbraPath, t);
-      if (pos) {
-        const vec = latLonToVector3(pos.lat, pos.lon, EARTH_RADIUS * 1.004);
-        curvePoints.push(new THREE.Vector3(...vec));
-      }
-    }
-    const pathGeo = new THREE.BufferGeometry().setFromPoints(curvePoints);
+    const pathGeo = new THREE.BufferGeometry().setFromPoints(buildPathPoints(umbraPath));
     const pathMat = new THREE.LineBasicMaterial({ color: 0xf59e0b, linewidth: 2, transparent: true, opacity: 0.95 });
     const pathLine = new THREE.Line(pathGeo, pathMat);
     scene.add(pathLine);
@@ -765,18 +775,14 @@ export const Earth3D: React.FC<Earth3DProps> = ({
   }, [generateFallbackDayTexture, generateFallbackNightTexture]);
 
   // Refresh the visible path when the user switches between the live 2026 route and an archive replay.
+  // Also clears the line for scenes that have no route at all.
   useEffect(() => {
-    if (!pathLineRef.current || !umbraPath.length) return;
-    const routeStart = umbraPath[0].time;
-    const routeEnd = umbraPath[umbraPath.length - 1].time;
-    const points: THREE.Vector3[] = [];
-    for (let t = routeStart; t <= routeEnd; t += Math.max(15, (routeEnd - routeStart) / 360)) {
-      const pos = getPathPosition(umbraPath, t);
-      if (pos) points.push(new THREE.Vector3(...latLonToVector3(pos.lat, pos.lon, EARTH_RADIUS * 1.004)));
-    }
+    if (!pathLineRef.current) return;
+    const points = buildPathPoints(umbraPath);
+    pathLineRef.current.visible = showPathLine && points.length > 1;
     pathLineRef.current.geometry.dispose();
     pathLineRef.current.geometry = new THREE.BufferGeometry().setFromPoints(points);
-  }, [umbraPath]);
+  }, [umbraPath, showPathLine]);
 
   // Update Scene elements when timestamp, selection, or toggles change
   useEffect(() => {
@@ -822,7 +828,7 @@ export const Earth3D: React.FC<Earth3DProps> = ({
 
     // Update Path Line Visibility
     if (pathLineRef.current) {
-      pathLineRef.current.visible = showPathLine;
+      pathLineRef.current.visible = showPathLine && Boolean(umbraPath.length);
     }
 
     // Update Station Markers & Custom Observation Pin (Orbital HUD Laser Reticles)
@@ -861,11 +867,13 @@ export const Earth3D: React.FC<Earth3DProps> = ({
         stationMarkersRef.current?.add(hudGroup);
       };
 
-      OBSERVATION_STATIONS.forEach((station) => {
+      stations.forEach((station) => {
         const isSelected = selectedStation?.id === station.id && !selectedStation?.isCustom;
         createOrbitalHud(station.coords, isSelected, station.name, false, station);
       });
 
+      // A custom pin only belongs to the scene it was dropped in. When a historical scene is
+      // active the pin is already cleared by App, and this keeps the globe consistent.
       if (selectedStation?.isCustom) {
         createOrbitalHud(selectedStation.coords, true, selectedStation.name || "Custom Target", true, selectedStation);
       }
@@ -1001,7 +1009,7 @@ export const Earth3D: React.FC<Earth3DProps> = ({
         controlsRef.current.target.set(0, 0, 0);
       }
     }
-  }, [currentTimestamp, selectedStation, cameraMode, cameraResetTrigger, showPathLine, showPenumbra, showDayNightTerminator, showCelestialIcons]);
+  }, [currentTimestamp, selectedStation, stations, umbraPath, cameraMode, cameraResetTrigger, showPathLine, showPenumbra, showDayNightTerminator, showCelestialIcons]);
 
   // Handle Click on Globe / Markers
   const handleClick = (event: React.MouseEvent<HTMLDivElement>) => {
