@@ -96,12 +96,19 @@ const layoutNewModels = (
 let dimensionUpdateTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingDimensionUpdates: Record<string, Vec3> = {};
 
+// Monotonic token identifying the single in-flight AR export. Every new export,
+// selection change, or session close invalidates previous tokens so a late
+// completion can never overwrite the current AR state.
+let arRequestSequence = 0;
+
 export type ArStatus = 'idle' | 'preparing' | 'ready' | 'error';
 
 export interface ArState {
   isArSupported: boolean;
   arStatus: ArStatus;
+  // Token + model id captured at the moment an export is initiated.
   arGenerationRequest: number | null;
+  arTargetModelId: string | null;
   arModelUrl: string | null;
   arUsdzUrl: string | null;
   arFileName: string | null;
@@ -109,9 +116,15 @@ export interface ArState {
   setArSupported: (supported: boolean) => void;
   triggerArGeneration: () => void;
   clearArGenerationRequest: () => void;
-  setArModelUrl: (url: string | null) => void;
-  setArAsset: (kind: 'usdz' | 'glb', url: string, fileName: string) => void;
-  setArError: (message: string) => void;
+  // resolve* reject results whose token no longer matches the active export.
+  resolveArAsset: (
+    requestToken: number,
+    modelId: string,
+    kind: 'usdz' | 'glb',
+    url: string,
+    fileName: string
+  ) => void;
+  resolveArError: (requestToken: number, modelId: string, message: string) => void;
   closeArSession: () => void;
 }
 
@@ -135,6 +148,7 @@ export const useStore = create<ViewerState & ArState>()(
       isArSupported: false,
       arStatus: 'idle',
       arGenerationRequest: null,
+      arTargetModelId: null,
       arModelUrl: null,
       arUsdzUrl: null,
       arFileName: null,
@@ -230,6 +244,15 @@ export const useStore = create<ViewerState & ArState>()(
           const { [id]: _scale, ...remainingScales } = state.modelScales;
           const { [id]: _pos, ...remainingPositions } = state.modelPositions;
 
+          // If the removed model owns the active AR session, invalidate any
+          // in-flight export for it and release its AR temporary URLs.
+          const resettingAr = state.arTargetModelId === id;
+          if (resettingAr) {
+            if (state.arModelUrl) URL.revokeObjectURL(state.arModelUrl);
+            if (state.arUsdzUrl) URL.revokeObjectURL(state.arUsdzUrl);
+            arRequestSequence += 1;
+          }
+
           return {
             models: newModels,
             selectedModelId: state.selectedModelId === id ? null : state.selectedModelId,
@@ -237,11 +260,43 @@ export const useStore = create<ViewerState & ArState>()(
             modelRotations: remainingRotations,
             modelScales: remainingScales,
             modelPositions: remainingPositions,
+            ...(resettingAr
+              ? {
+                  arStatus: 'idle' as ArStatus,
+                  arGenerationRequest: null,
+                  arTargetModelId: null,
+                  arModelUrl: null,
+                  arUsdzUrl: null,
+                  arFileName: null,
+                  arError: null,
+                }
+              : {}),
           };
         });
       },
 
-      selectModel: (id) => set({ selectedModelId: id }),
+      selectModel: (id) =>
+        set((state) => {
+          // Switching the selection while an AR session is active invalidates the
+          // export bound to the previous model: return to a clean, re-launchable
+          // state and release the previous model's temporary GLB/USDZ URLs.
+          if (id !== state.selectedModelId && state.arStatus !== 'idle') {
+            if (state.arModelUrl) URL.revokeObjectURL(state.arModelUrl);
+            if (state.arUsdzUrl) URL.revokeObjectURL(state.arUsdzUrl);
+            arRequestSequence += 1;
+            return {
+              selectedModelId: id,
+              arStatus: 'idle',
+              arGenerationRequest: null,
+              arTargetModelId: null,
+              arModelUrl: null,
+              arUsdzUrl: null,
+              arFileName: null,
+              arError: null,
+            };
+          }
+          return { selectedModelId: id };
+        }),
 
       setPPI: (ppi) => {
         if (typeof ppi === 'number' && Number.isFinite(ppi) && ppi > 0) {
@@ -333,12 +388,24 @@ export const useStore = create<ViewerState & ArState>()(
       },
 
       setArSupported: (supported) => set({ isArSupported: supported }),
+
       triggerArGeneration: () =>
         set((state) => {
+          const targetModelId = state.selectedModelId;
+          if (!targetModelId) {
+            return {};
+          }
+
+          // Re-issuing (or retrying) an export invalidates the previous one and
+          // releases every temporary URL it produced.
           if (state.arModelUrl) URL.revokeObjectURL(state.arModelUrl);
           if (state.arUsdzUrl) URL.revokeObjectURL(state.arUsdzUrl);
+
+          const requestToken = ++arRequestSequence;
           return {
-            arGenerationRequest: Date.now(),
+            // The export is permanently bound to the model selected right now.
+            arGenerationRequest: requestToken,
+            arTargetModelId: targetModelId,
             arStatus: 'preparing',
             arModelUrl: null,
             arUsdzUrl: null,
@@ -346,24 +413,28 @@ export const useStore = create<ViewerState & ArState>()(
             arError: null,
           };
         }),
+
       clearArGenerationRequest: () => set({ arGenerationRequest: null }),
 
-      setArModelUrl: (url) =>
+      resolveArAsset: (requestToken, modelId, kind, url, fileName) =>
         set((state) => {
-          if (state.arModelUrl && state.arModelUrl !== url) {
-            URL.revokeObjectURL(state.arModelUrl);
+          // Drop results from superseded, cancelled, or re-targeted exports.
+          if (
+            requestToken !== arRequestSequence ||
+            state.arTargetModelId !== modelId ||
+            state.arStatus !== 'preparing'
+          ) {
+            URL.revokeObjectURL(url);
+            return {};
           }
-          return { arModelUrl: url };
-        }),
 
-      setArAsset: (kind, url, fileName) =>
-        set((state) => {
           if (state.arModelUrl && state.arModelUrl !== url) {
             URL.revokeObjectURL(state.arModelUrl);
           }
           if (state.arUsdzUrl && state.arUsdzUrl !== url) {
             URL.revokeObjectURL(state.arUsdzUrl);
           }
+
           return kind === 'usdz'
             ? {
                 arUsdzUrl: url,
@@ -381,20 +452,33 @@ export const useStore = create<ViewerState & ArState>()(
               };
         }),
 
-      setArError: (message) =>
-        set({
-          arStatus: 'error',
-          arError: message,
-          arGenerationRequest: null,
+      resolveArError: (requestToken, modelId, message) =>
+        set((state) => {
+          // A failure from an outdated export must never surface in the UI.
+          if (
+            requestToken !== arRequestSequence ||
+            state.arTargetModelId !== modelId ||
+            state.arStatus !== 'preparing'
+          ) {
+            return {};
+          }
+          return {
+            arStatus: 'error',
+            arError: message,
+            arGenerationRequest: null,
+          };
         }),
 
       closeArSession: () =>
         set((state) => {
           if (state.arModelUrl) URL.revokeObjectURL(state.arModelUrl);
           if (state.arUsdzUrl) URL.revokeObjectURL(state.arUsdzUrl);
+          // Any export still running completes against a dead token and is discarded.
+          arRequestSequence += 1;
           return {
             arStatus: 'idle',
             arGenerationRequest: null,
+            arTargetModelId: null,
             arModelUrl: null,
             arUsdzUrl: null,
             arFileName: null,

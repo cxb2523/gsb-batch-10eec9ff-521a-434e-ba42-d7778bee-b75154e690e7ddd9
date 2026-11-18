@@ -298,12 +298,14 @@ export const ModelWrapper: React.FC<ModelWrapperProps> = ({ modelData }) => {
   const updateModelTransform = useStore((state) => state.updateModelTransform);
 
   const arGenerationRequest = useStore((state) => state.arGenerationRequest);
+  const arTargetModelId = useStore((state) => state.arTargetModelId);
   const clearArGenerationRequest = useStore((state) => state.clearArGenerationRequest);
-  const setArAsset = useStore((state) => state.setArAsset);
-  const setArError = useStore((state) => state.setArError);
+  const resolveArAsset = useStore((state) => state.resolveArAsset);
+  const resolveArError = useStore((state) => state.resolveArError);
 
   const [group, setGroup] = useState<Group | null>(null);
   const transformControlsRef = useRef<TransformControlsImpl | null>(null);
+  // Local guard for this component instance; the store token is the cross-model guard.
   const arExportIdRef = useRef(0);
 
   useEffect(() => {
@@ -342,8 +344,10 @@ export const ModelWrapper: React.FC<ModelWrapperProps> = ({ modelData }) => {
 
   // AR USDZ (iOS) / GLB (Android & WebXR) export, lazy-loading only the needed exporter
   useEffect(() => {
-    if (!arGenerationRequest || !isSelected || !group) return;
+    // Only the model that was selected when the export was initiated can run it.
+    if (!arGenerationRequest || arTargetModelId !== modelData.id || !group) return;
 
+    const requestToken = arGenerationRequest;
     const exportId = ++arExportIdRef.current;
     clearArGenerationRequest();
 
@@ -407,7 +411,14 @@ export const ModelWrapper: React.FC<ModelWrapperProps> = ({ modelData }) => {
           if (exportId !== arExportIdRef.current) return;
 
           const blob = new Blob([arrayBuffer], { type: 'model/vnd.usdz+zip' });
-          setArAsset('usdz', URL.createObjectURL(blob), baseName);
+          // A stale token is rejected by the store, which revokes this URL itself.
+          resolveArAsset(
+            requestToken,
+            modelData.id,
+            'usdz',
+            URL.createObjectURL(blob),
+            baseName
+          );
           return;
         }
 
@@ -425,23 +436,30 @@ export const ModelWrapper: React.FC<ModelWrapperProps> = ({ modelData }) => {
         }
 
         const blob = new Blob([gltf], { type: 'model/gltf-binary' });
-        setArAsset('glb', URL.createObjectURL(blob), baseName);
+        resolveArAsset(
+          requestToken,
+          modelData.id,
+          'glb',
+          URL.createObjectURL(blob),
+          baseName
+        );
       } catch (error) {
         if (exportId !== arExportIdRef.current) return;
         console.error('AR export failed:', error);
-        setArError('Could not prepare this model for AR.');
+        resolveArError(requestToken, modelData.id, 'Could not prepare this model for AR.');
       }
     };
 
     void exportArAsset();
   }, [
     arGenerationRequest,
-    isSelected,
-    group,
+    arTargetModelId,
+    modelData.id,
     modelData.file.name,
+    group,
     clearArGenerationRequest,
-    setArAsset,
-    setArError,
+    resolveArAsset,
+    resolveArError,
   ]);
 
   const posX = position?.x ?? 0;
