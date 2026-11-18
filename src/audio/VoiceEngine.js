@@ -267,10 +267,12 @@ export class VoiceEngine {
   setEnabled(enabled) {
     this._enabled = enabled;
     if (!enabled) {
-      // Cancel audio only. Do NOT fire _pendingOnComplete — the turn's display
-      // timer is still running and will advance the game at the right time.
-      // The safetyCap in engine.js fires 2s after display window closes as backup.
-      this._cancelSilent(false);
+      // Mute: cancel in-progress speech AND fire the pending onComplete so the
+      // current speaking turn advances instead of hanging until the safety cap.
+      // The engine gates turn advancement on BOTH the TTS callback and its display
+      // timer (with a one-shot guard), so firing here can't double-advance the
+      // turn or make two models speak at once — it just unblocks the TTS gate.
+      this._cancelSilent(true);
     }
   }
 

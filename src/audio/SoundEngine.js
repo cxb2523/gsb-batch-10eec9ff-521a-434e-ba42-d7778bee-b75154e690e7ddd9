@@ -2,7 +2,8 @@ export class SoundEngine {
   constructor() {
     this.ctx        = null;   // created lazily on first user gesture
     this.muted      = false;
-    this.ambientNode = null;
+    this.ambientNode = null;      // live ambient node — null when nothing is sounding
+    this._ambientWanted = false;  // INTENT: game wants ambient — independent of mute/ctx
     this._lastUiSound   = '';
     this._lastUiSoundAt = 0;
     this._pendingSounds = []; // queued while ctx doesn't exist yet
@@ -44,11 +45,9 @@ export class SoundEngine {
     // Play any sounds that were requested before the gesture
     this._drainPending();
 
-    // Restart ambient if it was requested before ctx existed
-    if (this._ambientWanted) {
-      this._ambientWanted = false;
-      this.playAmbient();
-    }
+    // Ambient: reconcile intent vs. live node now that the context exists.
+    // Plays only if the game still wants ambient and we're not muted.
+    this._syncAmbient();
   }
 
   // unlock() kept for backwards-compat — ctx is already running after gesture
@@ -57,14 +56,22 @@ export class SoundEngine {
     if (this.ctx.state === 'running') return true;
     try { await this.ctx.resume(); } catch {}
     const ok = this.ctx?.state === 'running';
-    // Drain any queued sounds now that the context is running again
-    if (ok) this._drainPending();
+    // Drain queued sounds and reconcile ambient now that the context is running
+    if (ok) {
+      this._drainPending();
+      this._syncAmbient();
+    }
     return ok;
   }
 
   _resume() { return this.unlock(); }
 
-  setMuted(v) { this.muted = v; }
+  setMuted(v) {
+    this.muted = v;
+    // Muting tears down the live ambient node but KEEPS the intent, so
+    // unmuting restores it. Unmuting replays ambient if it's still wanted.
+    this._syncAmbient();
+  }
 
   play(soundName) {
     if (this.muted) return;
@@ -686,14 +693,34 @@ export class SoundEngine {
   }
 
   // ── Ambient village ───────────────────────────────────────────────────────
+  // Two separate pieces of state:
+  //   _ambientWanted — INTENT: the game wants ambient (set/cleared by
+  //                    playAmbient/stopAmbient; survives mute and missing ctx)
+  //   ambientNode    — REALITY: the live looping node (null when silent)
+  // _syncAmbient() reconciles the two whenever anything changes, so replay and
+  // teardown always follow current state instead of one-shot flags.
   playAmbient() {
-    if (this.muted) return;
-    if (!this.ctx) {
-      // ctx doesn't exist yet — set a flag so _onFirstGesture starts ambient
-      this._ambientWanted = true;
-      return;
-    }
-    if (this.ambientNode) return;
+    // Record intent even while muted or before the AudioContext exists —
+    // the node is only created when state allows it.
+    this._ambientWanted = true;
+    this._syncAmbient();
+  }
+
+  stopAmbient() {
+    // Clear intent FIRST so a later gesture unlock / unmute can't resurrect it.
+    this._ambientWanted = false;
+    this._syncAmbient();
+  }
+
+  _syncAmbient() {
+    const shouldPlay = this._ambientWanted && !this.muted && !!this.ctx;
+    if (shouldPlay && !this.ambientNode) this._startAmbientNode();
+    else if (!shouldPlay && this.ambientNode) this._stopAmbientNode();
+  }
+
+  _startAmbientNode() {
+    // Guard: never stack a second ambient loop
+    if (this.ambientNode || !this.ctx) return;
     const bufSize = this.ctx.sampleRate * 2;
     const buf = this.ctx.createBuffer(1, bufSize, this.ctx.sampleRate);
     const data = buf.getChannelData(0);
@@ -715,7 +742,7 @@ export class SoundEngine {
     this.ambientNode = { source, gainNode };
   }
 
-  stopAmbient() {
+  _stopAmbientNode() {
     if (this.ambientNode) {
       try { this.ambientNode.source.stop(); } catch (e) {}
       this.ambientNode = null;
