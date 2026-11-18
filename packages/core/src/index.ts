@@ -65,7 +65,11 @@ export type {
 } from './types';
 
 // Engine
-export { ForceGraphSimulation, type ForceGraphConfig } from './engine/ForceGraphSimulation';
+export {
+  ForceGraphSimulation,
+  DEFAULT_FORCE_GRAPH_CONFIG,
+  type ForceGraphConfig,
+} from './engine/ForceGraphSimulation';
 export { SpatialHash } from './engine/SpatialHash';
 
 // Categories

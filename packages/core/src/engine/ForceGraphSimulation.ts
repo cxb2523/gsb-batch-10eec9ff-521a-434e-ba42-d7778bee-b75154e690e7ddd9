@@ -70,7 +70,8 @@ export interface ForceGraphConfig {
   velocityDecay?: number;
 }
 
-const DEFAULT_CONFIG: Required<ForceGraphConfig> = {
+/** Default force-graph configuration — also used to parameterise the WebGPU engine. */
+export const DEFAULT_FORCE_GRAPH_CONFIG: Required<ForceGraphConfig> = {
   maxAgentNodes: 5000,
   hubBaseRadius: 0.8,
   hubMaxRadius: 3.0,
@@ -103,7 +104,7 @@ export class ForceGraphSimulation {
   private config: Required<ForceGraphConfig>;
 
   constructor(config: ForceGraphConfig = {}) {
-    this.config = { ...DEFAULT_CONFIG, ...config };
+    this.config = { ...DEFAULT_FORCE_GRAPH_CONFIG, ...config };
     const c = this.config;
 
     // numDimensions=3 enables full volumetric (spherical) layout

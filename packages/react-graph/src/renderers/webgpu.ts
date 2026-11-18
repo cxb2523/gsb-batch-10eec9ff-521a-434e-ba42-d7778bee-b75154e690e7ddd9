@@ -82,6 +82,10 @@ export class WebGPUForceEngine {
   async init(): Promise<boolean> {
     if (typeof navigator === 'undefined' || !navigator.gpu) return false;
 
+    // Repeated initialisation must not leak a previous device/buffers.
+    if (this._ready && this.device) return true;
+    this.dispose();
+
     try {
       const adapter = await navigator.gpu.requestAdapter();
       if (!adapter) return false;
@@ -109,7 +113,12 @@ export class WebGPUForceEngine {
     this.nodeCount = nodes.length;
     this.edgeCount = edges.length;
 
-    if (this.nodeCount === 0) return;
+    if (this.nodeCount === 0) {
+      // No nodes — release any buffers from a previous, larger graph so we
+      // neither leak GPU memory nor keep a stale bind group around.
+      this.disposeBuffers();
+      return;
+    }
 
     // Position buffer: [x, y, z, radius] per node
     const posData = new Float32Array(this.nodeCount * 4);

@@ -475,16 +475,17 @@ const ForceGraph = forwardRef<GraphHandle, ForceGraphProps>(function ForceGraph(
   const gpuSim = useWebGPUSimulation(renderer, simulationConfig);
   const sim = gpuSim.sim;
 
-  // Notify parent when renderer is determined
+  // Notify parent when the active renderer is determined. The reported value
+  // mirrors the engine's ready state: 'webgpu' only when the GPU engine is
+  // actually driving the simulation, otherwise 'webgl'.
   const notifiedRef = useRef(false);
   useEffect(() => {
     if (notifiedRef.current) return;
-    const active = gpuSim.gpuActive ? 'webgpu' : 'webgl';
-    if (renderer === 'webgl' || gpuSim.gpuActive) {
+    if (renderer === 'webgl' || gpuSim.gpuResolved) {
       notifiedRef.current = true;
-      onRendererReady?.(active);
+      onRendererReady?.(gpuSim.gpuActive ? 'webgpu' : 'webgl');
     }
-  }, [gpuSim.gpuActive, renderer, onRendererReady]);
+  }, [gpuSim.gpuActive, gpuSim.gpuResolved, renderer, onRendererReady]);
 
   useImperativeHandle(ref, () => ({
     getCanvasElement: () => containerRef.current?.querySelector('canvas') ?? null,
