@@ -114,6 +114,7 @@ class StockSimulator {
         this.defaultTool = this.tools.values().next().value || null;
 
         this.base = null; // heights after earlier jobs, the starting point for this one
+        this.priorJobs = []; // earlier jobs (oldest first), kept so they can be re-carved
         this.hiddenTools = new Set(); // segment.tool values (the tool panel's) not carved
         this.segments = [];
         this.snapshots = new Map(); // segment index -> heights after carving [0, index)
@@ -136,18 +137,30 @@ class StockSimulator {
      * @param {Array<{segments: Array, tools: Map}>} jobs
      */
     setPriorJobs(jobs) {
-        this.base = null;
-        this.heights.fill(this.stock.zmax);
-        for (const job of jobs) {
-            const tools = StockSimulator.compileTools(job.tools);
-            for (let i = 0; i < job.segments.length; i++) {
-                this.carveMove(job.segments, i, tools, null);
-            }
-        }
-        if (jobs.length > 0) this.base = this.heights.slice();
+        this.priorJobs = jobs || [];
+        this.carveBase();
         this.snapshots.clear();
         this.gouges.clear();
         this.reset();
+    }
+
+    /**
+     * Carve the earlier jobs into the starting stock, leaving out the hidden tools, and
+     * keep the result as the base the current job starts from
+     */
+    carveBase() {
+        this.base = null;
+        this.heights.fill(this.stock.zmax);
+        for (const job of this.priorJobs) {
+            // An earlier job only cuts with the tools it defines, as it does on its own
+            const tools = StockSimulator.compileTools(job.tools);
+            for (let i = 0; i < job.segments.length; i++) {
+                // Same hidden key as the 3D view uses for hidden toolpaths
+                if (this.hiddenTools.size > 0 && this.hiddenTools.has(job.segments[i].tool || 0)) continue;
+                this.carveMove(job.segments, i, tools, null);
+            }
+        }
+        if (this.priorJobs.length > 0) this.base = this.heights.slice();
     }
 
     /**
@@ -160,6 +173,9 @@ class StockSimulator {
         this.hiddenTools = next;
         this.snapshots.clear();
         this.gouges.clear();
+        // The earlier jobs' cuts are part of the base, so they have to be carved again
+        // without the newly hidden tools (or with the newly shown ones)
+        this.carveBase();
         this.reset();
     }
 
