@@ -58,7 +58,11 @@ function generateRadius() {
  */
 function advanceChunk(x, z) {
   const chunk = getLoadedChunk(x, z);
-  if (chunk && (chunk.complete || chunk.calculating)) return;
+
+  // A mesh on its way is enough for now. A chunk whose blocks changed since
+  // its mesh was built is rebuilt, and a chunk whose meshing failed waits for
+  // an edit to clear the failure instead of being retried every frame.
+  if (chunk && !chunk.needsMesh()) return;
 
   // Generate every chunk whose trees can reach a neighbor of this one
   let generated = true;
@@ -111,7 +115,7 @@ function requestGeneration(x, z) {
  */
 function requestMesh(chunk) {
   const epoch = loaderEpoch;
-  const version = chunk.startMesh();
+  const started = chunk.startMesh();
 
   getChunkWorkers().submit(
     {
@@ -123,7 +127,7 @@ function requestMesh(chunk) {
       blockLayers: getBlockLayers(),
       world: getWorldSettings()
     },
-    (error, result) => finishedTasks.push({ name: 'upload', epoch: epoch, chunk: chunk, version: version, error: error, result: result })
+    (error, result) => finishedTasks.push({ name: 'upload', epoch: epoch, chunk: chunk, started: started, error: error, result: result })
   );
 }
 
@@ -141,10 +145,13 @@ function finishTasks(cx, cz, r) {
     if (task.name === 'adopt') {
       frameBudget.run('adopt', () => adoptChunk(task, cx, cz, r));
     } else if (task.error) {
-      // Leave the chunk marked as meshing so it isn't retried every frame
+      // Stop waiting so the chunk can be meshed again after its blocks change
       console.error(`Meshing chunk ${task.chunk.x},${task.chunk.z} failed`, task.error);
+      frameBudget.run('upload', () => task.chunk.meshFailed(task.started));
     } else {
-      frameBudget.run('upload', () => task.chunk.setMesh(task.version, task.result));
+      // Uploading is a no-op if the blocks changed after the mesh was
+      // requested, so an older result can never replace a newer mesh
+      frameBudget.run('upload', () => task.chunk.setMesh(task.started, task.result));
     }
   }
 }

@@ -22,7 +22,11 @@ class Chunk {
     this.translucentMesh = null; // {buffer, faces} of translucent blocks, drawn after every solid mesh
     this.complete = false;
     this.calculating = false;
-    this._meshVersion = 0; // bumped so meshes started earlier are ignored when they finish
+    this.meshError = false; // the last mesh failed, so it waits for the blocks to change instead of retrying every frame
+    this._meshVersion = 0; // bumped whenever the blocks the mesh is built from change
+    this._requestId = 0; // id of the mesh request in flight, or 0 when none is
+    this._pendingRequest = 0; // request id the chunk is waiting for, or 0
+    this._builtVersion = -1; // version of the blocks the mesh on the GPU was built from
   }
 
   /**
@@ -67,37 +71,87 @@ class Chunk {
   }
 
   /**
-   * Mark the chunk as having a mesh on the way. The chunk and its neighbors
-   * must be decorated first.
-   * @returns {number} Version to pass to setMesh when the mesh is built
+   * Note that blocks the mesh is built from changed, either in this chunk or
+   * in the border it copies from its neighbors. This is what makes a mesh
+   * request already on its way stale: the blocks its mesh is being built from
+   * are no longer the blocks there, so setMesh drops its result.
    */
-  startMesh() {
-    this.calculating = true;
-    return ++this._meshVersion;
+  markDirty() {
+    this._meshVersion++;
+    this.meshError = false;
   }
 
   /**
-   * Upload built meshes to the GPU, unless the chunk changed or was freed
-   * since the meshes were started
-   * @param {number} version Version from startMesh
-   * @param {{solid: Object, translucent: Object}} mesh Meshes from buildChunkMesh
+   * Check whether the chunk needs a mesh built for its current blocks
+   * @returns {boolean} Whether the loader should build a mesh for it
    */
-  setMesh(version, mesh) {
-    if (version !== this._meshVersion) return;
+  needsMesh() {
+    if (this.calculating || this.meshError) return false;
+
+    return !this.complete || this._builtVersion !== this._meshVersion;
+  }
+
+  /**
+   * Mark the chunk as having a mesh on the way, built from the blocks as they
+   * are now. The chunk and its neighbors must be decorated first.
+   * @returns {{version: number, request: number}} Version of the blocks the
+   *   mesh will be built from, and the id of this request, both for setMesh
+   */
+  startMesh() {
+    this.calculating = true;
+    this.meshError = false;
+    this._pendingRequest = ++this._requestId;
+
+    return { version: this._meshVersion, request: this._pendingRequest };
+  }
+
+  /**
+   * Upload built meshes to the GPU, unless the blocks they were built from
+   * changed or the chunk was freed while they were built. A dropped result
+   * still stops the chunk waiting if it was the newest request, so it can be
+   * built again.
+   * @param {{version: number, request: number}} started Values from startMesh
+   * @param {{solid: Object, translucent: Object}} mesh Meshes from buildChunkMesh
+   * @returns {boolean} Whether the meshes were uploaded
+   */
+  setMesh(started, mesh) {
+    if (started.request === this._pendingRequest) {
+      this._pendingRequest = 0;
+      this.calculating = false;
+    }
+
+    if (started.version !== this._meshVersion) return false;
 
     this.solidMesh = this._uploadMesh(this.solidMesh, mesh.solid);
     this.translucentMesh = this._uploadMesh(this.translucentMesh, mesh.translucent);
-    this.calculating = false;
     this.complete = true;
+    this._builtVersion = started.version;
+    return true;
+  }
+
+  /**
+   * Stop waiting for a mesh that failed, so the chunk is not left marked as
+   * meshing. It is built again the next time its blocks change, instead of
+   * being retried every frame. Failures of requests that were already
+   * replaced are ignored, so they cannot undo newer work.
+   * @param {{version: number, request: number}} [started] Values from startMesh for the failed request. Defaults to the newest request.
+   */
+  meshFailed(started = { request: this._pendingRequest }) {
+    if (started.request !== this._pendingRequest) return;
+
+    this._pendingRequest = 0;
+    this.calculating = false;
+    this.meshError = true;
   }
 
   /**
    * Rebuild the mesh on the main thread right away, for changes the player
-   * should see immediately
+   * should see immediately. Marking the chunk dirty invalidates any request
+   * still on its way, so it cannot replace this mesh when it arrives.
    */
   buildMeshNow() {
-    const version = this.startMesh();
-    this.setMesh(version, buildChunkMesh(createMeshArea(this), this.X, this.Z));
+    this.markDirty();
+    this.setMesh(this.startMesh(), buildChunkMesh(createMeshArea(this), this.X, this.Z));
   }
 
   /**
@@ -105,10 +159,12 @@ class Chunk {
    */
   freeMesh() {
     this._meshVersion++;
+    this._pendingRequest = 0;
     this.solidMesh = this._uploadMesh(this.solidMesh, null);
     this.translucentMesh = this._uploadMesh(this.translucentMesh, null);
     this.complete = false;
     this.calculating = false;
+    this.meshError = false;
   }
 
   /**

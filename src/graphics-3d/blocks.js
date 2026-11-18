@@ -95,7 +95,8 @@ function editBlock(x, y, z, type, update = false) {
 
 /**
  * Rebuild the meshes of every chunk whose faces or shading can depend on
- * the blocks in a column
+ * the blocks in a column, and invalidate any mesh still being built from the
+ * blocks as they were before the change
  * @param {number} x World x coordinate
  * @param {number} z World z coordinate
  */
@@ -104,10 +105,16 @@ function remeshAround(x, z) {
   for (let xo = -1; xo <= 1; xo++) {
     for (let zo = -1; zo <= 1; zo++) {
       const chunk = getChunk(x + xo, z + zo);
-      if (chunk && (chunk.complete || chunk.calculating)) chunks.add(chunk);
+      if (chunk) chunks.add(chunk);
     }
   }
 
-  for (const chunk of chunks)
-    chunk.buildMeshNow();
+  for (const chunk of chunks) {
+    // Chunks that are drawn pick up the change right away. The rest are
+    // meshed by the loader from the blocks as they are now, so they are only
+    // marked changed: that drops any mesh on its way and lets a chunk whose
+    // meshing failed try again.
+    if (chunk.complete || chunk.calculating) chunk.buildMeshNow();
+    else chunk.markDirty();
+  }
 }
